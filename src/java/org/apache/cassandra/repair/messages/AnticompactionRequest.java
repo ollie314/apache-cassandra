@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.repair.messages;
 
-import java.io.DataInput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -26,7 +25,9 @@ import java.util.UUID;
 
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.UUIDSerializer;
 
 public class AnticompactionRequest extends RepairMessage
@@ -51,25 +52,28 @@ public class AnticompactionRequest extends RepairMessage
         {
             UUIDSerializer.serializer.serialize(message.parentRepairSession, out, version);
             out.writeInt(message.successfulRanges.size());
-            for (Range r : message.successfulRanges)
-                Range.serializer.serialize(r, out, version);
+            for (Range<Token> r : message.successfulRanges)
+            {
+                MessagingService.validatePartitioner(r);
+                Range.tokenSerializer.serialize(r, out, version);
+            }
         }
 
-        public AnticompactionRequest deserialize(DataInput in, int version) throws IOException
+        public AnticompactionRequest deserialize(DataInputPlus in, int version) throws IOException
         {
             UUID parentRepairSession = UUIDSerializer.serializer.deserialize(in, version);
             int rangeCount = in.readInt();
             List<Range<Token>> ranges = new ArrayList<>(rangeCount);
             for (int i = 0; i < rangeCount; i++)
-                ranges.add((Range<Token>) Range.serializer.deserialize(in, version).toTokenBounds());
+                ranges.add((Range<Token>) Range.tokenSerializer.deserialize(in, MessagingService.globalPartitioner(), version));
             return new AnticompactionRequest(parentRepairSession, ranges);
         }
 
         public long serializedSize(AnticompactionRequest message, int version)
         {
             long size = UUIDSerializer.serializer.serializedSize(message.parentRepairSession, version);
-            for (Range r : message.successfulRanges)
-                size += Range.serializer.serializedSize(r, version);
+            for (Range<Token> r : message.successfulRanges)
+                size += Range.tokenSerializer.serializedSize(r, version);
             return size;
         }
     }

@@ -21,16 +21,15 @@ package org.apache.cassandra.cql3.selection;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.commons.lang3.text.StrBuilder;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.cql3.functions.Function;
-import org.apache.cassandra.cql3.functions.FunctionName;
-import org.apache.cassandra.cql3.functions.Functions;
+import org.apache.cassandra.cql3.functions.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.commons.lang3.text.StrBuilder;
 
 public abstract class Selectable
 {
@@ -90,7 +89,7 @@ public abstract class Selectable
                 throw new InvalidRequestException(String.format("Cannot use selection function %s on collections",
                                                                 isWritetime ? "writeTime" : "ttl"));
 
-            return WritetimeOrTTLSelector.newFactory(def.name.toString(), addAndGetIndex(def, defs), isWritetime);
+            return WritetimeOrTTLSelector.newFactory(def, addAndGetIndex(def, defs), isWritetime);
         }
 
         public static class Raw implements Selectable.Raw
@@ -143,8 +142,14 @@ public abstract class Selectable
             SelectorFactories factories  =
                     SelectorFactories.createFactoriesAndCollectColumnDefinitions(args, cfm, defs);
 
-            // resolve built-in functions before user defined functions
-            Function fun = Functions.get(cfm.ksName, functionName, factories.newInstances(), cfm.ksName, cfm.cfName);
+            // We need to circumvent the normal function lookup process for toJson() because instances of the function
+            // are not pre-declared (because it can accept any type of argument).
+            Function fun;
+            if (functionName.equalsNativeFunction(ToJsonFct.NAME))
+                fun = ToJsonFct.getInstance(factories.getReturnTypes());
+            else
+                fun = FunctionResolver.get(cfm.ksName, functionName, factories.newInstances(), cfm.ksName, cfm.cfName, null);
+
             if (fun == null)
                 throw new InvalidRequestException(String.format("Unknown function '%s'", functionName));
             if (fun.returnType() == null)

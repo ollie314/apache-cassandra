@@ -37,8 +37,9 @@ import org.apache.cassandra.utils.WrappedRunnable;
 import org.apache.commons.lang3.StringUtils;
 
 /**
+ * <p>
  * Used to determine if two IP's are in the same datacenter or on the same rack.
- * <p/>
+ * </p>
  * Based on a properties file in the following format:
  *
  * 10.0.0.13=DC1:RAC2
@@ -59,7 +60,7 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
 
     public PropertyFileSnitch() throws ConfigurationException
     {
-        reloadConfiguration();
+        reloadConfiguration(false);
 
         try
         {
@@ -68,7 +69,7 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
             {
                 protected void runMayThrow() throws ConfigurationException
                 {
-                    reloadConfiguration();
+                    reloadConfiguration(true);
                 }
             };
             ResourceWatcher.watch(SNITCH_PROPERTIES_FILENAME, runnable, 60 * 1000);
@@ -98,7 +99,7 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
         String[] value = endpointMap.get(endpoint);
         if (value == null)
         {
-            logger.debug("Could not find end point information for {}, will use default", endpoint);
+            logger.trace("Could not find end point information for {}, will use default", endpoint);
             return defaultDCRack;
         }
         return value;
@@ -130,24 +131,18 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
         return info[1];
     }
 
-    public void reloadConfiguration() throws ConfigurationException
+    public void reloadConfiguration(boolean isUpdate) throws ConfigurationException
     {
         HashMap<InetAddress, String[]> reloadedMap = new HashMap<InetAddress, String[]>();
 
         Properties properties = new Properties();
-        InputStream stream = null;
-        try
+        try (InputStream stream = getClass().getClassLoader().getResourceAsStream(SNITCH_PROPERTIES_FILENAME))
         {
-            stream = getClass().getClassLoader().getResourceAsStream(SNITCH_PROPERTIES_FILENAME);
             properties.load(stream);
         }
         catch (Exception e)
         {
             throw new ConfigurationException("Unable to read " + SNITCH_PROPERTIES_FILENAME, e);
-        }
-        finally
-        {
-            FileUtils.closeQuietly(stream);
         }
 
         for (Map.Entry<Object, Object> entry : properties.entrySet())
@@ -187,17 +182,22 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
             throw new ConfigurationException(String.format("Snitch definitions at %s do not define a location for this node's broadcast address %s, nor does it provides a default",
                                                            SNITCH_PROPERTIES_FILENAME, FBUtilities.getBroadcastAddress()));
 
-        if (logger.isDebugEnabled())
+        if (logger.isTraceEnabled())
         {
             StringBuilder sb = new StringBuilder();
             for (Map.Entry<InetAddress, String[]> entry : reloadedMap.entrySet())
                 sb.append(entry.getKey()).append(":").append(Arrays.toString(entry.getValue())).append(", ");
-            logger.debug("Loaded network topology from property file: {}", StringUtils.removeEnd(sb.toString(), ", "));
+            logger.trace("Loaded network topology from property file: {}", StringUtils.removeEnd(sb.toString(), ", "));
         }
 
         endpointMap = reloadedMap;
         if (StorageService.instance != null) // null check tolerates circular dependency; see CASSANDRA-4145
-            StorageService.instance.getTokenMetadata().invalidateCachedRings();
+        {
+            if (isUpdate)
+                StorageService.instance.updateTopology();
+            else
+                StorageService.instance.getTokenMetadata().invalidateCachedRings();
+        }
 
         if (gossipStarted)
             StorageService.instance.gossipSnitchInfo();

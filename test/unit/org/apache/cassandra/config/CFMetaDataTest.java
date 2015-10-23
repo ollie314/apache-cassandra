@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,26 +18,28 @@
  */
 package org.apache.cassandra.config;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.*;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.io.compress.*;
-import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.thrift.CfDef;
 import org.apache.cassandra.thrift.ColumnDef;
 import org.apache.cassandra.thrift.IndexType;
 import org.apache.cassandra.thrift.ThriftConversion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -59,6 +61,14 @@ public class CFMetaDataTest
         columnDefs.add(new ColumnDef(ByteBufferUtil.bytes("col2"), UTF8Type.class.getCanonicalName())
                                     .setIndex_name("col2Index")
                                     .setIndex_type(IndexType.KEYS));
+
+        Map<String, String> customIndexOptions = new HashMap<>();
+        customIndexOptions.put("option1", "value1");
+        customIndexOptions.put("option2", "value2");
+        columnDefs.add(new ColumnDef(ByteBufferUtil.bytes("col3"), Int32Type.class.getCanonicalName())
+                                    .setIndex_name("col3Index")
+                                    .setIndex_type(IndexType.CUSTOM)
+                                    .setIndex_options(customIndexOptions));
     }
 
     @BeforeClass
@@ -66,8 +76,7 @@ public class CFMetaDataTest
     {
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1,
-                                    SimpleStrategy.class,
-                                    KSMetaData.optsWithRF(1),
+                                    KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1));
     }
 
@@ -95,7 +104,9 @@ public class CFMetaDataTest
             c.name = ByteBufferUtil.clone(columnDef.name);
             c.validation_class = columnDef.getValidation_class();
             c.index_name = columnDef.getIndex_name();
-            c.index_type = IndexType.KEYS;
+            c.index_type = columnDef.getIndex_type();
+            if (columnDef.isSetIndex_options())
+                c.setIndex_options(columnDef.getIndex_options());
             thriftCfDef.column_metadata.add(c);
         }
 
@@ -123,7 +134,7 @@ public class CFMetaDataTest
 
                 // Testing with compression to catch #3558
                 CFMetaData withCompression = cfm.copy();
-                withCompression.compressionParameters(new CompressionParameters(SnappyCompressor.instance, 32768, new HashMap<String, String>()));
+                withCompression.compression(CompressionParams.snappy(32768));
                 checkInverses(withCompression);
             }
         }
@@ -131,7 +142,7 @@ public class CFMetaDataTest
 
     private void checkInverses(CFMetaData cfm) throws Exception
     {
-        DecoratedKey k = StorageService.getPartitioner().decorateKey(ByteBufferUtil.bytes(cfm.ksName));
+        KeyspaceMetadata keyspace = Schema.instance.getKSMetaData(cfm.ksName);
 
         // Test thrift conversion
         CFMetaData before = cfm;
@@ -139,11 +150,14 @@ public class CFMetaDataTest
         assert before.equals(after) : String.format("%n%s%n!=%n%s", before, after);
 
         // Test schema conversion
-        Mutation rm = cfm.toSchema(System.currentTimeMillis());
-        ColumnFamily serializedCf = rm.getColumnFamily(Schema.instance.getId(SystemKeyspace.NAME, SystemKeyspace.SCHEMA_COLUMNFAMILIES_TABLE));
-        ColumnFamily serializedCD = rm.getColumnFamily(Schema.instance.getId(SystemKeyspace.NAME, SystemKeyspace.SCHEMA_COLUMNS_TABLE));
-        UntypedResultSet.Row result = QueryProcessor.resultify("SELECT * FROM system.schema_columnfamilies", new Row(k, serializedCf)).one();
-        CFMetaData newCfm = CFMetaData.fromSchemaNoTriggers(result, ColumnDefinition.resultify(new Row(k, serializedCD)));
+        Mutation rm = SchemaKeyspace.makeCreateTableMutation(keyspace, cfm, FBUtilities.timestampMicros());
+        PartitionUpdate cfU = rm.getPartitionUpdate(Schema.instance.getId(SchemaKeyspace.NAME, SchemaKeyspace.TABLES));
+        PartitionUpdate cdU = rm.getPartitionUpdate(Schema.instance.getId(SchemaKeyspace.NAME, SchemaKeyspace.COLUMNS));
+
+        CFMetaData newCfm = SchemaKeyspace.createTableFromTablePartitionAndColumnsPartition(
+                UnfilteredRowIterators.filter(cfU.unfilteredIterator(), FBUtilities.nowInSeconds()),
+                UnfilteredRowIterators.filter(cdU.unfilteredIterator(), FBUtilities.nowInSeconds())
+        );
         assert cfm.equals(newCfm) : String.format("%n%s%n!=%n%s", cfm, newCfm);
     }
 }

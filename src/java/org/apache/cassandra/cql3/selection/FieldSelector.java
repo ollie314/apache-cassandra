@@ -19,6 +19,7 @@ package org.apache.cassandra.cql3.selection;
 
 import java.nio.ByteBuffer;
 
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.selection.Selection.ResultSetBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
@@ -47,7 +48,12 @@ final class FieldSelector extends Selector
                 return type.fieldType(field);
             }
 
-            public Selector newInstance()
+            protected void addColumnMapping(SelectionColumnMapping mapping, ColumnSpecification resultsColumn)
+            {
+                factory.addColumnMapping(mapping, resultsColumn);
+            }
+
+            public Selector newInstance() throws InvalidRequestException
             {
                 return new FieldSelector(type, field, factory.newInstance());
             }
@@ -64,14 +70,14 @@ final class FieldSelector extends Selector
         return false;
     }
 
-    public void addInput(ResultSetBuilder rs) throws InvalidRequestException
+    public void addInput(int protocolVersion, ResultSetBuilder rs) throws InvalidRequestException
     {
-        selected.addInput(rs);
+        selected.addInput(protocolVersion, rs);
     }
 
-    public ByteBuffer getOutput() throws InvalidRequestException
+    public ByteBuffer getOutput(int protocolVersion) throws InvalidRequestException
     {
-        ByteBuffer value = selected.getOutput();
+        ByteBuffer value = selected.getOutput(protocolVersion);
         if (value == null)
             return null;
         ByteBuffer[] buffers = type.split(value);

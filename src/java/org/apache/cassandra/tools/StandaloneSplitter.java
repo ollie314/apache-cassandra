@@ -20,15 +20,19 @@ package org.apache.cassandra.tools;
 
 import java.io.File;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.commons.cli.*;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.SSTableSplitter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.*;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
@@ -40,7 +44,6 @@ public class StandaloneSplitter
     public static final int DEFAULT_SSTABLE_SIZE = 50;
 
     private static final String TOOL_NAME = "sstablessplit";
-    private static final String VERBOSE_OPTION = "verbose";
     private static final String DEBUG_OPTION = "debug";
     private static final String HELP_OPTION = "help";
     private static final String NO_SNAPSHOT_OPTION = "no-snapshot";
@@ -49,10 +52,12 @@ public class StandaloneSplitter
     public static void main(String args[])
     {
         Options options = Options.parseArgs(args);
+        Util.initDatabaseDescriptor();
+
         try
         {
             // load keyspace descriptions.
-            DatabaseDescriptor.loadSchemas();
+            Schema.instance.loadFromDisk(false);
 
             String ksName = null;
             String cfName = null;
@@ -108,7 +113,6 @@ public class StandaloneSplitter
             // Do not load sstables since they might be broken
             Keyspace keyspace = Keyspace.openWithoutSSTables(ksName);
             ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
-
             String snapshotName = "pre-split-" + System.currentTimeMillis();
 
             List<SSTableReader> sstables = new ArrayList<>();
@@ -116,7 +120,7 @@ public class StandaloneSplitter
             {
                 try
                 {
-                    SSTableReader sstable = SSTableReader.openNoValidation(fn.getKey(), fn.getValue(), cfs.metadata);
+                    SSTableReader sstable = SSTableReader.openNoValidation(fn.getKey(), fn.getValue(), cfs);
                     if (!isSSTableLargerEnough(sstable, options.sizeInMB)) {
                         System.out.println(String.format("Skipping %s: it's size (%.3f MB) is less than the split size (%d MB)",
                                 sstable.getFilename(), ((sstable.onDiskLength() * 1.0d) / 1024L) / 1024L, options.sizeInMB));
@@ -145,21 +149,23 @@ public class StandaloneSplitter
             if (options.snapshot)
                 System.out.println(String.format("Pre-split sstables snapshotted into snapshot %s", snapshotName));
 
-            cfs.getDataTracker().markCompacting(sstables);
             for (SSTableReader sstable : sstables)
             {
-                try
+                try (LifecycleTransaction transaction = LifecycleTransaction.offline(OperationType.UNKNOWN, sstable))
                 {
-                    new SSTableSplitter(cfs, sstable, options.sizeInMB).split();
+                    new SSTableSplitter(cfs, transaction, options.sizeInMB).split();
                 }
                 catch (Exception e)
                 {
                     System.err.println(String.format("Error splitting %s: %s", sstable, e.getMessage()));
                     if (options.debug)
                         e.printStackTrace(System.err);
+
+                    sstable.selfRef().release();
                 }
             }
-            SSTableDeletingTask.waitForDeletions();
+            CompactionManager.instance.finishCompactionsAndShutdown(5, TimeUnit.MINUTES);
+            LifecycleTransaction.waitForDeletions();
             System.exit(0); // We need that to stop non daemonized threads
         }
         catch (Exception e)
@@ -183,7 +189,6 @@ public class StandaloneSplitter
         public final List<String> filenames;
 
         public boolean debug;
-        public boolean verbose;
         public boolean snapshot;
         public int sizeInMB;
 
@@ -215,7 +220,6 @@ public class StandaloneSplitter
                 }
                 Options opts = new Options(Arrays.asList(args));
                 opts.debug = cmd.hasOption(DEBUG_OPTION);
-                opts.verbose = cmd.hasOption(VERBOSE_OPTION);
                 opts.snapshot = !cmd.hasOption(NO_SNAPSHOT_OPTION);
                 opts.sizeInMB = DEFAULT_SSTABLE_SIZE;
 
@@ -242,7 +246,6 @@ public class StandaloneSplitter
         {
             CmdLineOptions options = new CmdLineOptions();
             options.addOption(null, DEBUG_OPTION,          "display stack traces");
-            options.addOption("v",  VERBOSE_OPTION,        "verbose output");
             options.addOption("h",  HELP_OPTION,           "display this help message");
             options.addOption(null, NO_SNAPSHOT_OPTION,    "don't snapshot the sstables before splitting");
             options.addOption("s",  SIZE_OPTION, "size",   "maximum size in MB for the output sstables (default: " + DEFAULT_SSTABLE_SIZE + ")");

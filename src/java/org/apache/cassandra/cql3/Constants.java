@@ -21,11 +21,8 @@ import java.nio.ByteBuffer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.composites.CellName;
-import org.apache.cassandra.db.composites.Composite;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.CounterColumnType;
@@ -44,27 +41,13 @@ public abstract class Constants
 
     public enum Type
     {
-        STRING, INTEGER, UUID, FLOAT, BOOLEAN, HEX;
+        STRING, INTEGER, UUID, FLOAT, DATE, TIME, BOOLEAN, HEX;
     }
 
-    public static final Term.Raw NULL_LITERAL = new Term.Raw()
+    public static final Value UNSET_VALUE = new Value(ByteBufferUtil.UNSET_BYTE_BUFFER);
+
+    private static class NullLiteral extends Term.Raw
     {
-        private final Term.Terminal NULL_VALUE = new Value(null)
-        {
-            @Override
-            public Terminal bind(QueryOptions options)
-            {
-                // We return null because that makes life easier for collections
-                return null;
-            }
-
-            @Override
-            public String toString()
-            {
-                return "null";
-            }
-        };
-
         public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
             if (!testAssignment(keyspace, receiver).isAssignable())
@@ -80,6 +63,23 @@ public abstract class Constants
                  : AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
         }
 
+        public String getText()
+        {
+            return "NULL";
+        }
+    }
+
+    public static final NullLiteral NULL_LITERAL = new NullLiteral();
+
+    public static final Term.Terminal NULL_VALUE = new Value(null)
+    {
+        @Override
+        public Terminal bind(QueryOptions options)
+        {
+            // We return null because that makes life easier for collections
+            return null;
+        }
+
         @Override
         public String toString()
         {
@@ -87,7 +87,7 @@ public abstract class Constants
         }
     };
 
-    public static class Literal implements Term.Raw
+    public static class Literal extends Term.Raw
     {
         private final Type type;
         private final String text;
@@ -156,11 +156,6 @@ public abstract class Constants
             }
         }
 
-        public String getRawText()
-        {
-            return text;
-        }
-
         public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
             CQL3Type receiverType = receiver.type.asCQL3Type();
@@ -181,6 +176,8 @@ public abstract class Constants
                         case TEXT:
                         case INET:
                         case VARCHAR:
+                        case DATE:
+                        case TIME:
                         case TIMESTAMP:
                             return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
@@ -190,11 +187,14 @@ public abstract class Constants
                     {
                         case BIGINT:
                         case COUNTER:
+                        case DATE:
                         case DECIMAL:
                         case DOUBLE:
                         case FLOAT:
                         case INT:
+                        case SMALLINT:
                         case TIMESTAMP:
+                        case TINYINT:
                         case VARINT:
                             return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
@@ -234,8 +234,12 @@ public abstract class Constants
             return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
         }
 
-        @Override
-        public String toString()
+        public String getRawText()
+        {
+            return text;
+        }
+
+        public String getText()
         {
             return type == Type.STRING ? String.format("'%s'", text) : text;
         }
@@ -253,7 +257,7 @@ public abstract class Constants
             this.bytes = bytes;
         }
 
-        public ByteBuffer get(QueryOptions options)
+        public ByteBuffer get(int protocolVersion)
         {
             return bytes;
         }
@@ -285,7 +289,7 @@ public abstract class Constants
             try
             {
                 ByteBuffer value = options.getValues().get(bindIndex);
-                if (value != null)
+                if (value != null && value != ByteBufferUtil.UNSET_BYTE_BUFFER)
                     receiver.type.validate(value);
                 return value;
             }
@@ -298,7 +302,11 @@ public abstract class Constants
         public Value bind(QueryOptions options) throws InvalidRequestException
         {
             ByteBuffer bytes = bindAndGet(options);
-            return bytes == null ? null : new Constants.Value(bytes);
+            if (bytes == null)
+                return null;
+            if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return Constants.UNSET_VALUE;
+            return new Constants.Value(bytes);
         }
     }
 
@@ -309,11 +317,13 @@ public abstract class Constants
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            CellName cname = cf.getComparator().create(prefix, column);
             ByteBuffer value = t.bindAndGet(params.options);
-            cf.addColumn(value == null ? params.makeTombstone(cname) : params.makeColumn(cname, value));
+            if (value == null)
+                params.addTombstone(column);
+            else if (value != ByteBufferUtil.UNSET_BYTE_BUFFER) // use reference equality and not object equality
+                params.addCell(column, value);
         }
     }
 
@@ -324,14 +334,16 @@ public abstract class Constants
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
             ByteBuffer bytes = t.bindAndGet(params.options);
             if (bytes == null)
                 throw new InvalidRequestException("Invalid null value for counter increment");
+            if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return;
+
             long increment = ByteBufferUtil.toLong(bytes);
-            CellName cname = cf.getComparator().create(prefix, column);
-            cf.addColumn(params.makeCounter(cname, increment));
+            params.addCounter(column, increment);
         }
     }
 
@@ -342,18 +354,19 @@ public abstract class Constants
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
             ByteBuffer bytes = t.bindAndGet(params.options);
             if (bytes == null)
                 throw new InvalidRequestException("Invalid null value for counter increment");
+            if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return;
 
             long increment = ByteBufferUtil.toLong(bytes);
             if (increment == Long.MIN_VALUE)
                 throw new InvalidRequestException("The negation of " + increment + " overflows supported counter precision (signed 8 bytes integer)");
 
-            CellName cname = cf.getComparator().create(prefix, column);
-            cf.addColumn(params.makeCounter(cname, -increment));
+            params.addCounter(column, -increment);
         }
     }
 
@@ -366,13 +379,12 @@ public abstract class Constants
             super(column, null);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            CellName cname = cf.getComparator().create(prefix, column);
             if (column.type.isMultiCell())
-                cf.addAtom(params.makeRangeTombstone(cname.slice()));
+                params.setComplexDeletionTime(column);
             else
-                cf.addColumn(params.makeTombstone(cname));
+                params.addTombstone(column);
         }
-    };
+    }
 }

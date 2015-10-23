@@ -89,7 +89,7 @@ public class Accumulator<E> implements Iterable<E>
 
     public boolean isEmpty()
     {
-        return presentCount != 0;
+        return presentCount == 0;
     }
 
     /**
@@ -98,6 +98,11 @@ public class Accumulator<E> implements Iterable<E>
     public int size()
     {
         return presentCount;
+    }
+
+    public int capacity()
+    {
+        return values.length;
     }
 
     public Iterator<E> iterator()

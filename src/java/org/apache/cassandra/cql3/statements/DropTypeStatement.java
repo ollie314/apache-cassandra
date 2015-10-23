@@ -20,8 +20,10 @@ package org.apache.cassandra.cql3.statements;
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.transport.Event;
@@ -52,12 +54,11 @@ public class DropTypeStatement extends SchemaAlteringStatement
 
     public void validate(ClientState state) throws RequestValidationException
     {
-        KSMetaData ksm = Schema.instance.getKSMetaData(name.getKeyspace());
+        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
         if (ksm == null)
             throw new InvalidRequestException(String.format("Cannot drop type in unknown keyspace %s", name.getKeyspace()));
 
-        UserType old = ksm.userTypes.getType(name.getUserTypeName());
-        if (old == null)
+        if (!ksm.types.get(name.getUserTypeName()).isPresent())
         {
             if (ifExists)
                 return;
@@ -72,21 +73,24 @@ public class DropTypeStatement extends SchemaAlteringStatement
         // we drop and 2) existing tables referencing the type (maybe in a nested
         // way).
 
-        for (KSMetaData ksm2 : Schema.instance.getKeyspaceDefinitions())
+        for (Function function : ksm.functions)
         {
-            for (UserType ut : ksm2.userTypes.getAllTypes().values())
-            {
-                if (ut.keyspace.equals(name.getKeyspace()) && ut.name.equals(name.getUserTypeName()))
-                    continue;
-                if (isUsedBy(ut))
-                    throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by user type %s", name, ut.asCQL3Type()));
-            }
+            if (isUsedBy(function.returnType()))
+                throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by function %s", name, function));
 
-            for (CFMetaData cfm : ksm2.cfMetaData().values())
-                for (ColumnDefinition def : cfm.allColumns())
-                    if (isUsedBy(def.type))
-                        throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by table %s.%s", name, cfm.ksName, cfm.cfName));
+            for (AbstractType<?> argType : function.argTypes())
+                if (isUsedBy(argType))
+                    throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by function %s", name, function));
         }
+
+        for (UserType ut : ksm.types)
+            if (!ut.name.equals(name.getUserTypeName()) && isUsedBy(ut))
+                throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by user type %s", name, ut.asCQL3Type()));
+
+        for (CFMetaData cfm : ksm.tablesAndViews())
+            for (ColumnDefinition def : cfm.allColumns())
+                if (isUsedBy(def.type))
+                    throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by table %s.%s", name, cfm.ksName, cfm.cfName));
     }
 
     private boolean isUsedBy(AbstractType<?> toCheck) throws RequestValidationException
@@ -108,12 +112,6 @@ public class DropTypeStatement extends SchemaAlteringStatement
                 if (isUsedBy(subtype))
                     return true;
         }
-        else if (toCheck instanceof ColumnToCollectionType)
-        {
-            for (CollectionType collection : ((ColumnToCollectionType)toCheck).defined.values())
-                if (isUsedBy(collection))
-                    return true;
-        }
         else if (toCheck instanceof CollectionType)
         {
             if (toCheck instanceof ListType)
@@ -121,7 +119,7 @@ public class DropTypeStatement extends SchemaAlteringStatement
             else if (toCheck instanceof SetType)
                 return isUsedBy(((SetType)toCheck).getElementsType());
             else
-                return isUsedBy(((MapType)toCheck).getKeysType()) || isUsedBy(((MapType)toCheck).getKeysType());
+                return isUsedBy(((MapType)toCheck).getKeysType()) || isUsedBy(((MapType)toCheck).getValuesType());
         }
         return false;
     }
@@ -139,10 +137,10 @@ public class DropTypeStatement extends SchemaAlteringStatement
 
     public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
-        KSMetaData ksm = Schema.instance.getKSMetaData(name.getKeyspace());
+        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
         assert ksm != null;
 
-        UserType toDrop = ksm.userTypes.getType(name.getUserTypeName());
+        UserType toDrop = ksm.types.getNullable(name.getUserTypeName());
         // Can be null with ifExists
         if (toDrop == null)
             return false;

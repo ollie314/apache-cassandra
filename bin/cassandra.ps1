@@ -27,6 +27,7 @@ usage: cassandra.ps1 [-f] [-h] [-p pidfile] [-H dumpfile] [-D arg] [-E errorfile
     -E              change JVM ErrorFile
     -v              Print cassandra version and exit
     -s              Show detailed jvm environment information during launch
+    -a              Aggressive startup. Skip VerifyPorts check. For use in dev environments.
     -help           print this message
 
     NOTE: installing cassandra as a service requires Commons Daemon Service Runner
@@ -36,8 +37,6 @@ usage: cassandra.ps1 [-f] [-h] [-p pidfile] [-H dumpfile] [-D arg] [-E errorfile
 }
 
 #-----------------------------------------------------------------------------
-# Note: throughout these scripts we're replacing \ with /.  This allows clean
-# operation on both command-prompt and cygwin-based environments.
 Function Main
 {
     ValidateArguments
@@ -194,7 +193,6 @@ Function PrintVersion()
 #-----------------------------------------------------------------------------
 Function RunCassandra([string]$foreground)
 {
-    echo "Starting cassandra server"
     $cmd = @"
 $env:JAVA_BIN
 "@
@@ -269,6 +267,7 @@ $env:JAVA_BIN
 WARNING! Failed to write pidfile to $pidfile.  stop-server.bat and
     startup protection will not be available.
 "@
+            echo $_.Exception.Message
             exit 1
         }
 
@@ -282,6 +281,10 @@ WARNING! Failed to write pidfile to $pidfile.  stop-server.bat and
 #-----------------------------------------------------------------------------
 Function VerifyPortsAreAvailable
 {
+    if ($a)
+    {
+        return
+    }
     # Need to confirm 5 different ports are available or die if any are currently bound
     # From cassandra.yaml:
     #   storage_port
@@ -289,84 +292,28 @@ Function VerifyPortsAreAvailable
     #   native_transport_port
     #   rpc_port, which we'll match to rpc_address
     # and from env: JMX_PORT which we cache in our environment during SetCassandraEnvironment for this check
-    $toMatch = @("storage_port:","ssl_storage_port:","native_transport_port:","rpc_port")
+    $yamlRegex = "storage_port:|ssl_storage_port:|native_transport_port:|rpc_port"
     $yaml = Get-Content "$env:CASSANDRA_CONF\cassandra.yaml"
-
-    $listenAddress = "unknown"
-    $rpcAddress = "unknown"
-    foreach ($line in $yaml)
-    {
-        if ($line -match "^listen_address:")
-        {
-            $args = $line -Split ":"
-            $listenAddress = $args[1] -replace " ", ""
-        }
-        if ($line -match "^rpc_address:")
-        {
-            $args = $line -Split ":"
-            $rpcAddress = $args[1] -replace " ", ""
-        }
-    }
-    if ($listenAddress -eq "unknown")
-    {
-        echo "Failed to parse listen_address from cassandra.yaml to check open ports.  Aborting startup."
-        Exit
-    }
-    if ($rpcAddress -eq "unknown")
-    {
-        echo "Failed to parse rpc_address from cassandra.yaml to check open ports.  Aborting startup."
-        Exit
-    }
+    $portRegex = ":$env:JMX_PORT |"
 
     foreach ($line in $yaml)
     {
-        foreach ($match in $toMatch)
+        if ($line -match $yamlRegex)
         {
-            if ($line -match "^$match")
-            {
-                if ($line.contains("rpc"))
-                {
-                    CheckPort $rpcAddress $line
-                }
-                else
-                {
-                    CheckPort $listenAddress $line
-                }
-            }
+            $sa = $line.Split(":")
+            $portRegex = $portRegex + ":" + ($sa[1] -replace " ","") + " |"
         }
     }
-    CheckPort $listenAddress "jmx_port: $env:JMX_PORT"
-}
+    $portRegex = $portRegex.Substring(0, $portRegex.Length - 2)
 
-#-----------------------------------------------------------------------------
-Function CheckPort([string]$listenAddress, [string]$configLine)
-{
-    $split = $configLine -Split ":"
-    if ($split.Length -ne 2)
+    $netstat = netstat -an
+
+    foreach ($line in $netstat)
     {
-        echo "Invalid cassandra.yaml config line parsed while checking for available ports:"
-        echo "$configLine"
-        echo "Aborting startup"
-        Exit
-    }
-    else
-    {
-        $port = $split[1] -replace " ", ""
-
-        # start an async connect to the ip/port combo, give it 25ms, and error out if it succeeded
-        $tcpobject = new-Object system.Net.Sockets.TcpClient
-        $connect = $tcpobject.BeginConnect($listenAddress, $port, $null, $null)
-        $wait = $connect.AsyncWaitHandle.WaitOne(25, $false)
-
-        if (!$wait)
+        if ($line -match "TCP" -and $line -match $portRegex)
         {
-            # still trying to connect, if it's not serviced in 25ms we'll assume it's not open
-            $tcpobject.Close()
-        }
-        else
-        {
-            $tcpobject.EndConnect($connect) | out-Null
-            echo "Cassandra port already in use ($configLine).  Aborting"
+            Write-Error "Found a port already in use. Aborting startup"
+            Write-Error $line
             Exit
         }
     }
@@ -386,6 +333,7 @@ Function ValidateArguments
     }
 }
 
+#-----------------------------------------------------------------------------
 Function CheckEmptyParam($param)
 {
     if ([String]::IsNullOrEmpty($param))
@@ -395,6 +343,8 @@ Function CheckEmptyParam($param)
     }
 }
 
+#-----------------------------------------------------------------------------
+# Populate arguments
 for ($i = 0; $i -lt $args.count; $i++)
 {
     # Skip JVM args
@@ -407,12 +357,15 @@ for ($i = 0; $i -lt $args.count; $i++)
         "-install"          { $install = $True }
         "-uninstall"        { $uninstall = $True }
         "-help"             { PrintUsage }
+        "-?"                { PrintUsage }
+        "--help"            { PrintUsage }
         "-v"                { $v = $True }
         "-f"                { $f = $True }
         "-s"                { $s = $True }
         "-p"                { $p = $args[++$i]; CheckEmptyParam($p) }
         "-H"                { $H = $args[++$i]; CheckEmptyParam($H) }
         "-E"                { $E = $args[++$i]; CheckEmptyParam($E) }
+        "-a"                { $a = $True }
         default
         {
             "Invalid argument: " + $args[$i];

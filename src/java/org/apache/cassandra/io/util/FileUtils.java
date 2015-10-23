@@ -19,13 +19,14 @@ package org.apache.cassandra.io.util;
 
 import java.io.*;
 import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.nio.channels.FileChannel;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.text.DecimalFormat;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 import sun.nio.ch.DirectBuffer;
 
@@ -43,8 +44,13 @@ import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
+import static org.apache.cassandra.utils.Throwables.maybeFail;
+import static org.apache.cassandra.utils.Throwables.merge;
+
 public class FileUtils
 {
+    public static final Charset CHARSET = StandardCharsets.UTF_8;
+
     private static final Logger logger = LoggerFactory.getLogger(FileUtils.class);
     private static final double KB = 1024d;
     private static final double MB = 1024*1024d;
@@ -110,6 +116,34 @@ public class FileUtils
         return createTempFile(prefix, suffix, new File(System.getProperty("java.io.tmpdir")));
     }
 
+    public static Throwable deleteWithConfirm(String filePath, boolean expect, Throwable accumulate)
+    {
+        return deleteWithConfirm(new File(filePath), expect, accumulate);
+    }
+
+    public static Throwable deleteWithConfirm(File file, boolean expect, Throwable accumulate)
+    {
+        boolean exists = file.exists();
+        assert exists || !expect : "attempted to delete non-existing file " + file.getName();
+        try
+        {
+            if (exists)
+                Files.delete(file.toPath());
+        }
+        catch (Throwable t)
+        {
+            try
+            {
+                throw new FSWriteError(t, file);
+            }
+            catch (Throwable t2)
+            {
+                accumulate = merge(accumulate, t2);
+            }
+        }
+        return accumulate;
+    }
+
     public static void deleteWithConfirm(String file)
     {
         deleteWithConfirm(new File(file));
@@ -117,17 +151,7 @@ public class FileUtils
 
     public static void deleteWithConfirm(File file)
     {
-        assert file.exists() : "attempted to delete non-existing file " + file.getName();
-        if (logger.isDebugEnabled())
-            logger.debug("Deleting {}", file.getName());
-        try
-        {
-            Files.delete(file.toPath());
-        }
-        catch (IOException e)
-        {
-            throw new FSWriteError(e, file);
-        }
+        maybeFail(deleteWithConfirm(file, true, null));
     }
 
     public static void renameWithOutConfirm(String from, String to)
@@ -151,8 +175,8 @@ public class FileUtils
     public static void renameWithConfirm(File from, File to)
     {
         assert from.exists();
-        if (logger.isDebugEnabled())
-            logger.debug((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
+        if (logger.isTraceEnabled())
+            logger.trace((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
         // this is not FSWE because usually when we see it it's because we didn't close the file before renaming it,
         // and Windows is picky about that.
         try
@@ -179,39 +203,37 @@ public class FileUtils
         }
         catch (AtomicMoveNotSupportedException e)
         {
-            logger.debug("Could not do an atomic move", e);
+            logger.trace("Could not do an atomic move", e);
             Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
         }
 
     }
     public static void truncate(String path, long size)
     {
-        RandomAccessFile file;
-
-        try
+        try(FileChannel channel = FileChannel.open(Paths.get(path), StandardOpenOption.READ, StandardOpenOption.WRITE))
         {
-            file = new RandomAccessFile(path, "rw");
-        }
-        catch (FileNotFoundException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        try
-        {
-            file.getChannel().truncate(size);
+            channel.truncate(size);
         }
         catch (IOException e)
         {
-            throw new FSWriteError(e, path);
-        }
-        finally
-        {
-            closeQuietly(file);
+            throw new RuntimeException(e);
         }
     }
 
     public static void closeQuietly(Closeable c)
+    {
+        try
+        {
+            if (c != null)
+                c.close();
+        }
+        catch (Exception e)
+        {
+            logger.warn("Failed closing {}", c, e);
+        }
+    }
+
+    public static void closeQuietly(AutoCloseable c)
     {
         try
         {
@@ -249,6 +271,22 @@ public class FileUtils
             throw e;
     }
 
+    public static void closeQuietly(Iterable<? extends AutoCloseable> cs)
+    {
+        for (AutoCloseable c : cs)
+        {
+            try
+            {
+                if (c != null)
+                    c.close();
+            }
+            catch (Exception ex)
+            {
+                logger.warn("Failed closing {}", c, ex);
+            }
+        }
+    }
+
     public static String getCanonicalPath(String filename)
     {
         try
@@ -273,14 +311,42 @@ public class FileUtils
         }
     }
 
+    /** Return true if file is contained in folder */
+    public static boolean isContained(File folder, File file)
+    {
+        String folderPath = getCanonicalPath(folder);
+        String filePath = getCanonicalPath(file);
+
+        return filePath.startsWith(folderPath);
+    }
+
+    /** Convert absolute path into a path relative to the base path */
+    public static String getRelativePath(String basePath, String path)
+    {
+        try
+        {
+            return Paths.get(basePath).relativize(Paths.get(path)).toString();
+        }
+        catch(Exception ex)
+        {
+            String absDataPath = FileUtils.getCanonicalPath(basePath);
+            return Paths.get(absDataPath).relativize(Paths.get(path)).toString();
+        }
+    }
+
     public static boolean isCleanerAvailable()
     {
         return canCleanDirectBuffers;
     }
 
-    public static void clean(MappedByteBuffer buffer)
+    public static void clean(ByteBuffer buffer)
     {
-        ((DirectBuffer) buffer).cleaner().clean();
+        if (isCleanerAvailable() && buffer.isDirect())
+        {
+            DirectBuffer db = (DirectBuffer) buffer;
+            if (db.cleaner() != null)
+                db.cleaner().clean();
+        }
     }
 
     public static void createDirectory(String directory)
@@ -375,20 +441,28 @@ public class FileUtils
         deleteWithConfirm(dir);
     }
 
-    public static void skipBytesFully(DataInput in, int bytes) throws IOException
+    /**
+     * Schedules deletion of all file and subdirectories under "dir" on JVM shutdown.
+     * @param dir Directory to be deleted
+     */
+    public static void deleteRecursiveOnExit(File dir)
     {
-        int n = 0;
-        while (n < bytes)
+        if (dir.isDirectory())
         {
-            int skipped = in.skipBytes(bytes - n);
-            if (skipped == 0)
-                throw new EOFException("EOF after " + n + " bytes out of " + bytes);
-            n += skipped;
+            String[] children = dir.list();
+            for (String child : children)
+                deleteRecursiveOnExit(new File(dir, child));
         }
+
+        logger.trace("Scheduling deferred deletion of file: " + dir);
+        dir.deleteOnExit();
     }
 
     public static void handleCorruptSSTable(CorruptSSTableException e)
     {
+        if (!StorageService.instance.isSetupCompleted())
+            handleStartupFSError(e);
+
         JVMStabilityInspector.inspectThrowable(e);
         switch (DatabaseDescriptor.getDiskFailurePolicy())
         {
@@ -400,6 +474,9 @@ public class FileUtils
     
     public static void handleFSError(FSError e)
     {
+        if (!StorageService.instance.isSetupCompleted())
+            handleStartupFSError(e);
+
         JVMStabilityInspector.inspectThrowable(e);
         switch (DatabaseDescriptor.getDiskFailurePolicy())
         {
@@ -425,6 +502,22 @@ public class FileUtils
         }
     }
 
+    private static void handleStartupFSError(Throwable t)
+    {
+        switch (DatabaseDescriptor.getDiskFailurePolicy())
+        {
+            case stop_paranoid:
+            case stop:
+            case die:
+                logger.error("Exiting forcefully due to file system exception on startup, disk failure policy \"{}\"",
+                             DatabaseDescriptor.getDiskFailurePolicy(),
+                             t);
+                JVMStabilityInspector.killCurrentJVM(t, true);
+                break;
+            default:
+                break;
+        }
+    }
     /**
      * Get the size of a directory in bytes
      * @param directory The directory for which we need size.
@@ -461,6 +554,64 @@ public class FileUtils
             int left = length - copiedBytes;
             in.readFully(buffer, 0, left);
             out.write(buffer, 0, left);
+        }
+    }
+
+    public static boolean isSubDirectory(File parent, File child) throws IOException
+    {
+        parent = parent.getCanonicalFile();
+        child = child.getCanonicalFile();
+
+        File toCheck = child;
+        while (toCheck != null)
+        {
+            if (parent.equals(toCheck))
+                return true;
+            toCheck = toCheck.getParentFile();
+        }
+        return false;
+    }
+
+    public static void append(File file, String ... lines)
+    {
+        if (file.exists())
+            write(file, StandardOpenOption.APPEND, lines);
+        else
+            write(file, StandardOpenOption.CREATE, lines);
+    }
+
+    public static void replace(File file, String ... lines)
+    {
+        write(file, StandardOpenOption.TRUNCATE_EXISTING, lines);
+    }
+
+    public static void write(File file, StandardOpenOption op, String ... lines)
+    {
+        try
+        {
+            Files.write(file.toPath(),
+                        Arrays.asList(lines),
+                        CHARSET,
+                        op);
+        }
+        catch (IOException ex)
+        {
+            throw new RuntimeException(ex);
+        }
+    }
+
+    public static List<String> readLines(File file)
+    {
+        try
+        {
+            return Files.readAllLines(file.toPath(), CHARSET);
+        }
+        catch (IOException ex)
+        {
+            if (ex instanceof NoSuchFileException)
+                return Collections.emptyList();
+
+            throw new RuntimeException(ex);
         }
     }
 }

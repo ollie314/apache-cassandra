@@ -21,7 +21,11 @@ import java.io.IOException;
 import java.util.concurrent.TimeoutException;
 
 import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.service.ClientState;
@@ -60,17 +64,13 @@ public class TruncateStatement extends CFStatement implements CQLStatement
     {
         try
         {
+            CFMetaData metaData = Schema.instance.getCFMetaData(keyspace(), columnFamily());
+            if (metaData.isView())
+                throw new InvalidRequestException("Cannot TRUNCATE materialized view directly; must truncate base table instead");
+
             StorageProxy.truncateBlocking(keyspace(), columnFamily());
         }
-        catch (UnavailableException e)
-        {
-            throw new TruncateException(e);
-        }
-        catch (TimeoutException e)
-        {
-            throw new TruncateException(e);
-        }
-        catch (IOException e)
+        catch (UnavailableException | TimeoutException | IOException e)
         {
             throw new TruncateException(e);
         }
@@ -79,6 +79,15 @@ public class TruncateStatement extends CFStatement implements CQLStatement
 
     public ResultMessage executeInternal(QueryState state, QueryOptions options)
     {
-        throw new UnsupportedOperationException();
+        try
+        {
+            ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(columnFamily());
+            cfs.truncateBlocking();
+        }
+        catch (Exception e)
+        {
+            throw new TruncateException(e);
+        }
+        return null;
     }
 }

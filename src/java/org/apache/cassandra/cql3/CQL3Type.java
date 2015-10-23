@@ -20,14 +20,16 @@ package org.apache.cassandra.cql3;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.cassandra.config.KSMetaData;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 
 public interface CQL3Type
 {
@@ -38,22 +40,26 @@ public interface CQL3Type
 
     public enum Native implements CQL3Type
     {
-        ASCII    (AsciiType.instance),
-        BIGINT   (LongType.instance),
-        BLOB     (BytesType.instance),
-        BOOLEAN  (BooleanType.instance),
-        COUNTER  (CounterColumnType.instance),
-        DECIMAL  (DecimalType.instance),
-        DOUBLE   (DoubleType.instance),
-        FLOAT    (FloatType.instance),
-        INET     (InetAddressType.instance),
-        INT      (Int32Type.instance),
-        TEXT     (UTF8Type.instance),
-        TIMESTAMP(TimestampType.instance),
-        UUID     (UUIDType.instance),
-        VARCHAR  (UTF8Type.instance),
-        VARINT   (IntegerType.instance),
-        TIMEUUID (TimeUUIDType.instance);
+        ASCII       (AsciiType.instance),
+        BIGINT      (LongType.instance),
+        BLOB        (BytesType.instance),
+        BOOLEAN     (BooleanType.instance),
+        COUNTER     (CounterColumnType.instance),
+        DECIMAL     (DecimalType.instance),
+        DOUBLE      (DoubleType.instance),
+        FLOAT       (FloatType.instance),
+        INET        (InetAddressType.instance),
+        INT         (Int32Type.instance),
+        SMALLINT    (ShortType.instance),
+        TEXT        (UTF8Type.instance),
+        TIMESTAMP   (TimestampType.instance),
+        TINYINT     (ByteType.instance),
+        UUID        (UUIDType.instance),
+        VARCHAR     (UTF8Type.instance),
+        VARINT      (IntegerType.instance),
+        TIMEUUID    (TimeUUIDType.instance),
+        DATE        (SimpleDateType.instance),
+        TIME        (TimeType.instance);
 
         private final AbstractType<?> type;
 
@@ -310,9 +316,24 @@ public interface CQL3Type
             return false;
         }
 
+        public boolean isFrozen()
+        {
+            return this.frozen;
+        }
+
+        public boolean canBeNonFrozen()
+        {
+            return true;
+        }
+
         public boolean isCounter()
         {
             return false;
+        }
+
+        public String keyspace()
+        {
+            return null;
         }
 
         public void freeze() throws InvalidRequestException
@@ -474,9 +495,19 @@ public interface CQL3Type
                 this.name = name;
             }
 
+            public String keyspace()
+            {
+                return name.getKeyspace();
+            }
+
             public void freeze()
             {
                 frozen = true;
+            }
+
+            public boolean canBeNonFrozen()
+            {
+                return false;
             }
 
             public CQL3Type prepare(String keyspace) throws InvalidRequestException
@@ -485,7 +516,7 @@ public interface CQL3Type
                 {
                     // The provided keyspace is the one of the current statement this is part of. If it's different from the keyspace of
                     // the UTName, we reject since we want to limit user types to their own keyspace (see #6643)
-                    if (!keyspace.equals(name.getKeyspace()))
+                    if (keyspace != null && !SystemKeyspace.NAME.equals(name.getKeyspace()) && !keyspace.equals(name.getKeyspace()))
                         throw new InvalidRequestException(String.format("Statement on keyspace %s cannot refer to a user type in keyspace %s; "
                                                                         + "user types can only be used in the keyspace they are defined in",
                                                                         keyspace, name.getKeyspace()));
@@ -495,10 +526,10 @@ public interface CQL3Type
                     name.setKeyspace(keyspace);
                 }
 
-                KSMetaData ksm = Schema.instance.getKSMetaData(name.getKeyspace());
+                KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
                 if (ksm == null)
                     throw new InvalidRequestException("Unknown keyspace " + name.getKeyspace());
-                UserType type = ksm.userTypes.getType(name.getUserTypeName());
+                UserType type = ksm.types.getNullable(name.getUserTypeName());
                 if (type == null)
                     throw new InvalidRequestException("Unknown type " + name);
 

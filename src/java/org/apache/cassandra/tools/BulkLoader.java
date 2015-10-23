@@ -18,30 +18,25 @@
 package org.apache.cassandra.tools;
 
 import java.io.File;
-import java.net.*;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.MalformedURLException;
+import java.net.UnknownHostException;
 import java.util.*;
 
-import com.google.common.base.Joiner;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
-
 import org.apache.commons.cli.*;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.protocol.TProtocol;
-import org.apache.thrift.transport.TTransport;
 
-import org.apache.cassandra.auth.IAuthenticator;
+import com.datastax.driver.core.SSLOptions;
+import javax.net.ssl.SSLContext;
 import org.apache.cassandra.config.*;
-import org.apache.cassandra.db.SystemKeyspace;
-import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.SSTableLoader;
+import org.apache.cassandra.security.SSLFactory;
 import org.apache.cassandra.streaming.*;
-import org.apache.cassandra.thrift.*;
-import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.NativeSSTableLoaderClient;
 import org.apache.cassandra.utils.OutputHandler;
 
 public class BulkLoader
@@ -52,12 +47,10 @@ public class BulkLoader
     private static final String NOPROGRESS_OPTION  = "no-progress";
     private static final String IGNORE_NODES_OPTION  = "ignore";
     private static final String INITIAL_HOST_ADDRESS_OPTION = "nodes";
-    private static final String RPC_PORT_OPTION = "port";
+    private static final String NATIVE_PORT_OPTION = "port";
     private static final String USER_OPTION = "username";
     private static final String PASSWD_OPTION = "password";
     private static final String THROTTLE_MBITS = "throttle";
-
-    private static final String TRANSPORT_FACTORY = "transport-factory";
 
     /* client encryption options */
     private static final String SSL_TRUSTSTORE = "truststore";
@@ -73,19 +66,20 @@ public class BulkLoader
 
     public static void main(String args[])
     {
+        Config.setClientMode(true);
         LoaderOptions options = LoaderOptions.parseArgs(args);
         OutputHandler handler = new OutputHandler.SystemOutput(options.verbose, options.debug);
         SSTableLoader loader = new SSTableLoader(
                 options.directory,
                 new ExternalClient(
                         options.hosts,
-                        options.rpcPort,
+                        options.nativePort,
                         options.user,
                         options.passwd,
-                        options.transportFactory,
                         options.storagePort,
                         options.sslStoragePort,
-                        options.serverEncOptions),
+                        options.serverEncOptions,
+                        buildSSLOptions((EncryptionOptions.ClientEncryptionOptions)options.encOptions)),
                 handler,
                 options.connectionsPerHost);
         DatabaseDescriptor.setStreamThroughputOutboundMegabitsPerSec(options.throttle);
@@ -151,8 +145,13 @@ public class BulkLoader
             start = lastTime = System.nanoTime();
         }
 
-        public void onSuccess(StreamState finalState) {}
-        public void onFailure(Throwable t) {}
+        public void onSuccess(StreamState finalState)
+        {
+        }
+
+        public void onFailure(Throwable t)
+        {
+        }
 
         public synchronized void handleStreamEvent(StreamEvent event)
         {
@@ -224,14 +223,14 @@ public class BulkLoader
                     peak = average;
                 sb.append("(avg: ").append(average).append(" MB/s)");
 
-                System.err.print(sb.toString());
+                System.out.print(sb.toString());
             }
         }
 
         private int mbPerSec(long bytes, long timeInNano)
         {
             double bytesPerNano = ((double)bytes) / timeInNano;
-            return (int)((bytesPerNano * 1000 * 1000 * 1000) / (1024 * 2024));
+            return (int)((bytesPerNano * 1000 * 1000 * 1000) / (1024 * 1024));
         }
 
         private void printSummary(int connectionsPerHost)
@@ -247,18 +246,31 @@ public class BulkLoader
             sb.append(String.format("   %-30s: %-10d%n", "Total duration (ms): ", durationMS));
             sb.append(String.format("   %-30s: %-10d%n", "Average transfer rate (MB/s): ", + average));
             sb.append(String.format("   %-30s: %-10d%n", "Peak transfer rate (MB/s): ", + peak));
-            System.err.println(sb.toString());
+            System.out.println(sb.toString());
         }
     }
 
-    static class ExternalClient extends SSTableLoader.Client
+    private static SSLOptions buildSSLOptions(EncryptionOptions.ClientEncryptionOptions clientEncryptionOptions)
     {
-        private final Map<String, CFMetaData> knownCfs = new HashMap<>();
-        private final Set<InetAddress> hosts;
-        private final int rpcPort;
-        private final String user;
-        private final String passwd;
-        private final ITransportFactory transportFactory;
+
+        if (!clientEncryptionOptions.enabled)
+            return null;
+
+        SSLContext sslContext;
+        try
+        {
+            sslContext = SSLFactory.createSSLContext(clientEncryptionOptions, true);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException("Could not create SSL Context.", e);
+        }
+
+        return new SSLOptions(sslContext, clientEncryptionOptions.cipher_suites);
+    }
+
+    static class ExternalClient extends NativeSSTableLoaderClient
+    {
         private final int storagePort;
         private final int sslStoragePort;
         private final EncryptionOptions.ServerEncryptionOptions serverEncOptions;
@@ -267,102 +279,21 @@ public class BulkLoader
                               int port,
                               String user,
                               String passwd,
-                              ITransportFactory transportFactory,
                               int storagePort,
                               int sslStoragePort,
-                              EncryptionOptions.ServerEncryptionOptions serverEncryptionOptions)
+                              EncryptionOptions.ServerEncryptionOptions serverEncryptionOptions,
+                              SSLOptions sslOptions)
         {
-            super();
-            this.hosts = hosts;
-            this.rpcPort = port;
-            this.user = user;
-            this.passwd = passwd;
-            this.transportFactory = transportFactory;
+            super(hosts, port, user, passwd, sslOptions);
             this.storagePort = storagePort;
             this.sslStoragePort = sslStoragePort;
             this.serverEncOptions = serverEncryptionOptions;
         }
 
         @Override
-        public void init(String keyspace)
-        {
-            Iterator<InetAddress> hostiter = hosts.iterator();
-            while (hostiter.hasNext())
-            {
-                try
-                {
-                    // Query endpoint to ranges map and schemas from thrift
-                    InetAddress host = hostiter.next();
-                    Cassandra.Client client = createThriftClient(host.getHostAddress(), rpcPort, this.user, this.passwd, this.transportFactory);
-
-                    setPartitioner(client.describe_partitioner());
-                    Token.TokenFactory tkFactory = getPartitioner().getTokenFactory();
-
-                    for (TokenRange tr : client.describe_ring(keyspace))
-                    {
-                        Range<Token> range = new Range<>(tkFactory.fromString(tr.start_token), tkFactory.fromString(tr.end_token), getPartitioner());
-                        for (String ep : tr.endpoints)
-                        {
-                            addRangeForEndpoint(range, InetAddress.getByName(ep));
-                        }
-                    }
-
-                    String cfQuery = String.format("SELECT * FROM %s.%s WHERE keyspace_name = '%s'",
-                                                   SystemKeyspace.NAME,
-                                                   SystemKeyspace.SCHEMA_COLUMNFAMILIES_TABLE,
-                                                   keyspace);
-                    CqlResult cfRes = client.execute_cql3_query(ByteBufferUtil.bytes(cfQuery), Compression.NONE, ConsistencyLevel.ONE);
-
-
-                    for (CqlRow row : cfRes.rows)
-                    {
-                        String columnFamily = UTF8Type.instance.getString(row.columns.get(1).bufferForName());
-                        String columnsQuery = String.format("SELECT * FROM %s.%s WHERE keyspace_name = '%s' AND columnfamily_name = '%s'",
-                                                            SystemKeyspace.NAME,
-                                                            SystemKeyspace.SCHEMA_COLUMNS_TABLE,
-                                                            keyspace,
-                                                            columnFamily);
-                        CqlResult columnsRes = client.execute_cql3_query(ByteBufferUtil.bytes(columnsQuery), Compression.NONE, ConsistencyLevel.ONE);
-
-                        CFMetaData metadata = ThriftConversion.fromThriftCqlRow(row, columnsRes);
-                        knownCfs.put(metadata.cfName, metadata);
-                    }
-                    break;
-                }
-                catch (Exception e)
-                {
-                    if (!hostiter.hasNext())
-                        throw new RuntimeException("Could not retrieve endpoint ranges: ", e);
-                }
-            }
-        }
-
-        @Override
         public StreamConnectionFactory getConnectionFactory()
         {
             return new BulkLoadConnectionFactory(storagePort, sslStoragePort, serverEncOptions, false);
-        }
-
-        @Override
-        public CFMetaData getCFMetaData(String keyspace, String cfName)
-        {
-            return knownCfs.get(cfName);
-        }
-
-        private static Cassandra.Client createThriftClient(String host, int port, String user, String passwd, ITransportFactory transportFactory) throws Exception
-        {
-            TTransport trans = transportFactory.openTransport(host, port);
-            TProtocol protocol = new TBinaryProtocol(trans);
-            Cassandra.Client client = new Cassandra.Client(protocol);
-            if (user != null && passwd != null)
-            {
-                Map<String, String> credentials = new HashMap<>();
-                credentials.put(IAuthenticator.USERNAME_KEY, user);
-                credentials.put(IAuthenticator.PASSWORD_KEY, passwd);
-                AuthenticationRequest authenticationRequest = new AuthenticationRequest(credentials);
-                client.login(authenticationRequest);
-            }
-            return client;
         }
     }
 
@@ -373,13 +304,12 @@ public class BulkLoader
         public boolean debug;
         public boolean verbose;
         public boolean noProgress;
-        public int rpcPort = 9160;
+        public int nativePort = 9042;
         public String user;
         public String passwd;
         public int throttle = 0;
         public int storagePort;
         public int sslStoragePort;
-        public ITransportFactory transportFactory = new TFramedTransportFactory();
         public EncryptionOptions encOptions = new EncryptionOptions.ClientEncryptionOptions();
         public int connectionsPerHost = 1;
         public EncryptionOptions.ServerEncryptionOptions serverEncOptions = new EncryptionOptions.ServerEncryptionOptions();
@@ -435,8 +365,8 @@ public class BulkLoader
                 opts.verbose = cmd.hasOption(VERBOSE_OPTION);
                 opts.noProgress = cmd.hasOption(NOPROGRESS_OPTION);
 
-                if (cmd.hasOption(RPC_PORT_OPTION))
-                    opts.rpcPort = Integer.parseInt(cmd.getOptionValue(RPC_PORT_OPTION));
+                if (cmd.hasOption(NATIVE_PORT_OPTION))
+                    opts.nativePort = Integer.parseInt(cmd.getOptionValue(NATIVE_PORT_OPTION));
 
                 if (cmd.hasOption(USER_OPTION))
                     opts.user = cmd.getOptionValue(USER_OPTION);
@@ -555,13 +485,6 @@ public class BulkLoader
                     opts.encOptions.cipher_suites = cmd.getOptionValue(SSL_CIPHER_SUITES).split(",");
                 }
 
-                if (cmd.hasOption(TRANSPORT_FACTORY))
-                {
-                    ITransportFactory transportFactory = getTransportFactory(cmd.getOptionValue(TRANSPORT_FACTORY));
-                    configureTransportFactory(transportFactory, opts);
-                    opts.transportFactory = transportFactory;
-                }
-
                 return opts;
             }
             catch (ParseException | ConfigurationException | MalformedURLException e)
@@ -569,50 +492,6 @@ public class BulkLoader
                 errorMsg(e.getMessage(), options);
                 return null;
             }
-        }
-
-        private static ITransportFactory getTransportFactory(String transportFactory)
-        {
-            try
-            {
-                Class<?> factory = Class.forName(transportFactory);
-                if (!ITransportFactory.class.isAssignableFrom(factory))
-                    throw new IllegalArgumentException(String.format("transport factory '%s' " +
-                            "not derived from ITransportFactory", transportFactory));
-                return (ITransportFactory) factory.newInstance();
-            }
-            catch (Exception e)
-            {
-                throw new IllegalArgumentException(String.format("Cannot create a transport factory '%s'.", transportFactory), e);
-            }
-        }
-
-        private static void configureTransportFactory(ITransportFactory transportFactory, LoaderOptions opts)
-        {
-            Map<String, String> options = new HashMap<>();
-            // If the supplied factory supports the same set of options as our SSL impl, set those 
-            if (transportFactory.supportedOptions().contains(SSLTransportFactory.TRUSTSTORE))
-                options.put(SSLTransportFactory.TRUSTSTORE, opts.encOptions.truststore);
-            if (transportFactory.supportedOptions().contains(SSLTransportFactory.TRUSTSTORE_PASSWORD))
-                options.put(SSLTransportFactory.TRUSTSTORE_PASSWORD, opts.encOptions.truststore_password);
-            if (transportFactory.supportedOptions().contains(SSLTransportFactory.PROTOCOL))
-                options.put(SSLTransportFactory.PROTOCOL, opts.encOptions.protocol);
-            if (transportFactory.supportedOptions().contains(SSLTransportFactory.CIPHER_SUITES))
-                options.put(SSLTransportFactory.CIPHER_SUITES, Joiner.on(',').join(opts.encOptions.cipher_suites));
-
-            if (transportFactory.supportedOptions().contains(SSLTransportFactory.KEYSTORE)
-                    && opts.encOptions.require_client_auth)
-                options.put(SSLTransportFactory.KEYSTORE, opts.encOptions.keystore);
-            if (transportFactory.supportedOptions().contains(SSLTransportFactory.KEYSTORE_PASSWORD)
-                    && opts.encOptions.require_client_auth)
-                options.put(SSLTransportFactory.KEYSTORE_PASSWORD, opts.encOptions.keystore_password);
-
-            // Now check if any of the factory's supported options are set as system properties
-            for (String optionKey : transportFactory.supportedOptions())
-                if (System.getProperty(optionKey) != null)
-                    options.put(optionKey, System.getProperty(optionKey));
-
-            transportFactory.setOptions(options);
         }
 
         private static void errorMsg(String msg, CmdLineOptions options)
@@ -630,11 +509,10 @@ public class BulkLoader
             options.addOption(null, NOPROGRESS_OPTION,   "don't display progress");
             options.addOption("i",  IGNORE_NODES_OPTION, "NODES", "don't stream to this (comma separated) list of nodes");
             options.addOption("d",  INITIAL_HOST_ADDRESS_OPTION, "initial hosts", "Required. try to connect to these hosts (comma separated) initially for ring information");
-            options.addOption("p",  RPC_PORT_OPTION, "rpc port", "port used for rpc (default 9160)");
+            options.addOption("p",  NATIVE_PORT_OPTION, "rpc port", "port used for native connection (default 9042)");
             options.addOption("t",  THROTTLE_MBITS, "throttle", "throttle speed in Mbits (default unlimited)");
             options.addOption("u",  USER_OPTION, "username", "username for cassandra authentication");
             options.addOption("pw", PASSWD_OPTION, "password", "password for cassandra authentication");
-            options.addOption("tf", TRANSPORT_FACTORY, "transport factory", "Fully-qualified ITransportFactory class name for creating a connection to cassandra");
             options.addOption("cph", CONNECTIONS_PER_HOST, "connectionsPerHost", "number of concurrent connections-per-host.");
             // ssl connection-related options
             options.addOption("ts", SSL_TRUSTSTORE, "TRUSTSTORE", "Client SSL: full path to truststore");

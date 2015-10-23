@@ -29,9 +29,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.collect.Iterators;
+
 import com.datastax.driver.core.Host;
 import com.datastax.driver.core.Metadata;
-import com.google.common.collect.Iterators;
 import org.apache.cassandra.stress.settings.StressSettings;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -171,7 +172,7 @@ public class SmartThriftClient implements ThriftClient
     }
 
     @Override
-    public List<ColumnOrSuperColumn> get_slice(ByteBuffer key, ColumnParent parent, SlicePredicate predicate, ConsistencyLevel consistencyLevel) throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    public List<ColumnOrSuperColumn> get_slice(ByteBuffer key, ColumnParent parent, SlicePredicate predicate, ConsistencyLevel consistencyLevel) throws TException
     {
         Client client = get(key);
         try
@@ -184,7 +185,7 @@ public class SmartThriftClient implements ThriftClient
     }
 
     @Override
-    public void insert(ByteBuffer key, ColumnParent column_parent, Column column, ConsistencyLevel consistency_level) throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    public void insert(ByteBuffer key, ColumnParent column_parent, Column column, ConsistencyLevel consistency_level) throws TException
     {
         Client client = get(key);
         try
@@ -197,7 +198,7 @@ public class SmartThriftClient implements ThriftClient
     }
 
     @Override
-    public CqlResult execute_cql_query(String query, ByteBuffer key, Compression compression) throws InvalidRequestException, UnavailableException, TimedOutException, SchemaDisagreementException, TException
+    public CqlResult execute_cql_query(String query, ByteBuffer key, Compression compression) throws TException
     {
         Client client = get(key);
         try
@@ -210,7 +211,7 @@ public class SmartThriftClient implements ThriftClient
     }
 
     @Override
-    public CqlResult execute_cql3_query(String query, ByteBuffer key, Compression compression, ConsistencyLevel consistency) throws InvalidRequestException, UnavailableException, TimedOutException, SchemaDisagreementException, TException
+    public CqlResult execute_cql3_query(String query, ByteBuffer key, Compression compression, ConsistencyLevel consistency) throws TException
     {
         Client client = get(key);
         try
@@ -223,13 +224,13 @@ public class SmartThriftClient implements ThriftClient
     }
 
     @Override
-    public Integer prepare_cql3_query(String query, Compression compression) throws InvalidRequestException, TException
+    public Integer prepare_cql3_query(String query, Compression compression) throws TException
     {
         return getId(query);
     }
 
     @Override
-    public CqlResult execute_prepared_cql3_query(int queryId, ByteBuffer key, List<ByteBuffer> values, ConsistencyLevel consistency) throws InvalidRequestException, UnavailableException, TimedOutException, SchemaDisagreementException, TException
+    public CqlResult execute_prepared_cql3_query(int queryId, ByteBuffer key, List<ByteBuffer> values, ConsistencyLevel consistency) throws TException
     {
         Client client = get(key);
         try
@@ -242,13 +243,13 @@ public class SmartThriftClient implements ThriftClient
     }
 
     @Override
-    public Integer prepare_cql_query(String query, Compression compression) throws InvalidRequestException, TException
+    public Integer prepare_cql_query(String query, Compression compression) throws TException
     {
         return getId(query);
     }
 
     @Override
-    public CqlResult execute_prepared_cql_query(int queryId, ByteBuffer key, List<ByteBuffer> values) throws InvalidRequestException, UnavailableException, TimedOutException, SchemaDisagreementException, TException
+    public CqlResult execute_prepared_cql_query(int queryId, ByteBuffer key, List<ByteBuffer> values) throws TException
     {
         Client client = get(key);
         try
@@ -261,19 +262,19 @@ public class SmartThriftClient implements ThriftClient
     }
 
     @Override
-    public Map<ByteBuffer, List<ColumnOrSuperColumn>> multiget_slice(List<ByteBuffer> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level) throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    public Map<ByteBuffer, List<ColumnOrSuperColumn>> multiget_slice(List<ByteBuffer> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level) throws TException
     {
         throw new UnsupportedOperationException();
     }
 
     @Override
-    public List<KeySlice> get_range_slices(ColumnParent column_parent, SlicePredicate predicate, KeyRange range, ConsistencyLevel consistency_level) throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    public List<KeySlice> get_range_slices(ColumnParent column_parent, SlicePredicate predicate, KeyRange range, ConsistencyLevel consistency_level) throws TException
     {
         throw new UnsupportedOperationException();
     }
 
     @Override
-    public List<KeySlice> get_indexed_slices(ColumnParent column_parent, IndexClause index_clause, SlicePredicate column_predicate, ConsistencyLevel consistency_level) throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    public List<KeySlice> get_indexed_slices(ColumnParent column_parent, IndexClause index_clause, SlicePredicate column_predicate, ConsistencyLevel consistency_level) throws TException
     {
         throw new UnsupportedOperationException();
     }

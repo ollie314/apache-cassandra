@@ -1,4 +1,3 @@
-package org.apache.cassandra.hadoop;
 /*
  *
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -19,6 +18,7 @@ package org.apache.cassandra.hadoop;
  * under the License.
  *
  */
+package org.apache.cassandra.hadoop;
 
 import java.io.IOException;
 import java.util.*;
@@ -26,9 +26,8 @@ import java.util.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.io.compress.CompressionParameters;
+import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Hex;
@@ -417,14 +416,7 @@ public class ConfigHelper
 
     public static IPartitioner getInputPartitioner(Configuration conf)
     {
-        try
-        {
-            return FBUtilities.newPartitioner(conf.get(INPUT_PARTITIONER_CONFIG));
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return FBUtilities.newPartitioner(conf.get(INPUT_PARTITIONER_CONFIG));
     }
 
     public static int getOutputRpcPort(Configuration conf)
@@ -454,14 +446,7 @@ public class ConfigHelper
 
     public static IPartitioner getOutputPartitioner(Configuration conf)
     {
-        try
-        {
-            return FBUtilities.newPartitioner(conf.get(OUTPUT_PARTITIONER_CONFIG));
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return FBUtilities.newPartitioner(conf.get(OUTPUT_PARTITIONER_CONFIG));
     }
 
     public static String getOutputCompressionClass(Configuration conf)
@@ -471,7 +456,7 @@ public class ConfigHelper
 
     public static String getOutputCompressionChunkLength(Configuration conf)
     {
-        return conf.get(OUTPUT_COMPRESSION_CHUNK_LENGTH, String.valueOf(CompressionParameters.DEFAULT_CHUNK_LENGTH));
+        return conf.get(OUTPUT_COMPRESSION_CHUNK_LENGTH, String.valueOf(CompressionParams.DEFAULT_CHUNK_LENGTH));
     }
 
     public static void setOutputCompressionClass(Configuration conf, String classname)
@@ -496,22 +481,6 @@ public class ConfigHelper
     public static int getThriftFramedTransportSize(Configuration conf)
     {
         return conf.getInt(THRIFT_FRAMED_TRANSPORT_SIZE_IN_MB, 15) * 1024 * 1024; // 15MB is default in Cassandra
-    }
-
-    public static CompressionParameters getOutputCompressionParamaters(Configuration conf)
-    {
-        if (getOutputCompressionClass(conf) == null)
-            return new CompressionParameters(null);
-
-        Map<String, String> options = new HashMap<String, String>(2);
-        options.put(CompressionParameters.SSTABLE_COMPRESSION, getOutputCompressionClass(conf));
-        options.put(CompressionParameters.CHUNK_LENGTH_KB, getOutputCompressionChunkLength(conf));
-
-        try {
-            return CompressionParameters.create(options);
-        } catch (ConfigurationException e) {
-            throw new RuntimeException(e);
-        }
     }
 
     public static boolean getOutputLocalDCOnly(Configuration conf)
@@ -562,6 +531,7 @@ public class ConfigHelper
         return client;
     }
 
+    @SuppressWarnings("resource")
     public static Cassandra.Client createConnection(Configuration conf, String host, Integer port) throws IOException
     {
         try

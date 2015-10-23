@@ -19,20 +19,16 @@ package org.apache.cassandra.cql3.functions;
 
 import java.util.List;
 
+import org.apache.cassandra.cql3.AssignmentTestable;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.github.jamm.Unmetered;
 
-public interface Function
+@Unmetered
+public interface Function extends AssignmentTestable
 {
     public FunctionName name();
     public List<AbstractType<?>> argTypes();
     public AbstractType<?> returnType();
-
-    /**
-     * Checks whether the function is a pure function (as in doesn't depend on, nor produce side effects) or not.
-     *
-     * @return <code>true</code> if the function is a pure function, <code>false</code> otherwise.
-     */
-    public boolean isPure();
 
     /**
      * Checks whether the function is a native/hard coded one or not.
@@ -47,4 +43,8 @@ public interface Function
      * @return <code>true</code> if the function is an aggregate function, <code>false</code> otherwise.
      */
     public boolean isAggregate();
+
+    public Iterable<Function> getFunctions();
+
+    public boolean hasReferenceTo(Function function);
 }

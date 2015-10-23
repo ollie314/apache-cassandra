@@ -22,39 +22,33 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 
 import com.google.common.base.Function;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
-import com.google.common.collect.AbstractIterator;
+
+import com.datastax.driver.core.TypeCodec;
+import org.apache.cassandra.utils.AbstractIterator;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
-
 import org.apache.commons.lang3.StringUtils;
-
-import org.apache.cassandra.hadoop.HadoopCompat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.ColumnDefinitions;
 import com.datastax.driver.core.ColumnMetadata;
+import com.datastax.driver.core.LocalDate;
+import com.datastax.driver.core.Metadata;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.TableMetadata;
+import com.datastax.driver.core.Token;
 import com.datastax.driver.core.TupleValue;
 import com.datastax.driver.core.UDTValue;
+import com.google.common.reflect.TypeToken;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.hadoop.ColumnFamilySplit;
@@ -68,22 +62,24 @@ import org.apache.hadoop.mapreduce.RecordReader;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 
 /**
+ * <p>
  * CqlRecordReader reads the rows return from the CQL query
  * It uses CQL auto-paging.
- * <p/>
+ * </p>
+ * <p>
  * Return a Long as a local CQL row key starts from 0;
- * <p/>
+ * </p>
+ * {@code
  * Row as C* java driver CQL result set row
  * 1) select clause must include partition key columns (to calculate the progress based on the actual CF row processed)
  * 2) where clause must include token(partition_key1, ...  , partition_keyn) > ? and 
  *       token(partition_key1, ... , partition_keyn) <= ?  (in the right order) 
+ * }
  */
 public class CqlRecordReader extends RecordReader<Long, Row>
         implements org.apache.hadoop.mapred.RecordReader<Long, Row>, AutoCloseable
 {
     private static final Logger logger = LoggerFactory.getLogger(CqlRecordReader.class);
-
-    public static final int DEFAULT_CQL_PAGE_LIMIT = 1000;
 
     private ColumnFamilySplit split;
     private RowIterator rowIterator;
@@ -103,6 +99,7 @@ public class CqlRecordReader extends RecordReader<Long, Row>
 
     // partition keys -- key aliases
     private LinkedHashMap<String, Boolean> partitionBoundColumns = Maps.newLinkedHashMap();
+    protected int nativeProtocolVersion = 1;
 
     public CqlRecordReader()
     {
@@ -143,6 +140,9 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         if (session == null)
           throw new RuntimeException("Can't create connection session");
 
+        //get negotiated serialization protocol
+        nativeProtocolVersion = cluster.getConfiguration().getProtocolOptions().getProtocolVersion().toInt();
+
         // If the user provides a CQL query then we will use it without validation
         // otherwise we will fall back to building a query using the:
         //   inputColumns
@@ -158,10 +158,10 @@ public class CqlRecordReader extends RecordReader<Long, Row>
 
         if (StringUtils.isEmpty(cqlQuery))
             cqlQuery = buildQuery();
-        logger.debug("cqlQuery {}", cqlQuery);
+        logger.trace("cqlQuery {}", cqlQuery);
 
         rowIterator = new RowIterator();
-        logger.debug("created {}", rowIterator);
+        logger.trace("created {}", rowIterator);
     }
 
     public void close()
@@ -196,7 +196,7 @@ public class CqlRecordReader extends RecordReader<Long, Row>
     {
         if (!rowIterator.hasNext())
         {
-            logger.debug("Finished scanning {} rows (estimate was: {})", rowIterator.totalRead, totalRowCount);
+            logger.trace("Finished scanning {} rows (estimate was: {})", rowIterator.totalRead, totalRowCount);
             return false;
         }
 
@@ -231,17 +231,25 @@ public class CqlRecordReader extends RecordReader<Long, Row>
 
     public long getPos() throws IOException
     {
-        return (long) rowIterator.totalRead;
+        return rowIterator.totalRead;
     }
 
     public Long createKey()
     {
-        return new Long(0L);
+        return Long.valueOf(0L);
     }
 
     public Row createValue()
     {
         return new WrappedRow();
+    }
+
+    /**
+     * Return native version protocol of the cluster connection
+     * @return serialization protocol version.
+     */
+    public int getNativeProtocolVersion() {
+        return nativeProtocolVersion;
     }
 
     /** CQL row iterator 
@@ -328,6 +336,54 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         }
 
         @Override
+        public Object getObject(int i)
+        {
+            return row.getObject(i);
+        }
+
+        @Override
+        public <T> T get(int i, Class<T> aClass)
+        {
+            return row.get(i, aClass);
+        }
+
+        @Override
+        public <T> T get(int i, TypeToken<T> typeToken)
+        {
+            return row.get(i, typeToken);
+        }
+
+        @Override
+        public <T> T get(int i, TypeCodec<T> typeCodec)
+        {
+            return row.get(i, typeCodec);
+        }
+
+        @Override
+        public Object getObject(String s)
+        {
+            return row.getObject(s);
+        }
+
+        @Override
+        public <T> T get(String s, Class<T> aClass)
+        {
+            return row.get(s, aClass);
+        }
+
+        @Override
+        public <T> T get(String s, TypeToken<T> typeToken)
+        {
+            return row.get(s, typeToken);
+        }
+
+        @Override
+        public <T> T get(String s, TypeCodec<T> typeCodec)
+        {
+            return row.get(s, typeCodec);
+        }
+
+        @Override
         public boolean getBool(int i)
         {
             return row.getBool(i);
@@ -337,6 +393,30 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         public boolean getBool(String name)
         {
             return row.getBool(name);
+        }
+
+        @Override
+        public short getShort(int i)
+        {
+            return row.getShort(i);
+        }
+
+        @Override
+        public short getShort(String s)
+        {
+            return row.getShort(s);
+        }
+
+        @Override
+        public byte getByte(int i)
+        {
+            return row.getByte(i);
+        }
+
+        @Override
+        public byte getByte(String s)
+        {
+            return row.getByte(s);
         }
 
         @Override
@@ -364,15 +444,39 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         }
 
         @Override
-        public Date getDate(int i)
+        public Date getTimestamp(int i)
+        {
+            return row.getTimestamp(i);
+        }
+
+        @Override
+        public Date getTimestamp(String s)
+        {
+            return row.getTimestamp(s);
+        }
+
+        @Override
+        public LocalDate getDate(int i)
         {
             return row.getDate(i);
         }
 
         @Override
-        public Date getDate(String name)
+        public LocalDate getDate(String s)
         {
-            return row.getDate(name);
+            return row.getDate(s);
+        }
+
+        @Override
+        public long getTime(int i)
+        {
+            return row.getTime(i);
+        }
+
+        @Override
+        public long getTime(String s)
+        {
+            return row.getTime(s);
         }
 
         @Override
@@ -490,9 +594,21 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         }
 
         @Override
+        public <T> List<T> getList(int i, TypeToken<T> typeToken)
+        {
+            return row.getList(i, typeToken);
+        }
+
+        @Override
         public <T> List<T> getList(String name, Class<T> elementsClass)
         {
             return row.getList(name, elementsClass);
+        }
+
+        @Override
+        public <T> List<T> getList(String s, TypeToken<T> typeToken)
+        {
+            return row.getList(s, typeToken);
         }
 
         @Override
@@ -502,9 +618,21 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         }
 
         @Override
+        public <T> Set<T> getSet(int i, TypeToken<T> typeToken)
+        {
+            return row.getSet(i, typeToken);
+        }
+
+        @Override
         public <T> Set<T> getSet(String name, Class<T> elementsClass)
         {
             return row.getSet(name, elementsClass);
+        }
+
+        @Override
+        public <T> Set<T> getSet(String s, TypeToken<T> typeToken)
+        {
+            return row.getSet(s, typeToken);
         }
 
         @Override
@@ -514,9 +642,21 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         }
 
         @Override
+        public <K, V> Map<K, V> getMap(int i, TypeToken<K> typeToken, TypeToken<V> typeToken1)
+        {
+            return row.getMap(i, typeToken, typeToken1);
+        }
+
+        @Override
         public <K, V> Map<K, V> getMap(String name, Class<K> keysClass, Class<V> valuesClass)
         {
             return row.getMap(name, keysClass, valuesClass);
+        }
+
+        @Override
+        public <K, V> Map<K, V> getMap(String s, TypeToken<K> typeToken, TypeToken<V> typeToken1)
+        {
+            return row.getMap(s, typeToken, typeToken1);
         }
 
         @Override
@@ -541,6 +681,24 @@ public class CqlRecordReader extends RecordReader<Long, Row>
         public TupleValue getTupleValue(String name)
         {
             return row.getTupleValue(name);
+        }
+
+        @Override
+        public Token getToken(int i)
+        {
+            return row.getToken(i);
+        }
+
+        @Override
+        public Token getToken(String name)
+        {
+            return row.getToken(name);
+        }
+
+        @Override
+        public Token getPartitionKeyToken()
+        {
+            return row.getPartitionKeyToken();
         }
     }
 
@@ -601,29 +759,21 @@ public class CqlRecordReader extends RecordReader<Long, Row>
 
     private void fetchKeys()
     {
-        String query = "SELECT column_name, component_index, type FROM system.schema_columns WHERE keyspace_name='" +
-                       keyspace + "' and columnfamily_name='" + cfName + "'";
-        List<Row> rows = session.execute(query).all();
-        if (rows.isEmpty())
+        // get CF meta data
+        TableMetadata tableMetadata = session.getCluster()
+                                             .getMetadata()
+                                             .getKeyspace(Metadata.quote(keyspace))
+                                             .getTable(Metadata.quote(cfName));
+        if (tableMetadata == null)
         {
             throw new RuntimeException("No table metadata found for " + keyspace + "." + cfName);
         }
-        int numberOfPartitionKeys = 0;
-        for (Row row : rows)
-            if (row.getString(2).equals("partition_key"))
-                numberOfPartitionKeys++;
-        String[] partitionKeyArray = new String[numberOfPartitionKeys];
-        for (Row row : rows)
+        //Here we assume that tableMetadata.getPartitionKey() always
+        //returns the list of columns in order of component_index
+        for (ColumnMetadata partitionKey : tableMetadata.getPartitionKey())
         {
-            String type = row.getString(2);
-            String column = row.getString(0);
-            if (type.equals("partition_key"))
-            {
-                int componentIndex = row.isNull(1) ? 0 : row.getInt(1);
-                partitionKeyArray[componentIndex] = column;
-            }
+            partitionKeys.add(partitionKey.getName());
         }
-        partitionKeys.addAll(Arrays.asList(partitionKeyArray));
     }
 
     private String quote(String identifier)

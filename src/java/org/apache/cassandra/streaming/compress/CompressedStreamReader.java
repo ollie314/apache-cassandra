@@ -18,14 +18,13 @@
 package org.apache.cassandra.streaming.compress;
 
 import java.io.DataInputStream;
-
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 
 import com.google.common.base.Throwables;
 
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,7 +60,8 @@ public class CompressedStreamReader extends StreamReader
      * @throws java.io.IOException if reading the remote sstable fails. Will throw an RTE if local write fails.
      */
     @Override
-    public SSTableWriter read(ReadableByteChannel channel) throws IOException
+    @SuppressWarnings("resource") // channel needs to remain open, streams on top of it can't be closed
+    public SSTableMultiWriter read(ReadableByteChannel channel) throws IOException
     {
         logger.debug("reading file from {}, repairedAt = {}", session.peer, repairedAt);
         long totalSize = totalSize();
@@ -74,15 +74,17 @@ public class CompressedStreamReader extends StreamReader
         }
         ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
 
-        SSTableWriter writer = createWriter(cfs, totalSize, repairedAt, format);
+        SSTableMultiWriter writer = createWriter(cfs, totalSize, repairedAt, format);
 
-        CompressedInputStream cis = new CompressedInputStream(Channels.newInputStream(channel), compressionInfo, inputVersion.hasPostCompressionAdlerChecksums());
+        CompressedInputStream cis = new CompressedInputStream(Channels.newInputStream(channel), compressionInfo,
+                                                              inputVersion.compressedChecksumType(), cfs::getCrcCheckChance);
         BytesReadTracker in = new BytesReadTracker(new DataInputStream(cis));
+        StreamDeserializer deserializer = new StreamDeserializer(cfs.metadata, in, inputVersion, header.toHeader(cfs.metadata));
         try
         {
             for (Pair<Long, Long> section : sections)
             {
-                assert in.getBytesRead() < totalSize;
+                assert cis.getTotalCompressedBytesRead() <= totalSize;
                 int sectionLength = (int) (section.right - section.left);
 
                 // skip to beginning of section inside chunk
@@ -91,8 +93,7 @@ public class CompressedStreamReader extends StreamReader
 
                 while (in.getBytesRead() < sectionLength)
                 {
-                    writeRow(writer, in, cfs);
-
+                    writePartition(deserializer, writer, cfs);
                     // when compressed, report total bytes of compressed chunks read since remoteFile.size is the sum of chunks transferred
                     session.progress(desc, ProgressInfo.Direction.IN, cis.getTotalCompressedBytesRead(), totalSize);
                 }
@@ -101,7 +102,7 @@ public class CompressedStreamReader extends StreamReader
         }
         catch (Throwable e)
         {
-            writer.abort();
+            SSTableMultiWriter.abortOrDie(writer);
             drain(cis, in.getBytesRead());
             if (e instanceof IOException)
                 throw (IOException) e;

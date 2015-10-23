@@ -19,6 +19,8 @@ package org.apache.cassandra.cql3.selection;
 
 import java.nio.ByteBuffer;
 
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.selection.Selection.ResultSetBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -31,14 +33,15 @@ final class WritetimeOrTTLSelector extends Selector
     private final int idx;
     private final boolean isWritetime;
     private ByteBuffer current;
+    private boolean isSet;
 
-    public static Factory newFactory(final String columnName, final int idx, final boolean isWritetime)
+    public static Factory newFactory(final ColumnDefinition def, final int idx, final boolean isWritetime)
     {
         return new Factory()
         {
             protected String getColumnName()
             {
-                return String.format("%s(%s)", isWritetime ? "writetime" : "ttl", columnName);
+                return String.format("%s(%s)", isWritetime ? "writetime" : "ttl", def.name.toString());
             }
 
             protected AbstractType<?> getReturnType()
@@ -46,9 +49,14 @@ final class WritetimeOrTTLSelector extends Selector
                 return isWritetime ? LongType.instance : Int32Type.instance;
             }
 
+            protected void addColumnMapping(SelectionColumnMapping mapping, ColumnSpecification resultsColumn)
+            {
+               mapping.addMapping(resultsColumn, def);
+            }
+
             public Selector newInstance()
             {
-                return new WritetimeOrTTLSelector(columnName, idx, isWritetime);
+                return new WritetimeOrTTLSelector(def.name.toString(), idx, isWritetime);
             }
 
             public boolean isWritetimeSelectorFactory()
@@ -63,8 +71,13 @@ final class WritetimeOrTTLSelector extends Selector
         };
     }
 
-    public void addInput(ResultSetBuilder rs)
+    public void addInput(int protocolVersion, ResultSetBuilder rs)
     {
+        if (isSet)
+            return;
+
+        isSet = true;
+
         if (isWritetime)
         {
             long ts = rs.timestamps[idx];
@@ -77,13 +90,14 @@ final class WritetimeOrTTLSelector extends Selector
         }
     }
 
-    public ByteBuffer getOutput()
+    public ByteBuffer getOutput(int protocolVersion)
     {
         return current;
     }
 
     public void reset()
     {
+        isSet = false;
         current = null;
     }
 

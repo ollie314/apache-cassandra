@@ -110,13 +110,14 @@ class TestCqlshOutput(BaseTestCase):
             for line in output:
                 self.assertNoHasColors(line)
                 self.assertNotRegexpMatches(line, r'^cqlsh\S*>')
-            self.assertTrue(6 <= len(output) <= 8,
-                            msg='output: %r' % '\n'.join(output))
+            self.assertEqual(len(output), 6,
+                             msg='output: %r' % '\n'.join(output))
             self.assertEqual(output[0], '')
             self.assertNicelyFormattedTableHeader(output[1])
             self.assertNicelyFormattedTableRule(output[2])
             self.assertNicelyFormattedTableData(output[3])
             self.assertEqual(output[4].strip(), '')
+            self.assertEqual(output[5].strip(), '(1 rows)')
 
     def test_color_output(self):
         for termname in ('xterm', 'unknown-garbage'):
@@ -175,7 +176,7 @@ class TestCqlshOutput(BaseTestCase):
              MMMMM
             -------
 
-                10
+                20
                 GG
 
 
@@ -274,9 +275,9 @@ class TestCqlshOutput(BaseTestCase):
         # same query should show up as empty in cql 3
         self.assertQueriesGiveColoredOutput((
             (q, """
-             num | asciicol | bigintcol | blobcol | booleancol | decimalcol | doublecol | floatcol | intcol | textcol | timestampcol | uuidcol | varcharcol | varintcol
-             RRR   MMMMMMMM   MMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMMM   MMMMMMMMM   MMMMMMMM   MMMMMM   MMMMMMM   MMMMMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMM
-            -----+----------+-----------+---------+------------+------------+-----------+----------+--------+---------+--------------+---------+------------+-----------
+             num | asciicol | bigintcol | blobcol | booleancol | decimalcol | doublecol | floatcol | intcol | smallintcol | textcol | timestampcol | tinyintcol | uuidcol | varcharcol | varintcol
+             RRR   MMMMMMMM   MMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMMM   MMMMMMMMM   MMMMMMMM   MMMMMM   MMMMMMMMMMM   MMMMMMM   MMMMMMMMMMMM   MMMMMMMMMM   MMMMMMM   MMMMMMMMMM   MMMMMMMMM
+            -----+----------+-----------+---------+------------+------------+-----------+----------+--------+-------------+---------+--------------+------------+---------+------------+-----------
 
 
             (0 rows)
@@ -522,29 +523,29 @@ class TestCqlshOutput(BaseTestCase):
 
     def test_prompt(self):
         with testrun_cqlsh(tty=True, keyspace=None, cqlver=cqlsh.DEFAULT_CQLVER) as c:
-            self.assertEqual(c.output_header.splitlines()[-1], 'cqlsh> ')
+            self.assertTrue(c.output_header.splitlines()[-1].endswith('cqlsh> '))
 
             c.send('\n')
             output = c.read_to_next_prompt().replace('\r\n', '\n')
-            self.assertEqual(output, '\ncqlsh> ')
+            self.assertTrue(output.endswith('cqlsh> '))
 
             cmd = "USE \"%s\";\n" % get_test_keyspace().replace('"', '""')
             c.send(cmd)
             output = c.read_to_next_prompt().replace('\r\n', '\n')
-            self.assertEqual(output, '%scqlsh:%s> ' % (cmd, get_test_keyspace()))
+            self.assertTrue(output.endswith('cqlsh:%s> ' % (get_test_keyspace())))
 
             c.send('use system;\n')
             output = c.read_to_next_prompt().replace('\r\n', '\n')
-            self.assertEqual(output, 'use system;\ncqlsh:system> ')
+            self.assertTrue(output.endswith('cqlsh:system> '))
 
             c.send('use NONEXISTENTKEYSPACE;\n')
             outputlines = c.read_to_next_prompt().splitlines()
 
             self.assertEqual(outputlines[0], 'use NONEXISTENTKEYSPACE;')
-            self.assertEqual(outputlines[2], 'cqlsh:system> ')
+            self.assertTrue(outputlines[2].endswith('cqlsh:system> '))
             midline = ColoredText(outputlines[1])
             self.assertEqual(midline.plain(),
-                             'code=2200 [Invalid query] message="Keyspace \'nonexistentkeyspace\' does not exist"')
+                             'InvalidRequest: code=2200 [Invalid query] message="Keyspace \'nonexistentkeyspace\' does not exist"')
             self.assertColorFromTags(midline,
                              "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR")
 
@@ -601,16 +602,19 @@ class TestCqlshOutput(BaseTestCase):
                 doublecol double,
                 floatcol float,
                 intcol int,
+                smallintcol smallint,
                 textcol text,
                 timestampcol timestamp,
+                tinyintcol tinyint,
                 uuidcol uuid,
                 varcharcol text,
                 varintcol varint
             ) WITH bloom_filter_fp_chance = 0.01
-                AND caching = '{"keys":"ALL", "rows_per_partition":"NONE"}'
+                AND caching = {'keys': 'ALL', 'rows_per_partition': 'NONE'}
                 AND comment = ''
-                AND compaction = {'min_threshold': '4', 'class': 'org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy', 'max_threshold': '32'}
-                AND compression = {'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}
+                AND compaction = {'class': 'org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy', 'max_threshold': '32', 'min_threshold': '4'}
+                AND compression = {'chunk_length_in_kb': '64', 'class': 'org.apache.cassandra.io.compress.LZ4Compressor'}
+                AND crc_check_chance = 1.0
                 AND dclocal_read_repair_chance = 0.1
                 AND default_time_to_live = 0
                 AND gc_grace_seconds = 864000
@@ -618,7 +622,7 @@ class TestCqlshOutput(BaseTestCase):
                 AND memtable_flush_period_in_ms = 0
                 AND min_index_interval = 128
                 AND read_repair_chance = 0.0
-                AND speculative_retry = '99.0PERCENTILE';
+                AND speculative_retry = '99PERCENTILE';
 
         """ % quote_name(get_test_keyspace()))
 
@@ -627,7 +631,7 @@ class TestCqlshOutput(BaseTestCase):
                 for semicolon in (';', ''):
                     output = c.cmd_and_response('%s has_all_types%s' % (cmdword, semicolon))
                     self.assertNoHasColors(output)
-                    self.assertEqual(output, table_desc3)
+                    self.assertSequenceEqual(output.split('\n'), table_desc3.split('\n'))
 
     def test_describe_columnfamilies_output(self):
         output_re = r'''

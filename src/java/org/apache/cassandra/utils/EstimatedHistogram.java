@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.DataInput;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongArray;
@@ -26,8 +25,8 @@ import com.google.common.base.Objects;
 
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-
 import org.slf4j.Logger;
 
 public class EstimatedHistogram
@@ -178,7 +177,7 @@ public class EstimatedHistogram
         if (buckets.get(lastBucket) > 0)
             throw new IllegalStateException("Unable to compute when histogram overflowed");
 
-        long pcount = (long) Math.floor(count() * percentile);
+        long pcount = (long) Math.ceil(count() * percentile);
         if (pcount == 0)
             return 0;
 
@@ -330,7 +329,7 @@ public class EstimatedHistogram
             }
         }
 
-        public EstimatedHistogram deserialize(DataInput in) throws IOException
+        public EstimatedHistogram deserialize(DataInputPlus in) throws IOException
         {
             int size = in.readInt();
             long[] offsets = new long[size - 1];
@@ -343,17 +342,17 @@ public class EstimatedHistogram
             return new EstimatedHistogram(offsets, buckets);
         }
 
-        public long serializedSize(EstimatedHistogram eh, TypeSizes typeSizes)
+        public long serializedSize(EstimatedHistogram eh)
         {
             int size = 0;
 
             long[] offsets = eh.getBucketOffsets();
             long[] buckets = eh.getBuckets(false);
-            size += typeSizes.sizeof(buckets.length);
+            size += TypeSizes.sizeof(buckets.length);
             for (int i = 0; i < buckets.length; i++)
             {
-                size += typeSizes.sizeof(offsets[i == 0 ? 0 : i - 1]);
-                size += typeSizes.sizeof(buckets[i]);
+                size += TypeSizes.sizeof(offsets[i == 0 ? 0 : i - 1]);
+                size += TypeSizes.sizeof(buckets[i]);
             }
             return size;
         }

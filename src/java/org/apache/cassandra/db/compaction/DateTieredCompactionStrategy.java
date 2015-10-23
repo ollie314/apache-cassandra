@@ -18,18 +18,23 @@
 package org.apache.cassandra.db.compaction;
 
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
 import com.google.common.collect.*;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.cql3.statements.CFPropDefs;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.utils.Pair;
+
+import static com.google.common.collect.Iterables.filter;
 
 public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
 {
@@ -38,29 +43,37 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
     private final DateTieredCompactionStrategyOptions options;
     protected volatile int estimatedRemainingTasks;
     private final Set<SSTableReader> sstables = new HashSet<>();
+    private long lastExpiredCheck;
 
     public DateTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
         super(cfs, options);
         this.estimatedRemainingTasks = 0;
         this.options = new DateTieredCompactionStrategyOptions(options);
+        if (!options.containsKey(AbstractCompactionStrategy.TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.containsKey(AbstractCompactionStrategy.TOMBSTONE_THRESHOLD_OPTION))
+        {
+            disableTombstoneCompactions = true;
+            logger.trace("Disabling tombstone compactions for DTCS");
+        }
+        else
+            logger.trace("Enabling tombstone compactions for DTCS");
+
     }
 
     @Override
+    @SuppressWarnings("resource")
     public synchronized AbstractCompactionTask getNextBackgroundTask(int gcBefore)
     {
-        if (!isEnabled())
-            return null;
-
         while (true)
         {
-            List<SSTableReader> latestBucket = getNextBackgroundSStables(gcBefore);
+            List<SSTableReader> latestBucket = getNextBackgroundSSTables(gcBefore);
 
             if (latestBucket.isEmpty())
                 return null;
 
-            if (cfs.getDataTracker().markCompacting(latestBucket))
-                return new CompactionTask(cfs, latestBucket, gcBefore, false);
+            LifecycleTransaction modifier = cfs.getTracker().tryModify(latestBucket, OperationType.COMPACTION);
+            if (modifier != null)
+                return new CompactionTask(cfs, modifier, gcBefore);
         }
     }
 
@@ -69,16 +82,37 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
      * @param gcBefore
      * @return
      */
-    private List<SSTableReader> getNextBackgroundSStables(final int gcBefore)
+    private List<SSTableReader> getNextBackgroundSSTables(final int gcBefore)
     {
-        if (!isEnabled() || cfs.getSSTables().isEmpty())
+        if (Iterables.isEmpty(cfs.getSSTables(SSTableSet.LIVE)))
             return Collections.emptyList();
 
+        Set<SSTableReader> uncompacting = ImmutableSet.copyOf(filter(cfs.getUncompactingSSTables(), sstables::contains));
+
+        Set<SSTableReader> expired = Collections.emptySet();
+        // we only check for expired sstables every 10 minutes (by default) due to it being an expensive operation
+        if (System.currentTimeMillis() - lastExpiredCheck > options.expiredSSTableCheckFrequency)
+        {
+            // Find fully expired SSTables. Those will be included no matter what.
+            expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, cfs.getOverlappingSSTables(SSTableSet.CANONICAL, uncompacting), gcBefore);
+            lastExpiredCheck = System.currentTimeMillis();
+        }
+        Set<SSTableReader> candidates = Sets.newHashSet(filterSuspectSSTables(uncompacting));
+
+        List<SSTableReader> compactionCandidates = new ArrayList<>(getNextNonExpiredSSTables(Sets.difference(candidates, expired), gcBefore));
+        if (!expired.isEmpty())
+        {
+            logger.trace("Including expired sstables: {}", expired);
+            compactionCandidates.addAll(expired);
+        }
+        return compactionCandidates;
+    }
+
+    private List<SSTableReader> getNextNonExpiredSSTables(Iterable<SSTableReader> nonExpiringSSTables, final int gcBefore)
+    {
         int base = cfs.getMinimumCompactionThreshold();
         long now = getNow();
-        Iterable<SSTableReader> candidates = filterSuspectSSTables(Sets.intersection(cfs.getUncompactingSSTables(), sstables));
-
-        List<SSTableReader> mostInteresting = getCompactionCandidates(candidates, now, base);
+        List<SSTableReader> mostInteresting = getCompactionCandidates(nonExpiringSSTables, now, base);
         if (mostInteresting != null)
         {
             return mostInteresting;
@@ -87,7 +121,7 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
         // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
         // ratio is greater than threshold.
         List<SSTableReader> sstablesWithTombstones = Lists.newArrayList();
-        for (SSTableReader sstable : candidates)
+        for (SSTableReader sstable : nonExpiringSSTables)
         {
             if (worthDroppingTombstones(sstable, gcBefore))
                 sstablesWithTombstones.add(sstable);
@@ -103,9 +137,13 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
         Iterable<SSTableReader> candidates = filterOldSSTables(Lists.newArrayList(candidateSSTables), options.maxSSTableAge, now);
 
         List<List<SSTableReader>> buckets = getBuckets(createSSTableAndMinTimestampPairs(candidates), options.baseTime, base, now);
-        logger.debug("Compaction buckets are {}", buckets);
+        logger.trace("Compaction buckets are {}", buckets);
         updateEstimatedCompactionsByTasks(buckets);
-        List<SSTableReader> mostInteresting = newestBucket(buckets, cfs.getMinimumCompactionThreshold(), cfs.getMaximumCompactionThreshold());
+        List<SSTableReader> mostInteresting = newestBucket(buckets,
+                                                           cfs.getMinimumCompactionThreshold(),
+                                                           cfs.getMaximumCompactionThreshold(),
+                                                           now,
+                                                           options.baseTime);
         if (!mostInteresting.isEmpty())
             return mostInteresting;
         return null;
@@ -118,13 +156,11 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
      */
     private long getNow()
     {
-        return Collections.max(cfs.getSSTables(), new Comparator<SSTableReader>()
-        {
-            public int compare(SSTableReader o1, SSTableReader o2)
-            {
-                return Long.compare(o1.getMaxTimestamp(), o2.getMaxTimestamp());
-            }
-        }).getMaxTimestamp();
+        // no need to convert to collection if had an Iterables.max(), but not present in standard toolkit, and not worth adding
+        List<SSTableReader> list = new ArrayList<>();
+        Iterables.addAll(list, cfs.getSSTables(SSTableSet.LIVE));
+        return Collections.max(list, (o1, o2) -> Long.compare(o1.getMaxTimestamp(), o2.getMaxTimestamp()))
+                          .getMaxTimestamp();
     }
 
     /**
@@ -140,7 +176,7 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
         if (maxSSTableAge == 0)
             return sstables;
         final long cutoff = now - maxSSTableAge;
-        return Iterables.filter(sstables, new Predicate<SSTableReader>()
+        return filter(sstables, new Predicate<SSTableReader>()
         {
             @Override
             public boolean apply(SSTableReader sstable)
@@ -309,12 +345,18 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
      * @return a bucket (list) of sstables to compact.
      */
     @VisibleForTesting
-    static List<SSTableReader> newestBucket(List<List<SSTableReader>> buckets, int minThreshold, int maxThreshold)
+    static List<SSTableReader> newestBucket(List<List<SSTableReader>> buckets, int minThreshold, int maxThreshold, long now, long baseTime)
     {
-        // Skip buckets containing less than minThreshold sstables, and limit other buckets to maxThreshold sstables.
+        // If the "incoming window" has at least minThreshold SSTables, choose that one.
+        // For any other bucket, at least 2 SSTables is enough.
+        // In any case, limit to maxThreshold SSTables.
+        Target incomingWindow = getInitialTarget(now, baseTime);
         for (List<SSTableReader> bucket : buckets)
-            if (bucket.size() >= minThreshold)
+        {
+            if (bucket.size() >= minThreshold ||
+                    (bucket.size() >= 2 && !incomingWindow.onTarget(bucket.get(0).getMinTimestamp())))
                 return trimToThreshold(bucket, maxThreshold);
+        }
         return Collections.emptyList();
     }
 
@@ -331,27 +373,30 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @Override
-    public synchronized Collection<AbstractCompactionTask> getMaximalTask(int gcBefore)
+    @SuppressWarnings("resource")
+    public synchronized Collection<AbstractCompactionTask> getMaximalTask(int gcBefore, boolean splitOutput)
     {
-        Iterable<SSTableReader> sstables = cfs.markAllCompacting();
-        if (sstables == null)
+        LifecycleTransaction modifier = cfs.markAllCompacting(OperationType.COMPACTION);
+        if (modifier == null)
             return null;
 
-        return Arrays.<AbstractCompactionTask>asList(new CompactionTask(cfs, sstables, gcBefore, false));
+        return Arrays.<AbstractCompactionTask>asList(new CompactionTask(cfs, modifier, gcBefore));
     }
 
     @Override
+    @SuppressWarnings("resource")
     public synchronized AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, int gcBefore)
     {
         assert !sstables.isEmpty(); // checked for by CM.submitUserDefined
 
-        if (!cfs.getDataTracker().markCompacting(sstables))
+        LifecycleTransaction modifier = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);
+        if (modifier == null)
         {
-            logger.debug("Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem", sstables);
+            logger.trace("Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem", sstables);
             return null;
         }
 
-        return new CompactionTask(cfs, sstables, gcBefore, false).setUserDefined(true);
+        return new CompactionTask(cfs, modifier, gcBefore).setUserDefined(true);
     }
 
     public int getEstimatedRemainingTasks()
@@ -364,14 +409,27 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
         return Long.MAX_VALUE;
     }
 
+    /**
+     * DTCS should not group sstables for anticompaction - this can mix new and old data
+     */
+    @Override
+    public Collection<Collection<SSTableReader>> groupSSTablesForAntiCompaction(Collection<SSTableReader> sstablesToGroup)
+    {
+        Collection<Collection<SSTableReader>> groups = new ArrayList<>();
+        for (SSTableReader sstable : sstablesToGroup)
+        {
+            groups.add(Collections.singleton(sstable));
+        }
+        return groups;
+    }
 
     public static Map<String, String> validateOptions(Map<String, String> options) throws ConfigurationException
     {
         Map<String, String> uncheckedOptions = AbstractCompactionStrategy.validateOptions(options);
         uncheckedOptions = DateTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);
 
-        uncheckedOptions.remove(CFPropDefs.KW_MINCOMPACTIONTHRESHOLD);
-        uncheckedOptions.remove(CFPropDefs.KW_MAXCOMPACTIONTHRESHOLD);
+        uncheckedOptions.remove(CompactionParams.Option.MIN_THRESHOLD.toString());
+        uncheckedOptions.remove(CompactionParams.Option.MAX_THRESHOLD.toString());
 
         return uncheckedOptions;
     }

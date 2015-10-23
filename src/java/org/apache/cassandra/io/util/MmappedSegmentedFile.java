@@ -18,97 +18,78 @@
 package org.apache.cassandra.io.util;
 
 import java.io.*;
-import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 
+import com.google.common.util.concurrent.RateLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
 public class MmappedSegmentedFile extends SegmentedFile
 {
     private static final Logger logger = LoggerFactory.getLogger(MmappedSegmentedFile.class);
 
-    // in a perfect world, MAX_SEGMENT_SIZE would be final, but we need to test with a smaller size to stay sane.
-    public static long MAX_SEGMENT_SIZE = Integer.MAX_VALUE;
+    private final MmappedRegions regions;
 
-    /**
-     * Sorted array of segment offsets and MappedByteBuffers for segments. If mmap is completely disabled, or if the
-     * segment would be too long to mmap, the value for an offset will be null, indicating that we need to fall back
-     * to a RandomAccessFile.
-     */
-    private final Segment[] segments;
-
-    public MmappedSegmentedFile(String path, long length, Segment[] segments)
+    public MmappedSegmentedFile(ChannelProxy channel, int bufferSize, long length, MmappedRegions regions)
     {
-        super(path, length);
-        this.segments = segments;
+        super(new Cleanup(channel, regions), channel, bufferSize, length);
+        this.regions = regions;
     }
 
-    /**
-     * @return The segment entry for the given position.
-     */
-    private Segment floor(long position)
+    private MmappedSegmentedFile(MmappedSegmentedFile copy)
     {
-        assert 0 <= position && position < length: String.format("%d >= %d in %s", position, length, path);
-        Segment seg = new Segment(position, null);
-        int idx = Arrays.binarySearch(segments, seg);
-        assert idx != -1 : String.format("Bad position %d for segments %s in %s", position, Arrays.toString(segments), path);
-        if (idx < 0)
-            // round down to entry at insertion point
-            idx = -(idx + 2);
-        return segments[idx];
+        super(copy);
+        this.regions = copy.regions;
     }
 
-    /**
-     * @return The segment containing the given position: must be closed after use.
-     */
-    public FileDataInput getSegment(long position)
+    public MmappedSegmentedFile sharedCopy()
     {
-        Segment segment = floor(position);
-        if (segment.right != null)
+        return new MmappedSegmentedFile(this);
+    }
+
+    public RandomAccessReader createReader()
+    {
+        return new RandomAccessReader.Builder(channel)
+               .overrideLength(length)
+               .regions(regions)
+               .build();
+    }
+
+    public RandomAccessReader createReader(RateLimiter limiter)
+    {
+        return new RandomAccessReader.Builder(channel)
+               .overrideLength(length)
+               .bufferSize(bufferSize)
+               .regions(regions)
+               .limiter(limiter)
+               .build();
+    }
+
+    private static final class Cleanup extends SegmentedFile.Cleanup
+    {
+        private final MmappedRegions regions;
+
+        Cleanup(ChannelProxy channel, MmappedRegions regions)
         {
-            // segment is mmap'd
-            return new MappedFileDataInput(segment.right, path, segment.left, (int) (position - segment.left));
+            super(channel);
+            this.regions = regions;
         }
 
-        // not mmap'd: open a braf covering the segment
-        // FIXME: brafs are unbounded, so this segment will cover the rest of the file, rather than just the row
-        RandomAccessReader file = RandomAccessReader.open(new File(path));
-        file.seek(position);
-        return file;
-    }
-
-    public void cleanup()
-    {
-        if (!FileUtils.isCleanerAvailable())
-            return;
-
-        /*
-         * Try forcing the unmapping of segments using undocumented unsafe sun APIs.
-         * If this fails (non Sun JVM), we'll have to wait for the GC to finalize the mapping.
-         * If this works and a thread tries to access any segment, hell will unleash on earth.
-         */
-        try
+        public void tidy()
         {
-            for (Segment segment : segments)
+            Throwable err = regions.close(null);
+            if (err != null)
             {
-                if (segment.right == null)
-                    continue;
-                FileUtils.clean(segment.right);
+                JVMStabilityInspector.inspectThrowable(err);
+
+                // This is not supposed to happen
+                logger.error("Error while closing mmapped regions", err);
             }
-            logger.debug("All segments have been unmapped successfully");
-        }
-        catch (Exception e)
-        {
-            JVMStabilityInspector.inspectThrowable(e);
-            // This is not supposed to happen
-            logger.error("Error while unmapping segments", e);
+
+            super.tidy();
         }
     }
 
@@ -117,126 +98,64 @@ public class MmappedSegmentedFile extends SegmentedFile
      */
     static class Builder extends SegmentedFile.Builder
     {
-        // planned segment boundaries
-        private List<Long> boundaries;
+        private MmappedRegions regions;
 
-        // offset of the open segment (first segment begins at 0).
-        private long currentStart = 0;
-
-        // current length of the open segment.
-        // used to allow merging multiple too-large-to-mmap segments, into a single buffered segment.
-        private long currentSize = 0;
-
-        public Builder()
+        Builder()
         {
             super();
-            boundaries = new ArrayList<Long>();
-            boundaries.add(0L);
         }
 
-        public void addPotentialBoundary(long boundary)
+        public SegmentedFile complete(ChannelProxy channel, int bufferSize, long overrideLength)
         {
-            if (boundary - currentStart <= MAX_SEGMENT_SIZE)
+            long length = overrideLength > 0 ? overrideLength : channel.size();
+            updateRegions(channel, length);
+
+            return new MmappedSegmentedFile(channel, bufferSize, length, regions.sharedCopy());
+        }
+
+        private void updateRegions(ChannelProxy channel, long length)
+        {
+            if (regions != null && !regions.isValid(channel))
             {
-                // boundary fits into current segment: expand it
-                currentSize = boundary - currentStart;
+                Throwable err = regions.close(null);
+                if (err != null)
+                    logger.error("Failed to close mapped regions", err);
+
+                regions = null;
+            }
+
+            if (regions == null)
+                regions = MmappedRegions.map(channel, length);
+            else
+                regions.extend(length);
+        }
+
+        @Override
+        public void serializeBounds(DataOutput out, Version version) throws IOException
+        {
+            if (!version.hasBoundaries())
                 return;
-            }
 
-            // close the current segment to try and make room for the boundary
-            if (currentSize > 0)
-            {
-                currentStart += currentSize;
-                boundaries.add(currentStart);
-            }
-            currentSize = boundary - currentStart;
-
-            // if we couldn't make room, the boundary needs its own segment
-            if (currentSize > MAX_SEGMENT_SIZE)
-            {
-                currentStart = boundary;
-                boundaries.add(currentStart);
-                currentSize = 0;
-            }
-        }
-
-        public SegmentedFile complete(String path)
-        {
-            long length = new File(path).length();
-            // create the segments
-            return new MmappedSegmentedFile(path, length, createSegments(path));
-        }
-
-        public SegmentedFile openEarly(String path)
-        {
-            return complete(path);
-        }
-
-        private Segment[] createSegments(String path)
-        {
-            RandomAccessFile raf;
-            long length;
-            try
-            {
-                raf = new RandomAccessFile(path, "r");
-                length = raf.length();
-            }
-            catch (IOException e)
-            {
-                throw new RuntimeException(e);
-            }
-
-            // add a sentinel value == length
-            List<Long> boundaries = new ArrayList<>(this.boundaries);
-            if (length != boundaries.get(boundaries.size() - 1))
-                boundaries.add(length);
-            int segcount = boundaries.size() - 1;
-            Segment[] segments = new Segment[segcount];
-
-            try
-            {
-                for (int i = 0; i < segcount; i++)
-                {
-                    long start = boundaries.get(i);
-                    long size = boundaries.get(i + 1) - start;
-                    MappedByteBuffer segment = size <= MAX_SEGMENT_SIZE
-                                               ? raf.getChannel().map(FileChannel.MapMode.READ_ONLY, start, size)
-                                               : null;
-                    segments[i] = new Segment(start, segment);
-                }
-            }
-            catch (IOException e)
-            {
-                throw new FSReadError(e, path);
-            }
-            finally
-            {
-                FileUtils.closeQuietly(raf);
-            }
-            return segments;
+            super.serializeBounds(out, version);
+            out.writeInt(0);
         }
 
         @Override
-        public void serializeBounds(DataOutput out) throws IOException
+        public void deserializeBounds(DataInput in, Version version) throws IOException
         {
-            super.serializeBounds(out);
-            out.writeInt(boundaries.size());
-            for (long position: boundaries)
-                out.writeLong(position);
+            if (!version.hasBoundaries())
+                return;
+
+            super.deserializeBounds(in, version);
+            in.skipBytes(in.readInt() * TypeSizes.sizeof(0L));
         }
 
         @Override
-        public void deserializeBounds(DataInput in) throws IOException
+        public Throwable close(Throwable accumulate)
         {
-            super.deserializeBounds(in);
-
-            int size = in.readInt();
-            List<Long> temp = new ArrayList<>(size);
-            
-            for (int i = 0; i < size; i++)
-                temp.add(in.readLong());
-
-            boundaries = temp;
+            return super.close(regions == null
+                               ? accumulate
+                               : regions.close(accumulate));
         }
     }
 }

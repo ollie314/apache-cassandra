@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,6 +19,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -28,14 +29,13 @@ import com.google.common.collect.Lists;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.Pair;
 
 import static org.apache.cassandra.db.compaction.DateTieredCompactionStrategy.getBuckets;
@@ -55,8 +55,7 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
     {
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1,
-                                    SimpleStrategy.class,
-                                    KSMetaData.optsWithRF(1),
+                                    KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1));
     }
 
@@ -81,7 +80,7 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
         {
             options.put(DateTieredCompactionStrategyOptions.BASE_TIME_KEY, "-1337");
             validateOptions(options);
-            fail(String.format("%Negative %s should be rejected", DateTieredCompactionStrategyOptions.BASE_TIME_KEY));
+            fail(String.format("Negative %s should be rejected", DateTieredCompactionStrategyOptions.BASE_TIME_KEY));
         }
         catch (ConfigurationException e)
         {
@@ -92,7 +91,7 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
         {
             options.put(DateTieredCompactionStrategyOptions.MAX_SSTABLE_AGE_KEY, "-1337");
             validateOptions(options);
-            fail(String.format("%Negative %s should be rejected", DateTieredCompactionStrategyOptions.MAX_SSTABLE_AGE_KEY));
+            fail(String.format("Negative %s should be rejected", DateTieredCompactionStrategyOptions.MAX_SSTABLE_AGE_KEY));
         }
         catch (ConfigurationException e)
         {
@@ -105,13 +104,43 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
     }
 
     @Test
+    public void testTimeConversions()
+    {
+        Map<String, String> options = new HashMap<>();
+        options.put(DateTieredCompactionStrategyOptions.BASE_TIME_KEY, "30");
+        options.put(DateTieredCompactionStrategyOptions.TIMESTAMP_RESOLUTION_KEY, "SECONDS");
+
+        DateTieredCompactionStrategyOptions opts = new DateTieredCompactionStrategyOptions(options);
+        assertEquals(opts.maxSSTableAge, TimeUnit.SECONDS.convert(365, TimeUnit.DAYS));
+
+        options.put(DateTieredCompactionStrategyOptions.TIMESTAMP_RESOLUTION_KEY, "MILLISECONDS");
+        opts = new DateTieredCompactionStrategyOptions(options);
+        assertEquals(opts.maxSSTableAge, TimeUnit.MILLISECONDS.convert(365, TimeUnit.DAYS));
+
+        options.put(DateTieredCompactionStrategyOptions.TIMESTAMP_RESOLUTION_KEY, "MICROSECONDS");
+        options.put(DateTieredCompactionStrategyOptions.MAX_SSTABLE_AGE_KEY, "10");
+        opts = new DateTieredCompactionStrategyOptions(options);
+        assertEquals(opts.maxSSTableAge, TimeUnit.MICROSECONDS.convert(10, TimeUnit.DAYS));
+
+        options.put(DateTieredCompactionStrategyOptions.MAX_SSTABLE_AGE_KEY, "0.5");
+        opts = new DateTieredCompactionStrategyOptions(options);
+        assertEquals(opts.maxSSTableAge, TimeUnit.MICROSECONDS.convert(1, TimeUnit.DAYS) / 2);
+
+        options.put(DateTieredCompactionStrategyOptions.TIMESTAMP_RESOLUTION_KEY, "HOURS");
+        options.put(DateTieredCompactionStrategyOptions.MAX_SSTABLE_AGE_KEY, "0.5");
+        opts = new DateTieredCompactionStrategyOptions(options);
+        assertEquals(opts.maxSSTableAge, 12);
+
+    }
+
+    @Test
     public void testGetBuckets()
     {
         List<Pair<String, Long>> pairs = Lists.newArrayList(
-                Pair.create("a", 199L),
-                Pair.create("b", 299L),
-                Pair.create("a", 1L),
-                Pair.create("b", 201L)
+                                                           Pair.create("a", 199L),
+                                                           Pair.create("b", 299L),
+                                                           Pair.create("a", 1L),
+                                                           Pair.create("b", 201L)
         );
         List<List<String>> buckets = getBuckets(pairs, 100L, 2, 200L);
         assertEquals(2, buckets.size());
@@ -184,17 +213,21 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
         for (int r = 0; r < numSSTables; r++)
         {
             DecoratedKey key = Util.dk(String.valueOf(r));
-            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
-            rm.add(CF_STANDARD1, Util.cellname("column"), value, r);
-            rm.apply();
+            new RowUpdateBuilder(cfs.metadata, r, key.getKey())
+                .clustering("column")
+                .add("val", value).build().applyUnsafe();
+
             cfs.forceBlockingFlush();
         }
         cfs.forceBlockingFlush();
 
-        List<SSTableReader> sstrs = new ArrayList<>(cfs.getSSTables());
+        List<SSTableReader> sstrs = new ArrayList<>(cfs.getLiveSSTables());
 
-        List<SSTableReader> newBucket = newestBucket(Collections.singletonList(sstrs.subList(0, 2)), 4, 32);
-        assertTrue("nothing should be returned when all buckets are below the min threshold", newBucket.isEmpty());
+        List<SSTableReader> newBucket = newestBucket(Collections.singletonList(sstrs.subList(0, 2)), 4, 32, 9, 10);
+        assertTrue("incoming bucket should not be accepted when it has below the min threshold SSTables", newBucket.isEmpty());
+
+        newBucket = newestBucket(Collections.singletonList(sstrs.subList(0, 2)), 4, 32, 10, 10);
+        assertFalse("non-incoming bucket should be accepted when it has at least 2 SSTables", newBucket.isEmpty());
 
         assertEquals("an sstable with a single value should have equal min/max timestamps", sstrs.get(0).getMinTimestamp(), sstrs.get(0).getMaxTimestamp());
         assertEquals("an sstable with a single value should have equal min/max timestamps", sstrs.get(1).getMinTimestamp(), sstrs.get(1).getMaxTimestamp());
@@ -228,15 +261,16 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
         for (int r = 0; r < numSSTables; r++)
         {
             DecoratedKey key = Util.dk(String.valueOf(r));
-            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
-            rm.add(CF_STANDARD1, Util.cellname("column"), value, r);
-            rm.apply();
+            new RowUpdateBuilder(cfs.metadata, r, key.getKey())
+                .clustering("column")
+                .add("val", value).build().applyUnsafe();
+
             cfs.forceBlockingFlush();
         }
         cfs.forceBlockingFlush();
 
         Iterable<SSTableReader> filtered;
-        List<SSTableReader> sstrs = new ArrayList<>(cfs.getSSTables());
+        List<SSTableReader> sstrs = new ArrayList<>(cfs.getLiveSSTables());
 
         filtered = filterOldSSTables(sstrs, 0, 2);
         assertEquals("when maxSSTableAge is zero, no sstables should be filtered", sstrs.size(), Iterables.size(filtered));
@@ -250,4 +284,54 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
         filtered = filterOldSSTables(sstrs, 1, 4);
         assertEquals("no sstables should remain when all are too old", 0, Iterables.size(filtered));
     }
+
+
+    @Test
+    public void testDropExpiredSSTables() throws InterruptedException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+
+        // create 2 sstables
+        DecoratedKey key = Util.dk(String.valueOf("expired"));
+        new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), 1, key.getKey())
+            .clustering("column")
+            .add("val", value).build().applyUnsafe();
+
+        cfs.forceBlockingFlush();
+        SSTableReader expiredSSTable = cfs.getLiveSSTables().iterator().next();
+        Thread.sleep(10);
+
+        key = Util.dk(String.valueOf("nonexpired"));
+        new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), key.getKey())
+            .clustering("column")
+            .add("val", value).build().applyUnsafe();
+
+        cfs.forceBlockingFlush();
+        assertEquals(cfs.getLiveSSTables().size(), 2);
+
+        Map<String, String> options = new HashMap<>();
+
+        options.put(DateTieredCompactionStrategyOptions.BASE_TIME_KEY, "30");
+        options.put(DateTieredCompactionStrategyOptions.TIMESTAMP_RESOLUTION_KEY, "MILLISECONDS");
+        options.put(DateTieredCompactionStrategyOptions.MAX_SSTABLE_AGE_KEY, Double.toString((1d / (24 * 60 * 60))));
+        options.put(DateTieredCompactionStrategyOptions.EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS_KEY, "0");
+        DateTieredCompactionStrategy dtcs = new DateTieredCompactionStrategy(cfs, options);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+            dtcs.addSSTable(sstable);
+        dtcs.startup();
+        assertNull(dtcs.getNextBackgroundTask((int) (System.currentTimeMillis() / 1000)));
+        Thread.sleep(2000);
+        AbstractCompactionTask t = dtcs.getNextBackgroundTask((int) (System.currentTimeMillis()/1000));
+        assertNotNull(t);
+        assertEquals(1, Iterables.size(t.transaction.originals()));
+        SSTableReader sstable = t.transaction.originals().iterator().next();
+        assertEquals(sstable, expiredSSTable);
+        t.transaction.abort();
+    }
+
 }

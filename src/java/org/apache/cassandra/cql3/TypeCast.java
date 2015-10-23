@@ -20,7 +20,7 @@ package org.apache.cassandra.cql3;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 
-public class TypeCast implements Term.Raw
+public class TypeCast extends Term.Raw
 {
     private final CQL3Type.Raw type;
     private final Term.Raw term;
@@ -49,24 +49,16 @@ public class TypeCast implements Term.Raw
 
     public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
     {
-        try
-        {
-            AbstractType<?> castedType = type.prepare(keyspace).getType();
-            if (receiver.type.equals(castedType))
-                return AssignmentTestable.TestResult.EXACT_MATCH;
-            else if (receiver.type.isValueCompatibleWith(castedType))
-                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
-            else
-                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
-        }
-        catch (InvalidRequestException e)
-        {
-            throw new AssertionError();
-        }
+        AbstractType<?> castedType = type.prepare(keyspace).getType();
+        if (receiver.type.equals(castedType))
+            return AssignmentTestable.TestResult.EXACT_MATCH;
+        else if (receiver.type.isValueCompatibleWith(castedType))
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+        else
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
     }
 
-    @Override
-    public String toString()
+    public String getText()
     {
         return "(" + type + ")" + term;
     }

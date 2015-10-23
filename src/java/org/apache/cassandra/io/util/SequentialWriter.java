@@ -18,42 +18,38 @@
 package org.apache.cassandra.io.util;
 
 import java.io.*;
-import java.nio.ByteBuffer;
-import java.nio.channels.ClosedChannelException;
-import java.nio.channels.WritableByteChannel;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.compress.CompressedSequentialWriter;
-import org.apache.cassandra.io.compress.CompressionParameters;
+import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.CLibrary;
+import org.apache.cassandra.utils.concurrent.Transactional;
+
+import static org.apache.cassandra.utils.Throwables.merge;
+
+import org.apache.cassandra.utils.SyncUtil;
 
 /**
  * Adds buffering, mark, and fsyncing to OutputStream.  We always fsync on close; we may also
  * fsync incrementally if Config.trickle_fsync is enabled.
  */
-public class SequentialWriter extends OutputStream implements WritableByteChannel
+public class SequentialWriter extends BufferedDataOutputStreamPlus implements Transactional
 {
-    // isDirty - true if this.buffer contains any un-synced bytes
-    protected boolean isDirty = false, syncNeeded = false;
+    private static final int DEFAULT_BUFFER_SIZE = 64 * 1024;
 
     // absolute path to the given file
     private final String filePath;
 
-    protected byte[] buffer;
-    private final int fd;
-    private final int directoryFD;
-    // directory should be synced only after first file sync, in other words, only once per file
-    private boolean directorySynced = false;
+    // Offset for start of buffer relative to underlying file
+    protected long bufferOffset;
 
-    protected long current = 0, bufferOffset;
-    protected int validBufferBytes;
-
-    protected final RandomAccessFile out;
+    protected final FileChannel fchannel;
 
     // whether to do trickling fsync() to avoid sudden bursts of dirty buffer flushing by kernel causing read
     // latency spikes
@@ -61,171 +57,116 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
     private int trickleFsyncByteInterval;
     private int bytesSinceTrickleFsync = 0;
 
-    public final DataOutputPlus stream;
     protected long lastFlushOffset;
 
-    public SequentialWriter(File file, int bufferSize)
+    protected Runnable runPostFlush;
+
+    private final TransactionalProxy txnProxy = txnProxy();
+    private boolean finishOnClose;
+    protected Descriptor descriptor;
+
+    // due to lack of multiple-inheritance, we proxy our transactional implementation
+    protected class TransactionalProxy extends AbstractTransactional
     {
+        @Override
+        protected Throwable doPreCleanup(Throwable accumulate)
+        {
+            // close is idempotent
+            try { channel.close(); }
+            catch (Throwable t) { accumulate = merge(accumulate, t); }
+
+            if (buffer != null)
+            {
+                try { FileUtils.clean(buffer); }
+                catch (Throwable t) { accumulate = merge(accumulate, t); }
+                buffer = null;
+            }
+
+            return accumulate;
+        }
+
+        protected void doPrepare()
+        {
+            syncInternal();
+        }
+
+        protected Throwable doCommit(Throwable accumulate)
+        {
+            return accumulate;
+        }
+
+        protected Throwable doAbort(Throwable accumulate)
+        {
+            return accumulate;
+        }
+    }
+
+    // TODO: we should specify as a parameter if we permit an existing file or not
+    private static FileChannel openChannel(File file) {
         try
         {
-            out = new RandomAccessFile(file, "rw");
-        }
-        catch (FileNotFoundException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        filePath = file.getAbsolutePath();
-
-        buffer = new byte[bufferSize];
-        this.trickleFsync = DatabaseDescriptor.getTrickleFsync();
-        this.trickleFsyncByteInterval = DatabaseDescriptor.getTrickleFsyncIntervalInKb() * 1024;
-
-        try
-        {
-            fd = CLibrary.getfd(out.getFD());
+            if (file.exists())
+            {
+                return FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+            }
+            else
+            {
+                FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
+                try
+                {
+                    SyncUtil.trySyncDir(file.getParentFile());
+                }
+                catch (Throwable t)
+                {
+                    try { channel.close(); }
+                    catch (Throwable t2) { t.addSuppressed(t2); }
+                }
+                return channel;
+            }
         }
         catch (IOException e)
         {
-            throw new RuntimeException(e); // shouldn't happen
+            throw new RuntimeException(e);
         }
-
-        directoryFD = CLibrary.tryOpenDirectory(file.getParent());
-        stream = new DataOutputStreamAndChannel(this, this);
     }
 
+    public SequentialWriter(File file, int bufferSize, BufferType bufferType)
+    {
+        super(openChannel(file), bufferType.allocate(bufferSize));
+        strictFlushing = true;
+        fchannel = (FileChannel)channel;
+
+        filePath = file.getAbsolutePath();
+
+        this.trickleFsync = DatabaseDescriptor.getTrickleFsync();
+        this.trickleFsyncByteInterval = DatabaseDescriptor.getTrickleFsyncIntervalInKb() * 1024;
+    }
+
+    /**
+     * Open a heap-based, non-compressed SequentialWriter
+     */
     public static SequentialWriter open(File file)
     {
-        return open(file, RandomAccessReader.DEFAULT_BUFFER_SIZE);
-    }
-
-    public static SequentialWriter open(File file, int bufferSize)
-    {
-        return new SequentialWriter(file, bufferSize);
+        return new SequentialWriter(file, DEFAULT_BUFFER_SIZE, BufferType.ON_HEAP);
     }
 
     public static ChecksummedSequentialWriter open(File file, File crcPath)
     {
-        return new ChecksummedSequentialWriter(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, crcPath);
+        return new ChecksummedSequentialWriter(file, DEFAULT_BUFFER_SIZE, crcPath);
     }
 
     public static CompressedSequentialWriter open(String dataFilePath,
                                                   String offsetsPath,
-                                                  CompressionParameters parameters,
+                                                  CompressionParams parameters,
                                                   MetadataCollector sstableMetadataCollector)
     {
         return new CompressedSequentialWriter(new File(dataFilePath), offsetsPath, parameters, sstableMetadataCollector);
     }
 
-    public void write(int value) throws ClosedChannelException
+    public SequentialWriter finishOnClose()
     {
-        if (current >= bufferOffset + buffer.length)
-            reBuffer();
-
-        assert current < bufferOffset + buffer.length
-                : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
-
-        buffer[bufferCursor()] = (byte) value;
-
-        validBufferBytes += 1;
-        current += 1;
-        isDirty = true;
-        syncNeeded = true;
-    }
-
-    public void write(byte[] buffer) throws ClosedChannelException
-    {
-        write(buffer, 0, buffer.length);
-    }
-
-    public void write(byte[] data, int offset, int length) throws ClosedChannelException
-    {
-        if (buffer == null)
-            throw new ClosedChannelException();
-
-        while (length > 0)
-        {
-            int n = writeAtMost(data, offset, length);
-            offset += n;
-            length -= n;
-            isDirty = true;
-            syncNeeded = true;
-        }
-    }
-
-    public int write(ByteBuffer src) throws IOException
-    {
-        if (buffer == null)
-            throw new ClosedChannelException();
-
-        int length = src.remaining();
-        int offset = src.position();
-        while (length > 0)
-        {
-            int n = writeAtMost(src, offset, length);
-            offset += n;
-            length -= n;
-            isDirty = true;
-            syncNeeded = true;
-        }
-        src.position(offset);
-        return length;
-    }
-
-    /*
-     * Write at most "length" bytes from "data" starting at position "offset", and
-     * return the number of bytes written. caller is responsible for setting
-     * isDirty.
-     */
-    private int writeAtMost(ByteBuffer data, int offset, int length)
-    {
-        if (current >= bufferOffset + buffer.length)
-            reBuffer();
-
-        assert current < bufferOffset + buffer.length
-        : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
-
-
-        int toCopy = Math.min(length, buffer.length - bufferCursor());
-
-        // copy bytes from external buffer
-        ByteBufferUtil.arrayCopy(data, offset, buffer, bufferCursor(), toCopy);
-
-        assert current <= bufferOffset + buffer.length
-        : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
-
-        validBufferBytes = Math.max(validBufferBytes, bufferCursor() + toCopy);
-        current += toCopy;
-
-        return toCopy;
-    }
-
-    /*
-     * Write at most "length" bytes from "data" starting at position "offset", and
-     * return the number of bytes written. caller is responsible for setting
-     * isDirty.
-     */
-    private int writeAtMost(byte[] data, int offset, int length)
-    {
-        if (current >= bufferOffset + buffer.length)
-            reBuffer();
-
-        assert current < bufferOffset + buffer.length
-                : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
-
-
-        int toCopy = Math.min(length, buffer.length - bufferCursor());
-
-        // copy bytes from external buffer
-        System.arraycopy(data, offset, buffer, bufferCursor(), toCopy);
-
-        assert current <= bufferOffset + buffer.length
-                : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
-
-        validBufferBytes = Math.max(validBufferBytes, bufferCursor() + toCopy);
-        current += toCopy;
-
-        return toCopy;
+        finishOnClose = true;
+        return this;
     }
 
     /**
@@ -240,7 +181,7 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
     {
         try
         {
-            out.getFD().sync();
+            SyncUtil.force(fchannel, false);
         }
         catch (IOException e)
         {
@@ -248,55 +189,40 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
         }
     }
 
+    /*
+     * This is only safe to call before truncation or close for CompressedSequentialWriter
+     * Otherwise it will leave a non-uniform size compressed block in the middle of the file
+     * and the compressed format can't handle that.
+     */
     protected void syncInternal()
     {
-        if (syncNeeded)
-        {
-            flushInternal();
-            syncDataOnlyInternal();
-
-            if (!directorySynced)
-            {
-                CLibrary.trySync(directoryFD);
-                directorySynced = true;
-            }
-
-            syncNeeded = false;
-        }
+        doFlush();
+        syncDataOnlyInternal();
     }
 
-    /**
-     * If buffer is dirty, flush it's contents to the operating system. Does not imply fsync().
-     *
-     * Currently, for implementation reasons, this also invalidates the buffer.
-     */
     @Override
-    public void flush()
+    protected void doFlush()
     {
-        flushInternal();
+        flushData();
+
+        if (trickleFsync)
+        {
+            bytesSinceTrickleFsync += buffer.position();
+            if (bytesSinceTrickleFsync >= trickleFsyncByteInterval)
+            {
+                syncDataOnlyInternal();
+                bytesSinceTrickleFsync = 0;
+            }
+        }
+
+        // Remember that we wrote, so we don't write it again on next flush().
+        resetBuffer();
     }
 
-    protected void flushInternal()
+    public void setPostFlushListener(Runnable runPostFlush)
     {
-        if (isDirty)
-        {
-            flushData();
-
-            if (trickleFsync)
-            {
-                bytesSinceTrickleFsync += validBufferBytes;
-                if (bytesSinceTrickleFsync >= trickleFsyncByteInterval)
-                {
-                    syncDataOnlyInternal();
-                    bytesSinceTrickleFsync = 0;
-                }
-            }
-
-            // Remember that we wrote, so we don't write it again on next flush().
-            resetBuffer();
-
-            isDirty = false;
-        }
+        assert this.runPostFlush == null;
+        this.runPostFlush = runPostFlush;
     }
 
     /**
@@ -307,18 +233,26 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
     {
         try
         {
-            out.write(buffer, 0, validBufferBytes);
-            lastFlushOffset += validBufferBytes;
+            buffer.flip();
+            channel.write(buffer);
+            lastFlushOffset += buffer.position();
         }
         catch (IOException e)
         {
             throw new FSWriteError(e, getPath());
         }
+        if (runPostFlush != null)
+            runPostFlush.run();
     }
 
-    public long getFilePointer()
+    public boolean hasPosition()
     {
-        return current;
+        return true;
+    }
+
+    public long position()
+    {
+        return current();
     }
 
     /**
@@ -327,19 +261,19 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
      * size and not every write to the writer will modify this value.
      * Furthermore, for compressed files, this value refers to compressed data, while the
      * writer getFilePointer() refers to uncompressedFile
-     * 
+     *
      * @return the current file pointer
      */
     public long getOnDiskFilePointer()
     {
-        return getFilePointer();
+        return position();
     }
 
     public long length()
     {
         try
         {
-            return Math.max(Math.max(current, out.length()), bufferOffset + validBufferBytes);
+            return Math.max(current(), fchannel.size());
         }
         catch (IOException e)
         {
@@ -352,52 +286,50 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
         return filePath;
     }
 
-    protected void reBuffer()
-    {
-        flushInternal();
-        resetBuffer();
-    }
-
     protected void resetBuffer()
     {
-        bufferOffset = current;
-        validBufferBytes = 0;
+        bufferOffset = current();
+        buffer.clear();
     }
 
-    private int bufferCursor()
+    protected long current()
     {
-        return (int) (current - bufferOffset);
+        return bufferOffset + (buffer == null ? 0 : buffer.position());
     }
 
     public FileMark mark()
     {
-        return new BufferedFileWriterMark(current);
+        return new BufferedFileWriterMark(current());
     }
 
+    /**
+     * Drops all buffered data that's past the limits of our new file mark + buffer capacity, or syncs and truncates
+     * the underlying file to the marked position
+     */
     public void resetAndTruncate(FileMark mark)
     {
         assert mark instanceof BufferedFileWriterMark;
 
-        long previous = current;
-        current = ((BufferedFileWriterMark) mark).pointer;
+        long previous = current();
+        long truncateTarget = ((BufferedFileWriterMark) mark).pointer;
 
-        if (previous - current <= validBufferBytes) // current buffer
+        // If we're resetting to a point within our buffered data, just adjust our buffered position to drop bytes to
+        // the right of the desired mark.
+        if (previous - truncateTarget <= buffer.position())
         {
-            validBufferBytes = validBufferBytes - ((int) (previous - current));
+            buffer.position(buffer.position() - ((int) (previous - truncateTarget)));
             return;
         }
 
-        // synchronize current buffer with disk
-        // because we don't want any data loss
+        // synchronize current buffer with disk - we don't want any data loss
         syncInternal();
 
         // truncate file to given position
-        truncate(current);
+        truncate(truncateTarget);
 
-        // reset channel position
         try
         {
-            out.seek(current);
+            fchannel.position(truncateTarget);
         }
         catch (IOException e)
         {
@@ -416,7 +348,7 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
     {
         try
         {
-            out.getChannel().truncate(toSize);
+            fchannel.truncate(toSize);
         }
         catch (IOException e)
         {
@@ -426,34 +358,47 @@ public class SequentialWriter extends OutputStream implements WritableByteChanne
 
     public boolean isOpen()
     {
-        return out.getChannel().isOpen();
+        return channel.isOpen();
+    }
+
+    public SequentialWriter setDescriptor(Descriptor descriptor)
+    {
+        this.descriptor = descriptor;
+        return this;
+    }
+
+    public final void prepareToCommit()
+    {
+        txnProxy.prepareToCommit();
+    }
+
+    public final Throwable commit(Throwable accumulate)
+    {
+        return txnProxy.commit(accumulate);
+    }
+
+    public final Throwable abort(Throwable accumulate)
+    {
+        return txnProxy.abort(accumulate);
     }
 
     @Override
-    public void close()
+    public final void close()
     {
-        if (buffer == null)
-            return; // already closed
-
-        syncInternal();
-
-        buffer = null;
-
-        try
-        {
-            out.close();
-        }
-        catch (IOException e)
-        {
-            throw new FSWriteError(e, getPath());
-        }
-
-        CLibrary.tryCloseFD(directoryFD);
+        if (finishOnClose)
+            txnProxy.finish();
+        else
+            txnProxy.close();
     }
 
-    // hack to make life easier for subclasses
-    public void writeFullChecksum(Descriptor descriptor)
+    public final void finish()
     {
+        txnProxy.finish();
+    }
+
+    protected TransactionalProxy txnProxy()
+    {
+        return new TransactionalProxy();
     }
 
     /**

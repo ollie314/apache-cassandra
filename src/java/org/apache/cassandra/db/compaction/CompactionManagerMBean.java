@@ -19,6 +19,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import javax.management.openmbean.TabularData;
 
 public interface CompactionManagerMBean
@@ -31,34 +32,6 @@ public interface CompactionManagerMBean
 
     /** compaction history **/
     public TabularData getCompactionHistory();
-
-    /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#pendingTasks
-     * @return estimated number of compactions remaining to perform
-     */
-    @Deprecated
-    public int getPendingTasks();
-
-    /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#completedTasks
-     * @return number of completed compactions since server [re]start
-     */
-    @Deprecated
-    public long getCompletedTasks();
-
-    /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#bytesCompacted
-     * @return total number of bytes compacted since server [re]start
-     */
-    @Deprecated
-    public long getTotalBytesCompacted();
-
-    /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#totalCompactionsCompleted
-     * @return total number of compactions since server [re]start
-     */
-    @Deprecated
-    public long getTotalCompactionsCompleted();
 
     /**
      * Triggers the compaction of user specified sstables.
@@ -81,6 +54,14 @@ public interface CompactionManagerMBean
      *   - INDEX_BUILD
      */
     public void stopCompaction(String type);
+
+    /**
+     * Stop an individual running compaction using the compactionId.
+     * @param compactionId Compaction ID of compaction to stop. Such IDs can be found in
+     *                     the transaction log files whose name starts with compaction_,
+     *                     located in the table transactions folder.
+     */
+    public void stopCompactionById(String compactionId);
 
     /**
      * Returns core size of compaction thread pool

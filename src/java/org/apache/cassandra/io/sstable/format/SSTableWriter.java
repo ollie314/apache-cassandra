@@ -18,30 +18,30 @@
 
 package org.apache.cassandra.io.sstable.format;
 
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Sets;
+
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.RowIndexEntry;
-import org.apache.cassandra.db.compaction.AbstractCompactedRow;
-import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
+import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.Pair;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.DataInput;
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
+import org.apache.cassandra.utils.concurrent.Transactional;
 
 /**
  * This is the API all table writers must implement.
@@ -49,51 +49,80 @@ import java.util.Set;
  * TableWriter.create() is the primary way to create a writer for a particular format.
  * The format information is part of the Descriptor.
  */
-public abstract class SSTableWriter extends SSTable
+public abstract class SSTableWriter extends SSTable implements Transactional
 {
-    private static final Logger logger = LoggerFactory.getLogger(SSTableWriter.class);
-
-    protected final long repairedAt;
+    protected long repairedAt;
+    protected long maxDataAge = -1;
     protected final long keyCount;
     protected final MetadataCollector metadataCollector;
     protected final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+    protected final SerializationHeader header;
+    protected final TransactionalProxy txnProxy = txnProxy();
 
-    protected SSTableWriter(Descriptor descriptor, long keyCount, long repairedAt, CFMetaData metadata, IPartitioner partitioner, MetadataCollector metadataCollector)
+    protected abstract TransactionalProxy txnProxy();
+
+    // due to lack of multiple inheritance, we use an inner class to proxy our Transactional implementation details
+    protected abstract class TransactionalProxy extends AbstractTransactional
     {
-        super(descriptor, components(metadata), metadata, partitioner);
+        // should be set during doPrepare()
+        protected SSTableReader finalReader;
+        protected boolean openResult;
+    }
+
+    protected SSTableWriter(Descriptor descriptor, 
+                            long keyCount, 
+                            long repairedAt, 
+                            CFMetaData metadata, 
+                            MetadataCollector metadataCollector, 
+                            SerializationHeader header)
+    {
+        super(descriptor, components(metadata), metadata);
         this.keyCount = keyCount;
         this.repairedAt = repairedAt;
         this.metadataCollector = metadataCollector;
-        this.rowIndexEntrySerializer = descriptor.version.getSSTableFormat().getIndexSerializer(metadata);
+        this.header = header;
+        this.rowIndexEntrySerializer = descriptor.version.getSSTableFormat().getIndexSerializer(metadata, descriptor.version, header);
     }
 
-    public static SSTableWriter create(Descriptor descriptor, Long keyCount, Long repairedAt, CFMetaData metadata,  IPartitioner partitioner, MetadataCollector metadataCollector)
+    public static SSTableWriter create(Descriptor descriptor,
+                                       Long keyCount,
+                                       Long repairedAt,
+                                       CFMetaData metadata,
+                                       MetadataCollector metadataCollector,
+                                       SerializationHeader header,
+                                       LifecycleTransaction txn)
     {
         Factory writerFactory = descriptor.getFormat().getWriterFactory();
-        return writerFactory.open(descriptor, keyCount, repairedAt, metadata, partitioner, metadataCollector);
+        return writerFactory.open(descriptor, keyCount, repairedAt, metadata, metadataCollector, header, txn);
     }
 
-    public static SSTableWriter create(Descriptor descriptor, long keyCount, long repairedAt)
-    {
-        return create(descriptor, keyCount, repairedAt, 0);
-    }
-
-    public static SSTableWriter create(Descriptor descriptor, long keyCount, long repairedAt, int sstableLevel)
+    public static SSTableWriter create(Descriptor descriptor, long keyCount, long repairedAt, int sstableLevel, SerializationHeader header, LifecycleTransaction txn)
     {
         CFMetaData metadata = Schema.instance.getCFMetaData(descriptor);
+        return create(metadata, descriptor, keyCount, repairedAt, sstableLevel, header, txn);
+    }
+
+    public static SSTableWriter create(CFMetaData metadata,
+                                       Descriptor descriptor,
+                                       long keyCount,
+                                       long repairedAt,
+                                       int sstableLevel,
+                                       SerializationHeader header,
+                                       LifecycleTransaction txn)
+    {
         MetadataCollector collector = new MetadataCollector(metadata.comparator).sstableLevel(sstableLevel);
-
-        return create(descriptor, keyCount, repairedAt, metadata, DatabaseDescriptor.getPartitioner(), collector);
+        return create(descriptor, keyCount, repairedAt, metadata, collector, header, txn);
     }
 
-    public static SSTableWriter create(String filename, long keyCount, long repairedAt, int sstableLevel)
+    public static SSTableWriter create(String filename, long keyCount, long repairedAt, int sstableLevel, SerializationHeader header,LifecycleTransaction txn)
     {
-        return create(Descriptor.fromFilename(filename), keyCount, repairedAt, sstableLevel);
+        return create(Descriptor.fromFilename(filename), keyCount, repairedAt, sstableLevel, header, txn);
     }
 
-    public static SSTableWriter create(String filename, long keyCount, long repairedAt)
+    @VisibleForTesting
+    public static SSTableWriter create(String filename, long keyCount, long repairedAt, SerializationHeader header, LifecycleTransaction txn)
     {
-        return create(Descriptor.fromFilename(filename), keyCount, repairedAt, 0);
+        return create(Descriptor.fromFilename(filename), keyCount, repairedAt, 0, header, txn);
     }
 
     private static Set<Component> components(CFMetaData metadata)
@@ -103,12 +132,12 @@ public abstract class SSTableWriter extends SSTable
                 Component.STATS,
                 Component.SUMMARY,
                 Component.TOC,
-                Component.DIGEST));
+                Component.digestFor(BigFormat.latestVersion.uncompressedChecksumType())));
 
-        if (metadata.getBloomFilterFpChance() < 1.0)
+        if (metadata.params.bloomFilterFpChance < 1.0)
             components.add(Component.FILTER);
 
-        if (metadata.compressionParameters().sstableCompressor != null)
+        if (metadata.params.compression.isEnabled())
         {
             components.add(Component.COMPRESSION_INFO);
         }
@@ -121,52 +150,116 @@ public abstract class SSTableWriter extends SSTable
         return components;
     }
 
-
     public abstract void mark();
 
-
     /**
-     * @param row
-     * @return null if the row was compacted away entirely; otherwise, the PK index entry for this row
+     * Appends partition data to this writer.
+     *
+     * @param iterator the partition to write
+     * @return the created index entry if something was written, that is if {@code iterator}
+     * wasn't empty, {@code null} otherwise.
+     *
+     * @throws FSWriteError if a write to the dataFile fails
      */
-    public abstract RowIndexEntry append(AbstractCompactedRow row);
-
-    public abstract void append(DecoratedKey decoratedKey, ColumnFamily cf);
-
-    public abstract long appendFromStream(DecoratedKey key, CFMetaData metadata, DataInput in, Version version) throws IOException;
+    public abstract RowIndexEntry append(UnfilteredRowIterator iterator);
 
     public abstract long getFilePointer();
 
     public abstract long getOnDiskFilePointer();
 
-    public abstract void isolateReferences();
-
     public abstract void resetAndTruncate();
 
-    public SSTableReader closeAndOpenReader()
+    public SSTableWriter setRepairedAt(long repairedAt)
     {
-        return closeAndOpenReader(System.currentTimeMillis());
+        if (repairedAt > 0)
+            this.repairedAt = repairedAt;
+        return this;
     }
 
-    public SSTableReader closeAndOpenReader(long maxDataAge)
+    public SSTableWriter setMaxDataAge(long maxDataAge)
     {
-        return closeAndOpenReader(maxDataAge, repairedAt);
+        this.maxDataAge = maxDataAge;
+        return this;
     }
 
-    public abstract SSTableReader closeAndOpenReader(long maxDataAge, long repairedAt);
-
-    public abstract SSTableReader openEarly(long maxDataAge);
-
-    // Close the writer and return the descriptor to the new sstable and it's metadata
-    public abstract Pair<Descriptor, StatsMetadata> close();
-
-
-
-    public static Descriptor rename(Descriptor tmpdesc, Set<Component> components)
+    public SSTableWriter setOpenResult(boolean openResult)
     {
-        Descriptor newdesc = tmpdesc.asType(Descriptor.Type.FINAL);
-        rename(tmpdesc, newdesc, components);
-        return newdesc;
+        txnProxy.openResult = openResult;
+        return this;
+    }
+
+    /**
+     * Open the resultant SSTableReader before it has been fully written
+     */
+    public abstract SSTableReader openEarly();
+
+    /**
+     * Open the resultant SSTableReader once it has been fully written, but before the
+     * _set_ of tables that are being written together as one atomic operation are all ready
+     */
+    public abstract SSTableReader openFinalEarly();
+
+    public SSTableReader finish(long repairedAt, long maxDataAge, boolean openResult)
+    {
+        if (repairedAt > 0)
+            this.repairedAt = repairedAt;
+        this.maxDataAge = maxDataAge;
+        return finish(openResult);
+    }
+
+    public SSTableReader finish(boolean openResult)
+    {
+        setOpenResult(openResult);
+        txnProxy.finish();
+        return finished();
+    }
+
+    /**
+     * Open the resultant SSTableReader once it has been fully written, and all related state
+     * is ready to be finalised including other sstables being written involved in the same operation
+     */
+    public SSTableReader finished()
+    {
+        return txnProxy.finalReader;
+    }
+
+    // finalise our state on disk, including renaming
+    public final void prepareToCommit()
+    {
+        txnProxy.prepareToCommit();
+    }
+
+    public final Throwable commit(Throwable accumulate)
+    {
+        return txnProxy.commit(accumulate);
+    }
+
+    public final Throwable abort(Throwable accumulate)
+    {
+        return txnProxy.abort(accumulate);
+    }
+
+    public final void close()
+    {
+        txnProxy.close();
+    }
+
+    public final void abort()
+    {
+        txnProxy.abort();
+    }
+
+    protected Map<MetadataType, MetadataComponent> finalizeMetadata()
+    {
+        return metadataCollector.finalizeMetadata(getPartitioner().getClass().getCanonicalName(),
+                                                  metadata.params.bloomFilterFpChance,
+                                                  repairedAt,
+                                                  header);
+    }
+
+    protected StatsMetadata statsMetadata()
+    {
+        return (StatsMetadata) finalizeMetadata().get(MetadataType.STATS);
     }
 
     public static void rename(Descriptor tmpdesc, Descriptor newdesc, Set<Component> components)
@@ -184,19 +277,14 @@ public abstract class SSTableWriter extends SSTable
     }
 
 
-    /**
-     * After failure, attempt to close the index writer and data file before deleting all temp components for the sstable
-     */
-    public void abort()
-    {
-        abort(true);
-    }
-
-    public abstract void abort(boolean closeBf);
-
-
     public static abstract class Factory
     {
-        public abstract SSTableWriter open(Descriptor descriptor, long keyCount, long repairedAt, CFMetaData metadata, IPartitioner partitioner, MetadataCollector metadataCollector);
+        public abstract SSTableWriter open(Descriptor descriptor,
+                                           long keyCount,
+                                           long repairedAt,
+                                           CFMetaData metadata,
+                                           MetadataCollector metadataCollector,
+                                           SerializationHeader header,
+                                           LifecycleTransaction txn);
     }
 }
