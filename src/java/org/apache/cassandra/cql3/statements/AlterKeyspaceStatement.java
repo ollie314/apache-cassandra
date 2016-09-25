@@ -19,6 +19,7 @@ package org.apache.cassandra.cql3.statements;
 
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.locator.LocalStrategy;
 import org.apache.cassandra.schema.KeyspaceMetadata;
@@ -55,7 +56,7 @@ public class AlterKeyspaceStatement extends SchemaAlteringStatement
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name);
         if (ksm == null)
             throw new InvalidRequestException("Unknown keyspace " + name);
-        if (Schema.isSystemKeyspace(ksm.name))
+        if (SchemaConstants.isSystemKeyspace(ksm.name))
             throw new InvalidRequestException("Cannot alter system keyspace");
 
         attrs.validate();
@@ -75,7 +76,7 @@ public class AlterKeyspaceStatement extends SchemaAlteringStatement
         }
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws RequestValidationException
+    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws RequestValidationException
     {
         KeyspaceMetadata oldKsm = Schema.instance.getKSMetaData(name);
         // In the (very) unlikely case the keyspace was dropped since validate()
@@ -84,11 +85,6 @@ public class AlterKeyspaceStatement extends SchemaAlteringStatement
 
         KeyspaceMetadata newKsm = oldKsm.withSwapped(attrs.asAlteredKeyspaceParams(oldKsm.params));
         MigrationManager.announceKeyspaceUpdate(newKsm, isLocalOnly);
-        return true;
-    }
-
-    public Event.SchemaChange changeEvent()
-    {
         return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, keyspace());
     }
 }

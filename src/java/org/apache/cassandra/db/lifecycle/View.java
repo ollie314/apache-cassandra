@@ -39,8 +39,6 @@ import static com.google.common.collect.ImmutableList.of;
 import static com.google.common.collect.Iterables.all;
 import static com.google.common.collect.Iterables.concat;
 import static com.google.common.collect.Iterables.filter;
-import static com.google.common.collect.Iterables.transform;
-import static java.util.Collections.singleton;
 import static org.apache.cassandra.db.lifecycle.Helpers.emptySet;
 import static org.apache.cassandra.db.lifecycle.Helpers.filterOut;
 import static org.apache.cassandra.db.lifecycle.Helpers.replace;
@@ -116,14 +114,9 @@ public class View
         return sstables;
     }
 
-    public Iterable<SSTableReader> sstables(SSTableSet sstableSet)
-    {
-        return select(sstableSet, sstables);
-    }
-
     public Iterable<SSTableReader> sstables(SSTableSet sstableSet, Predicate<SSTableReader> filter)
     {
-        return select(sstableSet, filter(sstables, filter));
+        return filter(select(sstableSet), filter);
     }
 
     // any sstable known by this tracker in any form; we have a special method here since it's only used for testing/debug
@@ -134,7 +127,7 @@ public class View
         return Iterables.concat(sstables, filterOut(compacting, sstables));
     }
 
-    private Iterable<SSTableReader> select(SSTableSet sstableSet, Iterable<SSTableReader> sstables)
+    public Iterable<SSTableReader> select(SSTableSet sstableSet)
     {
         switch (sstableSet)
         {
@@ -143,9 +136,18 @@ public class View
             case NONCOMPACTING:
                 return filter(sstables, (s) -> !compacting.contains(s));
             case CANONICAL:
-                return transform(filter(sstables,
-                                        (s) -> s.openReason != SSTableReader.OpenReason.EARLY),
-                                 (s) -> s.openReason != SSTableReader.OpenReason.MOVED_START ? s : compactingMap.get(s));
+                Set<SSTableReader> canonicalSSTables = new HashSet<>();
+                for (SSTableReader sstable : compacting)
+                    if (sstable.openReason != SSTableReader.OpenReason.EARLY)
+                        canonicalSSTables.add(sstable);
+                // reason for checking if compacting contains the sstable is that if compacting has an EARLY version
+                // of a NORMAL sstable, we still have the canonical version of that sstable in sstables.
+                // note that the EARLY version is equal, but not == since it is a different instance of the same sstable.
+                for (SSTableReader sstable : sstables)
+                    if (!compacting.contains(sstable) && sstable.openReason != SSTableReader.OpenReason.EARLY)
+                        canonicalSSTables.add(sstable);
+
+                return canonicalSSTables;
             default:
                 throw new IllegalStateException();
         }
@@ -180,7 +182,7 @@ public class View
      * Returns the sstables that have any partition between {@code left} and {@code right}, when both bounds are taken inclusively.
      * The interval formed by {@code left} and {@code right} shouldn't wrap.
      */
-    public Iterable<SSTableReader> sstablesInBounds(SSTableSet sstableSet, PartitionPosition left, PartitionPosition right)
+    public Iterable<SSTableReader> liveSSTablesInBounds(PartitionPosition left, PartitionPosition right)
     {
         assert !AbstractBounds.strictlyWrapsAround(left, right);
 
@@ -188,12 +190,23 @@ public class View
             return Collections.emptyList();
 
         PartitionPosition stopInTree = right.isMinimum() ? intervalTree.max() : right;
-        return select(sstableSet, intervalTree.search(Interval.create(left, stopInTree)));
+        return intervalTree.search(Interval.create(left, stopInTree));
     }
 
-    public static Function<View, Iterable<SSTableReader>> select(SSTableSet sstableSet)
+    public static List<SSTableReader> sstablesInBounds(PartitionPosition left, PartitionPosition right, SSTableIntervalTree intervalTree)
     {
-        return (view) -> view.sstables(sstableSet);
+        assert !AbstractBounds.strictlyWrapsAround(left, right);
+
+        if (intervalTree.isEmpty())
+            return Collections.emptyList();
+
+        PartitionPosition stopInTree = right.isMinimum() ? intervalTree.max() : right;
+        return intervalTree.search(Interval.create(left, stopInTree));
+    }
+
+    public static Function<View, Iterable<SSTableReader>> selectFunction(SSTableSet sstableSet)
+    {
+        return (view) -> view.select(sstableSet);
     }
 
     public static Function<View, Iterable<SSTableReader>> select(SSTableSet sstableSet, Predicate<SSTableReader> filter)
@@ -215,14 +228,14 @@ public class View
      * @return a ViewFragment containing the sstables and memtables that may need to be merged
      * for rows within @param rowBounds, inclusive, according to the interval tree.
      */
-    public static Function<View, Iterable<SSTableReader>> select(SSTableSet sstableSet, AbstractBounds<PartitionPosition> rowBounds)
+    public static Function<View, Iterable<SSTableReader>> selectLive(AbstractBounds<PartitionPosition> rowBounds)
     {
         // Note that View.sstablesInBounds always includes it's bound while rowBounds may not. This is ok however
         // because the fact we restrict the sstables returned by this function is an optimization in the first
         // place and the returned sstables will (almost) never cover *exactly* rowBounds anyway. It's also
         // *very* unlikely that a sstable is included *just* because we consider one of the bound inclusively
         // instead of exclusively, so the performance impact is negligible in practice.
-        return (view) -> view.sstablesInBounds(sstableSet, rowBounds.left, rowBounds.right);
+        return (view) -> view.liveSSTablesInBounds(rowBounds.left, rowBounds.right);
     }
 
     // METHODS TO CONSTRUCT FUNCTIONS FOR MODIFYING A VIEW:
@@ -310,7 +323,7 @@ public class View
     }
 
     // called after flush: removes memtable from flushingMemtables, and inserts flushed into the live sstable set
-    static Function<View, View> replaceFlushed(final Memtable memtable, final Collection<SSTableReader> flushed)
+    static Function<View, View> replaceFlushed(final Memtable memtable, final Iterable<SSTableReader> flushed)
     {
         return new Function<View, View>()
         {
@@ -319,7 +332,7 @@ public class View
                 List<Memtable> flushingMemtables = copyOf(filter(view.flushingMemtables, not(equalTo(memtable))));
                 assert flushingMemtables.size() == view.flushingMemtables.size() - 1;
 
-                if (flushed == null)
+                if (flushed == null || Iterables.isEmpty(flushed))
                     return new View(view.liveMemtables, flushingMemtables, view.sstablesMap,
                                     view.compactingMap, view.intervalTree);
 

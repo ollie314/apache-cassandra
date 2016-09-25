@@ -63,11 +63,11 @@ public abstract class AbstractReadExecutor
     protected final ReadCallback handler;
     protected final TraceState traceState;
 
-    AbstractReadExecutor(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistencyLevel, List<InetAddress> targetReplicas)
+    AbstractReadExecutor(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistencyLevel, List<InetAddress> targetReplicas, long queryStartNanoTime)
     {
         this.command = command;
         this.targetReplicas = targetReplicas;
-        this.handler = new ReadCallback(new DigestResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas);
+        this.handler = new ReadCallback(new DigestResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas, queryStartNanoTime);
         this.traceState = Tracing.instance.get();
 
         // Set the digest version (if we request some digests). This is the smallest version amongst all our target replicas since new nodes
@@ -93,7 +93,6 @@ public abstract class AbstractReadExecutor
 
     private void makeRequests(ReadCommand readCommand, Iterable<InetAddress> endpoints)
     {
-        MessageOut<ReadCommand> message = null;
         boolean hasLocalEndpoint = false;
 
         for (InetAddress endpoint : endpoints)
@@ -107,8 +106,7 @@ public abstract class AbstractReadExecutor
             if (traceState != null)
                 traceState.trace("reading {} from {}", readCommand.isDigestQuery() ? "digest" : "data", endpoint);
             logger.trace("reading {} from {}", readCommand.isDigestQuery() ? "digest" : "data", endpoint);
-            if (message == null)
-                message = readCommand.createMessage(MessagingService.instance().getVersion(endpoint));
+            MessageOut<ReadCommand> message = readCommand.createMessage(MessagingService.instance().getVersion(endpoint));
             MessagingService.instance().sendRRWithFailure(message, endpoint, handler);
         }
 
@@ -150,11 +148,14 @@ public abstract class AbstractReadExecutor
     /**
      * @return an executor appropriate for the configured speculative read policy
      */
-    public static AbstractReadExecutor getReadExecutor(SinglePartitionReadCommand command, ConsistencyLevel consistencyLevel) throws UnavailableException
+    public static AbstractReadExecutor getReadExecutor(SinglePartitionReadCommand command, ConsistencyLevel consistencyLevel, long queryStartNanoTime) throws UnavailableException
     {
         Keyspace keyspace = Keyspace.open(command.metadata().ksName);
         List<InetAddress> allReplicas = StorageProxy.getLiveSortedEndpoints(keyspace, command.partitionKey());
-        ReadRepairDecision repairDecision = command.metadata().newReadRepairDecision();
+        // 11980: Excluding EACH_QUORUM reads from potential RR, so that we do not miscount DC responses
+        ReadRepairDecision repairDecision = consistencyLevel == ConsistencyLevel.EACH_QUORUM
+                                            ? ReadRepairDecision.NONE
+                                            : command.metadata().newReadRepairDecision();
         List<InetAddress> targetReplicas = consistencyLevel.filterForQuery(keyspace, allReplicas, repairDecision);
 
         // Throw UAE early if we don't have enough replicas.
@@ -170,15 +171,18 @@ public abstract class AbstractReadExecutor
         SpeculativeRetryParam retry = cfs.metadata.params.speculativeRetry;
 
         // Speculative retry is disabled *OR* there are simply no extra replicas to speculate.
-        if (retry.equals(SpeculativeRetryParam.NONE) || consistencyLevel.blockFor(keyspace) == allReplicas.size())
-            return new NeverSpeculatingReadExecutor(keyspace, command, consistencyLevel, targetReplicas);
+        // 11980: Disable speculative retry if using EACH_QUORUM in order to prevent miscounting DC responses
+        if (retry.equals(SpeculativeRetryParam.NONE)
+            || consistencyLevel == ConsistencyLevel.EACH_QUORUM
+            || consistencyLevel.blockFor(keyspace) == allReplicas.size())
+            return new NeverSpeculatingReadExecutor(keyspace, command, consistencyLevel, targetReplicas, queryStartNanoTime);
 
         if (targetReplicas.size() == allReplicas.size())
         {
             // CL.ALL, RRD.GLOBAL or RRD.DC_LOCAL and a single-DC.
             // We are going to contact every node anyway, so ask for 2 full data requests instead of 1, for redundancy
             // (same amount of requests in total, but we turn 1 digest request into a full blown data request).
-            return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas);
+            return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
         }
 
         // RRD.NONE or RRD.DC_LOCAL w/ multiple DCs.
@@ -199,16 +203,16 @@ public abstract class AbstractReadExecutor
         targetReplicas.add(extraReplica);
 
         if (retry.equals(SpeculativeRetryParam.ALWAYS))
-            return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas);
+            return new AlwaysSpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
         else // PERCENTILE or CUSTOM.
-            return new SpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas);
+            return new SpeculatingReadExecutor(keyspace, cfs, command, consistencyLevel, targetReplicas, queryStartNanoTime);
     }
 
     public static class NeverSpeculatingReadExecutor extends AbstractReadExecutor
     {
-        public NeverSpeculatingReadExecutor(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistencyLevel, List<InetAddress> targetReplicas)
+        public NeverSpeculatingReadExecutor(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistencyLevel, List<InetAddress> targetReplicas, long queryStartNanoTime)
         {
-            super(keyspace, command, consistencyLevel, targetReplicas);
+            super(keyspace, command, consistencyLevel, targetReplicas, queryStartNanoTime);
         }
 
         public void executeAsync()
@@ -238,9 +242,10 @@ public abstract class AbstractReadExecutor
                                        ColumnFamilyStore cfs,
                                        ReadCommand command,
                                        ConsistencyLevel consistencyLevel,
-                                       List<InetAddress> targetReplicas)
+                                       List<InetAddress> targetReplicas,
+                                       long queryStartNanoTime)
         {
-            super(keyspace, command, consistencyLevel, targetReplicas);
+            super(keyspace, command, consistencyLevel, targetReplicas, queryStartNanoTime);
             this.cfs = cfs;
         }
 
@@ -310,9 +315,10 @@ public abstract class AbstractReadExecutor
                                              ColumnFamilyStore cfs,
                                              ReadCommand command,
                                              ConsistencyLevel consistencyLevel,
-                                             List<InetAddress> targetReplicas)
+                                             List<InetAddress> targetReplicas,
+                                             long queryStartNanoTime)
         {
-            super(keyspace, command, consistencyLevel, targetReplicas);
+            super(keyspace, command, consistencyLevel, targetReplicas, queryStartNanoTime);
             this.cfs = cfs;
         }
 

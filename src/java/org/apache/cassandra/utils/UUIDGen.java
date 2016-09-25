@@ -21,12 +21,15 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.util.Collection;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.annotations.VisibleForTesting;
-
+import com.google.common.primitives.Ints;
 
 /**
  * The goods are here: www.ietf.org/rfc/rfc4122.txt.
@@ -51,10 +54,12 @@ public class UUIDGen
     private static final long MIN_CLOCK_SEQ_AND_NODE = 0x8080808080808080L;
     private static final long MAX_CLOCK_SEQ_AND_NODE = 0x7f7f7f7f7f7f7f7fL;
 
+    private static final SecureRandom secureRandom = new SecureRandom();
+
     // placement of this singleton is important.  It needs to be instantiated *AFTER* the other statics.
     private static final UUIDGen instance = new UUIDGen();
 
-    private long lastNanos;
+    private AtomicLong lastNanos = new AtomicLong();
 
     private UUIDGen()
     {
@@ -82,11 +87,41 @@ public class UUIDGen
         return new UUID(createTime(fromUnixTimestamp(when)), clockSeqAndNode);
     }
 
+    /**
+     * Returns a version 1 UUID using the provided timestamp and the local clock and sequence.
+     * <p>
+     * Note that this method is generally only safe to use if you can guarantee that the provided
+     * parameter is unique across calls (otherwise the returned UUID won't be unique accross calls).
+     *
+     * @param whenInMicros a unix time in microseconds.
+     * @return a new UUID {@code id} such that {@code microsTimestamp(id) == whenInMicros}. Please not that
+     * multiple calls to this method with the same value of {@code whenInMicros} will return the <b>same</b>
+     * UUID.
+     */
     public static UUID getTimeUUIDFromMicros(long whenInMicros)
     {
         long whenInMillis = whenInMicros / 1000;
         long nanos = (whenInMicros - (whenInMillis * 1000)) * 10;
         return getTimeUUID(whenInMillis, nanos);
+    }
+
+    /**
+     * Similar to {@link getTimeUUIDFromMicros}, but randomize (using SecureRandom) the clock and sequence.
+     * <p>
+     * If you can guarantee that the {@code whenInMicros} argument is unique (for this JVM instance) for
+     * every call, then you should prefer {@link getTimeUUIDFromMicros} which is faster. If you can't
+     * guarantee this however, this method will ensure the returned UUID are still unique (accross calls)
+     * through randomization.
+     *
+     * @param whenInMicros a unix time in microseconds.
+     * @return a new UUID {@code id} such that {@code microsTimestamp(id) == whenInMicros}. The UUID returned
+     * by different calls will be unique even if {@code whenInMicros} is not.
+     */
+    public static UUID getRandomTimeUUIDFromMicros(long whenInMicros)
+    {
+        long whenInMillis = whenInMicros / 1000;
+        long nanos = (whenInMicros - (whenInMillis * 1000)) * 10;
+        return new UUID(createTime(fromUnixTimestamp(whenInMillis, nanos)), secureRandom.nextLong());
     }
 
     public static UUID getTimeUUID(long when, long nanos)
@@ -178,6 +213,15 @@ public class UUIDGen
 
     /**
      * @param uuid
+     * @return seconds since Unix epoch
+     */
+    public static int unixTimestampInSec(UUID uuid)
+    {
+        return Ints.checkedCast(TimeUnit.MILLISECONDS.toSeconds(unixTimestamp(uuid)));
+    }
+
+    /**
+     * @param uuid
      * @return microseconds since Unix epoch
      */
     public static long microsTimestamp(UUID uuid)
@@ -189,7 +233,8 @@ public class UUIDGen
      * @param timestamp milliseconds since Unix epoch
      * @return
      */
-    private static long fromUnixTimestamp(long timestamp) {
+    private static long fromUnixTimestamp(long timestamp)
+    {
         return fromUnixTimestamp(timestamp, 0L);
     }
 
@@ -203,7 +248,7 @@ public class UUIDGen
      * of a type 1 UUID (a time-based UUID).
      *
      * To specify a 100-nanoseconds precision timestamp, one should provide a milliseconds timestamp and
-     * a number 0 <= n < 10000 such that n*100 is the number of nanoseconds within that millisecond.
+     * a number {@code 0 <= n < 10000} such that n*100 is the number of nanoseconds within that millisecond.
      *
      * <p><i><b>Warning:</b> This method is not guaranteed to return unique UUIDs; Multiple
      * invocations using identical timestamps will result in identical UUIDs.</i></p>
@@ -247,7 +292,7 @@ public class UUIDGen
 
     private static long makeClockSeqAndNode()
     {
-        long clock = new Random(System.currentTimeMillis()).nextLong();
+        long clock = new SecureRandom().nextLong();
 
         long lsb = 0;
         lsb |= 0x8000000000000000L;                 // variant (2 bits)
@@ -258,15 +303,31 @@ public class UUIDGen
 
     // needs to return two different values for the same when.
     // we can generate at most 10k UUIDs per ms.
-    private synchronized long createTimeSafe()
+    private long createTimeSafe()
     {
-        long nanosSince = (System.currentTimeMillis() - START_EPOCH) * 10000;
-        if (nanosSince > lastNanos)
-            lastNanos = nanosSince;
-        else
-            nanosSince = ++lastNanos;
-
-        return createTime(nanosSince);
+        long newLastNanos;
+        while (true)
+        {
+            //Generate a candidate value for new lastNanos
+            newLastNanos = (System.currentTimeMillis() - START_EPOCH) * 10000;
+            long originalLastNanos = lastNanos.get();
+            if (newLastNanos > originalLastNanos)
+            {
+                //Slow path once per millisecond do a CAS
+                if (lastNanos.compareAndSet(originalLastNanos, newLastNanos))
+                {
+                    break;
+                }
+            }
+            else
+            {
+                //Fast path do an atomic increment
+                //Or when falling behind this will move time forward past the clock if necessary
+                newLastNanos = lastNanos.incrementAndGet();
+                break;
+            }
+        }
+        return createTime(newLastNanos);
     }
 
     private long createTimeUnsafe(long when, int nanos)
@@ -318,9 +379,20 @@ public class UUIDGen
     {
         try
         {
+            // Identify the host.
             MessageDigest messageDigest = MessageDigest.getInstance("MD5");
             for(InetAddress addr : data)
                 messageDigest.update(addr.getAddress());
+
+            // Identify the process on the load: we use both the PID and class loader hash.
+            long pid = SigarLibrary.instance.getPid();
+            if (pid < 0)
+                pid = new Random(System.currentTimeMillis()).nextLong();
+            FBUtilities.updateWithLong(messageDigest, pid);
+
+            ClassLoader loader = UUIDGen.class.getClassLoader();
+            int loaderId = loader != null ? System.identityHashCode(loader) : 0;
+            FBUtilities.updateWithInt(messageDigest, loaderId);
 
             return messageDigest.digest();
         }

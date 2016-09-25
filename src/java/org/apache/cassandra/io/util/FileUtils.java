@@ -23,31 +23,30 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.text.DecimalFormat;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-
-import sun.nio.ch.DirectBuffer;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import sun.nio.ch.DirectBuffer;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.BlacklistedDirectories;
-import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.FSErrorHandler;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
 import static org.apache.cassandra.utils.Throwables.maybeFail;
 import static org.apache.cassandra.utils.Throwables.merge;
 
-public class FileUtils
+public final class FileUtils
 {
     public static final Charset CHARSET = StandardCharsets.UTF_8;
 
@@ -58,7 +57,8 @@ public class FileUtils
     private static final double TB = 1024*1024*1024*1024d;
 
     private static final DecimalFormat df = new DecimalFormat("#.##");
-    private static final boolean canCleanDirectBuffers;
+    public static final boolean isCleanerAvailable;
+    private static final AtomicReference<Optional<FSErrorHandler>> fsErrorHandler = new AtomicReference<>(Optional.empty());
 
     static
     {
@@ -74,7 +74,7 @@ public class FileUtils
             JVMStabilityInspector.inspectThrowable(t);
             logger.info("Cannot initialize un-mmaper.  (Are you using a non-Oracle JVM?)  Compacted data files will not be removed promptly.  Consider using an Oracle JVM or using standard disk access mode");
         }
-        canCleanDirectBuffers = canClean;
+        isCleanerAvailable = canClean;
     }
 
     public static void createHardLink(String from, String to)
@@ -176,7 +176,7 @@ public class FileUtils
     {
         assert from.exists();
         if (logger.isTraceEnabled())
-            logger.trace((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
+            logger.trace("Renaming {} to {}", from.getPath(), to.getPath());
         // this is not FSWE because usually when we see it it's because we didn't close the file before renaming it,
         // and Windows is picky about that.
         try
@@ -334,14 +334,11 @@ public class FileUtils
         }
     }
 
-    public static boolean isCleanerAvailable()
-    {
-        return canCleanDirectBuffers;
-    }
-
     public static void clean(ByteBuffer buffer)
     {
-        if (isCleanerAvailable() && buffer.isDirect())
+        if (buffer == null)
+            return;
+        if (isCleanerAvailable && buffer.isDirect())
         {
             DirectBuffer db = (DirectBuffer) buffer;
             if (db.cleaner() != null)
@@ -396,25 +393,25 @@ public class FileUtils
         {
             d = value / TB;
             String val = df.format(d);
-            return val + " TB";
+            return val + " TiB";
         }
         else if ( value >= GB )
         {
             d = value / GB;
             String val = df.format(d);
-            return val + " GB";
+            return val + " GiB";
         }
         else if ( value >= MB )
         {
             d = value / MB;
             String val = df.format(d);
-            return val + " MB";
+            return val + " MiB";
         }
         else if ( value >= KB )
         {
             d = value / KB;
             String val = df.format(d);
-            return val + " KB";
+            return val + " KiB";
         }
         else
         {
@@ -454,88 +451,46 @@ public class FileUtils
                 deleteRecursiveOnExit(new File(dir, child));
         }
 
-        logger.trace("Scheduling deferred deletion of file: " + dir);
+        logger.trace("Scheduling deferred deletion of file: {}", dir);
         dir.deleteOnExit();
     }
 
     public static void handleCorruptSSTable(CorruptSSTableException e)
     {
-        if (!StorageService.instance.isSetupCompleted())
-            handleStartupFSError(e);
-
-        JVMStabilityInspector.inspectThrowable(e);
-        switch (DatabaseDescriptor.getDiskFailurePolicy())
-        {
-            case stop_paranoid:
-                StorageService.instance.stopTransports();
-                break;
-        }
+        fsErrorHandler.get().ifPresent(handler -> handler.handleCorruptSSTable(e));
     }
-    
+
     public static void handleFSError(FSError e)
     {
-        if (!StorageService.instance.isSetupCompleted())
-            handleStartupFSError(e);
-
-        JVMStabilityInspector.inspectThrowable(e);
-        switch (DatabaseDescriptor.getDiskFailurePolicy())
-        {
-            case stop_paranoid:
-            case stop:
-                StorageService.instance.stopTransports();
-                break;
-            case best_effort:
-                // for both read and write errors mark the path as unwritable.
-                BlacklistedDirectories.maybeMarkUnwritable(e.path);
-                if (e instanceof FSReadError)
-                {
-                    File directory = BlacklistedDirectories.maybeMarkUnreadable(e.path);
-                    if (directory != null)
-                        Keyspace.removeUnreadableSSTables(directory);
-                }
-                break;
-            case ignore:
-                // already logged, so left nothing to do
-                break;
-            default:
-                throw new IllegalStateException();
-        }
+        fsErrorHandler.get().ifPresent(handler -> handler.handleFSError(e));
     }
 
-    private static void handleStartupFSError(Throwable t)
-    {
-        switch (DatabaseDescriptor.getDiskFailurePolicy())
-        {
-            case stop_paranoid:
-            case stop:
-            case die:
-                logger.error("Exiting forcefully due to file system exception on startup, disk failure policy \"{}\"",
-                             DatabaseDescriptor.getDiskFailurePolicy(),
-                             t);
-                JVMStabilityInspector.killCurrentJVM(t, true);
-                break;
-            default:
-                break;
-        }
-    }
     /**
      * Get the size of a directory in bytes
-     * @param directory The directory for which we need size.
+     * @param folder The directory for which we need size.
      * @return The size of the directory
      */
-    public static long folderSize(File directory)
+    public static long folderSize(File folder)
     {
-        long length = 0;
-        for (File file : directory.listFiles())
+        final long [] sizeArr = {0L};
+        try
         {
-            if (file.isFile())
-                length += file.length();
-            else
-                length += folderSize(file);
+            Files.walkFileTree(folder.toPath(), new SimpleFileVisitor<Path>()
+            {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                {
+                    sizeArr[0] += attrs.size();
+                    return FileVisitResult.CONTINUE;
+                }
+            });
         }
-        return length;
+        catch (IOException e)
+        {
+            logger.error("Error while getting {} folder size. {}", folder, e);
+        }
+        return sizeArr[0];
     }
-
 
     public static void copyTo(DataInput in, OutputStream out, int length) throws IOException
     {
@@ -575,24 +530,32 @@ public class FileUtils
     public static void append(File file, String ... lines)
     {
         if (file.exists())
-            write(file, StandardOpenOption.APPEND, lines);
+            write(file, Arrays.asList(lines), StandardOpenOption.APPEND);
         else
-            write(file, StandardOpenOption.CREATE, lines);
+            write(file, Arrays.asList(lines), StandardOpenOption.CREATE);
+    }
+
+    public static void appendAndSync(File file, String ... lines)
+    {
+        if (file.exists())
+            write(file, Arrays.asList(lines), StandardOpenOption.APPEND, StandardOpenOption.SYNC);
+        else
+            write(file, Arrays.asList(lines), StandardOpenOption.CREATE, StandardOpenOption.SYNC);
     }
 
     public static void replace(File file, String ... lines)
     {
-        write(file, StandardOpenOption.TRUNCATE_EXISTING, lines);
+        write(file, Arrays.asList(lines), StandardOpenOption.TRUNCATE_EXISTING);
     }
 
-    public static void write(File file, StandardOpenOption op, String ... lines)
+    public static void write(File file, List<String> lines, StandardOpenOption ... options)
     {
         try
         {
             Files.write(file.toPath(),
-                        Arrays.asList(lines),
+                        lines,
                         CHARSET,
-                        op);
+                        options);
         }
         catch (IOException ex)
         {
@@ -613,5 +576,10 @@ public class FileUtils
 
             throw new RuntimeException(ex);
         }
+    }
+
+    public static void setFSErrorHandler(FSErrorHandler handler)
+    {
+        fsErrorHandler.getAndSet(Optional.ofNullable(handler));
     }
 }

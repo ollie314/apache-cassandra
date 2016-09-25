@@ -69,9 +69,9 @@ public class SetType<T> extends CollectionType<Set<T>>
     }
 
     @Override
-    public boolean references(AbstractType<?> check)
+    public boolean referencesUserType(String userTypeName)
     {
-        return super.references(check) || elements.references(check);
+        return getElementsType().referencesUserType(userTypeName);
     }
 
     public AbstractType<T> getElementsType()
@@ -102,6 +102,18 @@ public class SetType<T> extends CollectionType<Set<T>>
             return getInstance(this.elements, false);
         else
             return this;
+    }
+
+    @Override
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        if (!isMultiCell())
+            return this;
+
+        if (elements.isFreezable() && elements.isMultiCell())
+            return getInstance(elements.freeze(), isMultiCell);
+
+        return getInstance(elements.freezeNestedMulticellTypes(), isMultiCell);
     }
 
     @Override

@@ -18,7 +18,6 @@
 package org.apache.cassandra.thrift;
 
 import java.util.*;
-import java.util.regex.Matcher;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
@@ -35,7 +34,7 @@ import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.*;
-import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.locator.LocalStrategy;
@@ -242,7 +241,7 @@ public class ThriftConversion
             // historical reasons)
             boolean hasKeyAlias = cf_def.isSetKey_alias() && keyValidator != null && !(keyValidator instanceof CompositeType);
             if (hasKeyAlias)
-                defs.add(ColumnDefinition.partitionKeyDef(cf_def.keyspace, cf_def.name, UTF8Type.instance.getString(cf_def.key_alias), keyValidator, ColumnDefinition.NO_POSITION));
+                defs.add(ColumnDefinition.partitionKeyDef(cf_def.keyspace, cf_def.name, UTF8Type.instance.getString(cf_def.key_alias), keyValidator, 0));
 
             // Now add any CQL metadata that we want to copy, skipping the keyAlias if there was one
             for (ColumnDefinition def : previousCQLMetadata)
@@ -381,7 +380,7 @@ public class ThriftConversion
             }
             else
             {
-                defs.add(ColumnDefinition.partitionKeyDef(ks, cf, names.defaultPartitionKeyName(), keyValidator, ColumnDefinition.NO_POSITION));
+                defs.add(ColumnDefinition.partitionKeyDef(ks, cf, names.defaultPartitionKeyName(), keyValidator, 0));
             }
         }
 
@@ -591,7 +590,7 @@ public class ThriftConversion
         IndexMetadata matchedIndex = null;
         for (IndexMetadata index : cfMetaData.getIndexes())
         {
-            Pair<ColumnDefinition, IndexTarget.Type> target  = CassandraIndex.parseTarget(cfMetaData, index);
+            Pair<ColumnDefinition, IndexTarget.Type> target  = TargetParser.parse(cfMetaData, index);
             if (target.left.equals(column))
             {
                 // we already found an index for this column, we've no option but to

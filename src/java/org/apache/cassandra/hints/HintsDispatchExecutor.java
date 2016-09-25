@@ -18,10 +18,13 @@
 package org.apache.cassandra.hints;
 
 import java.io.File;
+import java.net.InetAddress;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import com.google.common.util.concurrent.RateLimiter;
@@ -47,12 +50,14 @@ final class HintsDispatchExecutor
     private final File hintsDirectory;
     private final ExecutorService executor;
     private final AtomicBoolean isPaused;
+    private final Function<InetAddress, Boolean> isAlive;
     private final Map<UUID, Future> scheduledDispatches;
 
-    HintsDispatchExecutor(File hintsDirectory, int maxThreads, AtomicBoolean isPaused)
+    HintsDispatchExecutor(File hintsDirectory, int maxThreads, AtomicBoolean isPaused, Function<InetAddress, Boolean> isAlive)
     {
         this.hintsDirectory = hintsDirectory;
         this.isPaused = isPaused;
+        this.isAlive = isAlive;
 
         scheduledDispatches = new ConcurrentHashMap<>();
         executor = new JMXEnabledThreadPoolExecutor(1,
@@ -71,6 +76,14 @@ final class HintsDispatchExecutor
     {
         scheduledDispatches.clear();
         executor.shutdownNow();
+        try
+        {
+            executor.awaitTermination(1, TimeUnit.MINUTES);
+        }
+        catch (InterruptedException e)
+        {
+            throw new AssertionError(e);
+        }
     }
 
     boolean isScheduled(HintsStore store)
@@ -236,29 +249,54 @@ final class HintsDispatchExecutor
         {
             logger.trace("Dispatching hints file {}", descriptor.fileName());
 
-            File file = new File(hintsDirectory, descriptor.fileName());
-            Long offset = store.getDispatchOffset(descriptor).orElse(null);
+            InetAddress address = StorageService.instance.getEndpointForHostId(hostId);
+            if (address != null)
+                return deliver(descriptor, address);
 
-            try (HintsDispatcher dispatcher = HintsDispatcher.create(file, rateLimiter, hostId, descriptor.hostId, isPaused))
+            // address == null means the target no longer exist; find new home for each hint entry.
+            convert(descriptor);
+            return true;
+        }
+
+        private boolean deliver(HintsDescriptor descriptor, InetAddress address)
+        {
+            File file = new File(hintsDirectory, descriptor.fileName());
+            InputPosition offset = store.getDispatchOffset(descriptor);
+
+            BooleanSupplier shouldAbort = () -> !isAlive.apply(address) || isPaused.get();
+            try (HintsDispatcher dispatcher = HintsDispatcher.create(file, rateLimiter, address, descriptor.hostId, shouldAbort))
             {
                 if (offset != null)
                     dispatcher.seek(offset);
 
                 if (dispatcher.dispatch())
                 {
-                    if (!file.delete())
-                        logger.error("Failed to delete hints file {}", descriptor.fileName());
+                    store.delete(descriptor);
                     store.cleanUp(descriptor);
                     logger.info("Finished hinted handoff of file {} to endpoint {}", descriptor.fileName(), hostId);
                     return true;
                 }
                 else
                 {
-                    store.markDispatchOffset(descriptor, dispatcher.dispatchOffset());
+                    store.markDispatchOffset(descriptor, dispatcher.dispatchPosition());
                     store.offerFirst(descriptor);
                     logger.info("Finished hinted handoff of file {} to endpoint {}, partially", descriptor.fileName(), hostId);
                     return false;
                 }
+            }
+        }
+
+        // for each hint in the hints file for a node that isn't part of the ring anymore, write RF hints for each replica
+        private void convert(HintsDescriptor descriptor)
+        {
+            File file = new File(hintsDirectory, descriptor.fileName());
+
+            try (HintsReader reader = HintsReader.open(file, rateLimiter))
+            {
+                reader.forEach(page -> page.hintsIterator().forEachRemaining(HintsService.instance::writeForAllReplicas));
+                store.delete(descriptor);
+                store.cleanUp(descriptor);
+                logger.info("Finished converting hints file {}", descriptor.fileName());
             }
         }
     }

@@ -23,6 +23,7 @@ import com.google.common.base.Charsets;
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.cache.ChunkCache;
 import org.apache.cassandra.UpdateBuilder;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.Verifier;
@@ -30,7 +31,6 @@ import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
@@ -275,11 +275,12 @@ public class VerifyTest
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
 
 
-        RandomAccessFile file = new RandomAccessFile(sstable.descriptor.filenameFor(sstable.descriptor.digestComponent), "rw");
-        Long correctChecksum = Long.parseLong(file.readLine());
-        file.close();
-
-        writeChecksum(++correctChecksum, sstable.descriptor.filenameFor(sstable.descriptor.digestComponent));
+        try (RandomAccessFile file = new RandomAccessFile(sstable.descriptor.filenameFor(sstable.descriptor.digestComponent), "rw"))
+        {
+            Long correctChecksum = Long.valueOf(file.readLine());
+    
+            writeChecksum(++correctChecksum, sstable.descriptor.filenameFor(sstable.descriptor.digestComponent));
+        }
 
         try (Verifier verifier = new Verifier(cfs, sstable, false))
         {
@@ -313,6 +314,8 @@ public class VerifyTest
         file.seek(startPosition);
         file.writeBytes(StringUtils.repeat('z', (int) 2));
         file.close();
+        if (ChunkCache.instance != null)
+            ChunkCache.instance.invalidateFile(sstable.getFilename());
 
         // Update the Digest to have the right Checksum
         writeChecksum(simpleFullChecksum(sstable.getFilename()), sstable.descriptor.filenameFor(sstable.descriptor.digestComponent));
@@ -371,13 +374,15 @@ public class VerifyTest
 
     protected long simpleFullChecksum(String filename) throws IOException
     {
-        FileInputStream inputStream = new FileInputStream(filename);
-        CRC32 checksum = new CRC32();
-        CheckedInputStream cinStream = new CheckedInputStream(inputStream, checksum);
-        byte[] b = new byte[128];
-        while (cinStream.read(b) >= 0) {
+        try (FileInputStream inputStream = new FileInputStream(filename))
+        {
+            CRC32 checksum = new CRC32();
+            CheckedInputStream cinStream = new CheckedInputStream(inputStream, checksum);
+            byte[] b = new byte[128];
+            while (cinStream.read(b) >= 0) {
+            }
+            return cinStream.getChecksum().getValue();
         }
-        return cinStream.getChecksum().getValue();
     }
 
     protected void writeChecksum(long checksum, String filePath)

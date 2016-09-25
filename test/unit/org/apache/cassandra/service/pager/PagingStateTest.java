@@ -21,10 +21,12 @@ package org.apache.cassandra.service.pager;
 
 import java.nio.ByteBuffer;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
@@ -37,6 +39,12 @@ import static org.junit.Assert.assertTrue;
 
 public class PagingStateTest
 {
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     private PagingState makeSomePagingState(int protocolVersion)
     {
         CFMetaData metadata = CFMetaData.Builder.create("ks", "tbl")
@@ -49,8 +57,8 @@ public class PagingStateTest
         ByteBuffer pk = ByteBufferUtil.bytes("someKey");
 
         ColumnDefinition def = metadata.getColumnDefinition(new ColumnIdentifier("myCol", false));
-        Clustering c = new Clustering(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes(42));
-        Row row = BTreeRow.singleCellRow(c, BufferCell.live(metadata, def, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+        Clustering c = Clustering.make(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes(42));
+        Row row = BTreeRow.singleCellRow(c, BufferCell.live(def, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
         PagingState.RowMark mark = PagingState.RowMark.create(metadata, row, protocolVersion);
         return new PagingState(pk, mark, 10, 0);
     }

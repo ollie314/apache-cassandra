@@ -29,6 +29,8 @@ import java.util.concurrent.CopyOnWriteArraySet;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
 public class BlacklistedDirectories implements BlacklistedDirectoriesMBean
@@ -66,6 +68,16 @@ public class BlacklistedDirectories implements BlacklistedDirectoriesMBean
         return Collections.unmodifiableSet(unwritableDirectories);
     }
 
+    public void markUnreadable(String path)
+    {
+        maybeMarkUnreadable(new File(path));
+    }
+
+    public void markUnwritable(String path)
+    {
+        maybeMarkUnwritable(new File(path));
+    }
+
     /**
      * Adds parent directory of the file (or the file itself, if it is a directory)
      * to the set of unreadable directories.
@@ -99,6 +111,17 @@ public class BlacklistedDirectories implements BlacklistedDirectoriesMBean
         }
         return null;
     }
+
+    /**
+     * Testing only!
+     * Clear the set of unwritable directories.
+     */
+    @VisibleForTesting
+    public static void clearUnwritableUnsafe()
+    {
+        instance.unwritableDirectories.clear();
+    }
+
 
     /**
      * Tells whether or not the directory is blacklisted for reads.

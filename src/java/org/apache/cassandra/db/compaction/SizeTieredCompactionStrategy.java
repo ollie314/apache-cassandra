@@ -74,7 +74,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         this.sizeTieredOptions = new SizeTieredCompactionStrategyOptions(options);
     }
 
-    private List<SSTableReader> getNextBackgroundSSTables(final int gcBefore)
+    private synchronized List<SSTableReader> getNextBackgroundSSTables(final int gcBefore)
     {
         // make local copies so they can't be changed out from under us mid-method
         int minThreshold = cfs.getMinimumCompactionThreshold();
@@ -84,7 +84,8 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
 
         List<List<SSTableReader>> buckets = getBuckets(createSSTableAndLengthPairs(candidates), sizeTieredOptions.bucketHigh, sizeTieredOptions.bucketLow, sizeTieredOptions.minSSTableSize);
         logger.trace("Compaction buckets are {}", buckets);
-        updateEstimatedCompactionsByTasks(buckets);
+        estimatedRemainingTasks = getEstimatedCompactionsByTasks(cfs, buckets);
+        cfs.getCompactionStrategyManager().compactionLogger.pending(this, estimatedRemainingTasks);
         List<SSTableReader> mostInteresting = mostInterestingBucket(buckets, minThreshold, maxThreshold);
         if (!mostInteresting.isEmpty())
             return mostInteresting;
@@ -100,8 +101,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         if (sstablesWithTombstones.isEmpty())
             return Collections.emptyList();
 
-        Collections.sort(sstablesWithTombstones, new SSTableReader.SizeComparator());
-        return Collections.singletonList(sstablesWithTombstones.get(0));
+        return Collections.singletonList(Collections.max(sstablesWithTombstones, SSTableReader.sizeComparator));
     }
 
 
@@ -174,7 +174,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @SuppressWarnings("resource")
-    public synchronized AbstractCompactionTask getNextBackgroundTask(int gcBefore)
+    public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
     {
         while (true)
         {
@@ -282,15 +282,15 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         return new ArrayList<List<T>>(buckets.values());
     }
 
-    private void updateEstimatedCompactionsByTasks(List<List<SSTableReader>> tasks)
+    public static int getEstimatedCompactionsByTasks(ColumnFamilyStore cfs, List<List<SSTableReader>> tasks)
     {
         int n = 0;
-        for (List<SSTableReader> bucket: tasks)
+        for (List<SSTableReader> bucket : tasks)
         {
             if (bucket.size() >= cfs.getMinimumCompactionThreshold())
                 n += Math.ceil((double)bucket.size() / cfs.getMaximumCompactionThreshold());
         }
-        estimatedRemainingTasks = n;
+        return n;
     }
 
     public long getMaxSSTableBytes()

@@ -20,20 +20,22 @@ package org.apache.cassandra.config;
 import java.beans.IntrospectionException;
 import java.io.ByteArrayInputStream;
 import java.io.File;
-import java.io.InputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
 import java.util.HashSet;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.TreeMap;
 
-import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.common.io.ByteStreams;
+
+import org.apache.commons.lang3.SystemUtils;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -89,11 +91,13 @@ public class YamlConfigurationLoader implements ConfigurationLoader
         return url;
     }
 
-    private static final URL storageConfigURL = getStorageConfigURL();
+    private static URL storageConfigURL;
 
     @Override
     public Config loadConfig() throws ConfigurationException
     {
+        if (storageConfigURL == null)
+            storageConfigURL = getStorageConfigURL();
         return loadConfig(storageConfigURL);
     }
 
@@ -113,19 +117,18 @@ public class YamlConfigurationLoader implements ConfigurationLoader
                 throw new AssertionError(e);
             }
 
-            logConfig(configBytes);
-
             Constructor constructor = new CustomConstructor(Config.class);
-            MissingPropertiesChecker propertiesChecker = new MissingPropertiesChecker();
+            PropertiesChecker propertiesChecker = new PropertiesChecker();
             constructor.setPropertyUtils(propertiesChecker);
             Yaml yaml = new Yaml(constructor);
-            Config result = yaml.loadAs(new ByteArrayInputStream(configBytes), Config.class);
+            Config result = loadConfig(yaml, configBytes);
             propertiesChecker.check();
             return result;
         }
         catch (YAMLException e)
         {
-            throw new ConfigurationException("Invalid yaml: " + url, e);
+            throw new ConfigurationException("Invalid yaml: " + url + SystemUtils.LINE_SEPARATOR
+                                             +  " Error: " + e.getMessage(), false);
         }
     }
 
@@ -165,25 +168,25 @@ public class YamlConfigurationLoader implements ConfigurationLoader
         }
     }
 
-    private void logConfig(byte[] configBytes)
+    private Config loadConfig(Yaml yaml, byte[] configBytes)
     {
-        Map<Object, Object> configMap = new TreeMap<>((Map<?, ?>) new Yaml().load(new ByteArrayInputStream(configBytes)));
-        // these keys contain passwords, don't log them
-        for (String sensitiveKey : new String[] { "client_encryption_options", "server_encryption_options" })
-        {
-            if (configMap.containsKey(sensitiveKey))
-            {
-                configMap.put(sensitiveKey, "<REDACTED>");
-            }
-        }
-        logger.info("Node configuration:[{}]", Joiner.on("; ").join(configMap.entrySet()));
+        Config config = yaml.loadAs(new ByteArrayInputStream(configBytes), Config.class);
+        // If the configuration file is empty yaml will return null. In this case we should use the default
+        // configuration to avoid hitting a NPE at a later stage.
+        return config == null ? new Config() : config;
     }
 
-    private static class MissingPropertiesChecker extends PropertyUtils
+    /**
+     * Utility class to check that there are no extra properties and that properties that are not null by default
+     * are not set to null.
+     */
+    private static class PropertiesChecker extends PropertyUtils
     {
         private final Set<String> missingProperties = new HashSet<>();
 
-        public MissingPropertiesChecker()
+        private final Set<String> nullProperties = new HashSet<>();
+
+        public PropertiesChecker()
         {
             setSkipMissingProperties(true);
         }
@@ -191,19 +194,49 @@ public class YamlConfigurationLoader implements ConfigurationLoader
         @Override
         public Property getProperty(Class<? extends Object> type, String name) throws IntrospectionException
         {
-            Property result = super.getProperty(type, name);
+            final Property result = super.getProperty(type, name);
+
             if (result instanceof MissingProperty)
             {
                 missingProperties.add(result.getName());
             }
-            return result;
+
+            return new Property(result.getName(), result.getType())
+            {
+                @Override
+                public void set(Object object, Object value) throws Exception
+                {
+                    if (value == null && get(object) != null)
+                    {
+                        nullProperties.add(getName());
+                    }
+                    result.set(object, value);
+                }
+
+                @Override
+                public Class<?>[] getActualTypeArguments()
+                {
+                    return result.getActualTypeArguments();
+                }
+
+                @Override
+                public Object get(Object object)
+                {
+                    return result.get(object);
+                }
+            };
         }
 
         public void check() throws ConfigurationException
         {
+            if (!nullProperties.isEmpty())
+            {
+                throw new ConfigurationException("Invalid yaml. Those properties " + nullProperties + " are not valid", false);
+            }
+
             if (!missingProperties.isEmpty())
             {
-                throw new ConfigurationException("Invalid yaml. Please remove properties " + missingProperties + " from your cassandra.yaml");
+                throw new ConfigurationException("Invalid yaml. Please remove properties " + missingProperties + " from your cassandra.yaml", false);
             }
         }
     }

@@ -28,8 +28,9 @@ import com.google.common.annotations.VisibleForTesting;
 
 import io.netty.buffer.ByteBuf;
 
-import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.utils.Pair;
 
 public enum DataType implements OptionCodec.Codecable<DataType>
@@ -66,6 +67,7 @@ public enum DataType implements OptionCodec.Codecable<DataType>
     private final int id;
     private final int protocolVersion;
     private final AbstractType type;
+    private final Pair<DataType, Object> pair;
     private static final Map<AbstractType, DataType> dataTypeMap = new HashMap<AbstractType, DataType>();
     static
     {
@@ -81,6 +83,7 @@ public enum DataType implements OptionCodec.Codecable<DataType>
         this.id = id;
         this.type = type;
         this.protocolVersion = protocolVersion;
+        pair = Pair.create(this, null);
     }
 
     public int getId(int version)
@@ -109,14 +112,14 @@ public enum DataType implements OptionCodec.Codecable<DataType>
                 String ks = CBUtil.readString(cb);
                 ByteBuffer name = UTF8Type.instance.decompose(CBUtil.readString(cb));
                 int n = cb.readUnsignedShort();
-                List<ByteBuffer> fieldNames = new ArrayList<>(n);
+                List<FieldIdentifier> fieldNames = new ArrayList<>(n);
                 List<AbstractType<?>> fieldTypes = new ArrayList<>(n);
                 for (int i = 0; i < n; i++)
                 {
-                    fieldNames.add(UTF8Type.instance.decompose(CBUtil.readString(cb)));
+                    fieldNames.add(FieldIdentifier.forInternalString(CBUtil.readString(cb)));
                     fieldTypes.add(DataType.toType(codec.decodeOne(cb, version)));
                 }
-                return new UserType(ks, name, fieldNames, fieldTypes);
+                return new UserType(ks, name, fieldNames, fieldTypes, true);
             case TUPLE:
                 n = cb.readUnsignedShort();
                 List<AbstractType<?>> types = new ArrayList<>(n);
@@ -161,7 +164,7 @@ public enum DataType implements OptionCodec.Codecable<DataType>
                 cb.writeShort(udt.size());
                 for (int i = 0; i < udt.size(); i++)
                 {
-                    CBUtil.writeString(UTF8Type.instance.compose(udt.fieldName(i)), cb);
+                    CBUtil.writeString(udt.fieldName(i).toString(), cb);
                     codec.writeOne(DataType.fromType(udt.fieldType(i), version), cb, version);
                 }
                 break;
@@ -201,7 +204,7 @@ public enum DataType implements OptionCodec.Codecable<DataType>
                 size += 2;
                 for (int i = 0; i < udt.size(); i++)
                 {
-                    size += CBUtil.sizeOfString(UTF8Type.instance.compose(udt.fieldName(i)));
+                    size += CBUtil.sizeOfString(udt.fieldName(i).toString());
                     size += codec.oneSerializedSize(DataType.fromType(udt.fieldType(i), version), version);
                 }
                 return size;
@@ -261,7 +264,7 @@ public enum DataType implements OptionCodec.Codecable<DataType>
             // Fall back to CUSTOM if target doesn't know this data type
             if (version < dt.protocolVersion)
                 return Pair.<DataType, Object>create(CUSTOM, type.toString());
-            return Pair.create(dt, null);
+            return dt.pair;
         }
     }
 

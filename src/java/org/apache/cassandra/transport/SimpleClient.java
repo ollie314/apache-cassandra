@@ -92,10 +92,7 @@ public class SimpleClient implements Closeable
 
     public SimpleClient(String host, int port, int version, ClientEncryptionOptions encryptionOptions)
     {
-        this.host = host;
-        this.port = port;
-        this.version = version;
-        this.encryptionOptions = encryptionOptions;
+        this(host, port, version, false, encryptionOptions);
     }
 
     public SimpleClient(String host, int port, ClientEncryptionOptions encryptionOptions)
@@ -106,6 +103,17 @@ public class SimpleClient implements Closeable
     public SimpleClient(String host, int port, int version)
     {
         this(host, port, version, new ClientEncryptionOptions());
+    }
+
+    public SimpleClient(String host, int port, int version, boolean useBeta, ClientEncryptionOptions encryptionOptions)
+    {
+        this.host = host;
+        this.port = port;
+        if (version == Server.BETA_VERSION && !useBeta)
+            throw new IllegalArgumentException(String.format("Beta version of server used (%s), but USE_BETA flag is not set", version));
+
+        this.version = version;
+        this.encryptionOptions = encryptionOptions;
     }
 
     public SimpleClient(String host, int port)
@@ -291,8 +299,8 @@ public class SimpleClient implements Closeable
             super.initChannel(channel);
             SSLEngine sslEngine = sslContext.createSSLEngine();
             sslEngine.setUseClientMode(true);
-            sslEngine.setEnabledCipherSuites(encryptionOptions.cipher_suites);
-            sslEngine.setEnabledProtocols(SSLFactory.ACCEPTED_PROTOCOLS);
+            String[] suites = SSLFactory.filterCipherSuites(sslEngine.getSupportedCipherSuites(), encryptionOptions.cipher_suites);
+            sslEngine.setEnabledCipherSuites(suites);
             channel.pipeline().addFirst("ssl", new SslHandler(sslEngine));
         }
     }

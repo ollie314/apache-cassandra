@@ -62,12 +62,12 @@ public class Verifier implements Closeable
     private final OutputHandler outputHandler;
     private FileDigestValidator validator;
 
-    public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, boolean isOffline) throws IOException
+    public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, boolean isOffline)
     {
         this(cfs, sstable, new OutputHandler.LogOutput(), isOffline);
     }
 
-    public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, OutputHandler outputHandler, boolean isOffline) throws IOException
+    public Verifier(ColumnFamilyStore cfs, SSTableReader sstable, OutputHandler outputHandler, boolean isOffline)
     {
         this.cfs = cfs;
         this.sstable = sstable;
@@ -87,7 +87,7 @@ public class Verifier implements Closeable
     {
         long rowStart = 0;
 
-        outputHandler.output(String.format("Verifying %s (%s bytes)", sstable, dataFile.length()));
+        outputHandler.output(String.format("Verifying %s (%s)", sstable, FBUtilities.prettyPrintMemory(dataFile.length())));
         outputHandler.output(String.format("Checking computed hash of %s ", sstable));
 
 
@@ -128,7 +128,7 @@ public class Verifier implements Closeable
         {
             ByteBuffer nextIndexKey = ByteBufferUtil.readWithShortLength(indexFile);
             {
-                long firstRowPositionFromIndex = rowIndexEntrySerializer.deserialize(indexFile).position;
+                long firstRowPositionFromIndex = rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);
                 if (firstRowPositionFromIndex != 0)
                     markAndThrow();
             }
@@ -162,7 +162,7 @@ public class Verifier implements Closeable
                     nextIndexKey = indexFile.isEOF() ? null : ByteBufferUtil.readWithShortLength(indexFile);
                     nextRowPositionFromIndex = indexFile.isEOF()
                                              ? dataFile.length()
-                                             : rowIndexEntrySerializer.deserialize(indexFile).position;
+                                             : rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);
                 }
                 catch (Throwable th)
                 {
@@ -177,7 +177,7 @@ public class Verifier implements Closeable
                 long dataSize = nextRowPositionFromIndex - dataStartFromIndex;
                 // avoid an NPE if key is null
                 String keyName = key == null ? "(unreadable key)" : ByteBufferUtil.bytesToHex(key.getKey());
-                outputHandler.debug(String.format("row %s is %s bytes", keyName, dataSize));
+                outputHandler.debug(String.format("row %s is %s", keyName, FBUtilities.prettyPrintMemory(dataSize)));
 
                 assert currentIndexKey != null || indexFile.isEOF();
 
@@ -187,7 +187,7 @@ public class Verifier implements Closeable
                         markAndThrow();
 
                     //mimic the scrub read path
-                    try (UnfilteredRowIterator iterator = new SSTableIdentityIterator(sstable, dataFile, key))
+                    try (UnfilteredRowIterator iterator = SSTableIdentityIterator.create(sstable, dataFile, key))
                     {
                     }
 

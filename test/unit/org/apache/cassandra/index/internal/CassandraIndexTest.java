@@ -28,10 +28,10 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
-import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
@@ -55,7 +55,6 @@ import static org.junit.Assert.fail;
  */
 public class CassandraIndexTest extends CQLTester
 {
-
     @Test
     public void indexOnRegularColumn() throws Throwable
     {
@@ -64,7 +63,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("v_index")
                         .withFirstRow(row(0, 0, 0))
                         .withSecondRow(row(1, 1, 1))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("v=0")
                         .secondQueryExpression("v=1")
                         .updateExpression("SET v=2")
@@ -81,7 +80,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("c_index")
                         .withFirstRow(row(0, 0, 0))
                         .withSecondRow(row(1, 1, 1))
-                        .missingIndexMessage(SelectStatement.REQUIRES_ALLOW_FILTERING_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("c=0")
                         .secondQueryExpression("c=1")
                         .run();
@@ -113,7 +112,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("k1_index")
                         .withFirstRow(row(0, 0, 0, 0, 0))
                         .withSecondRow(row(1, 1, 1, 1, 1))
-                        .missingIndexMessage("Partition key parts: k2 must be restricted as other parts are")
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("k1=0")
                         .secondQueryExpression("k1=1")
                         .run();
@@ -128,7 +127,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("k2_index")
                         .withFirstRow(row(0, 0, 0, 0, 0))
                         .withSecondRow(row(1, 1, 1, 1, 1))
-                        .missingIndexMessage("Partition key parts: k1 must be restricted as other parts are")
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("k2=0")
                         .secondQueryExpression("k2=1")
                         .run();
@@ -142,7 +141,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("l_index1")
                         .withFirstRow(row(0, 0, Lists.newArrayList(10, 20, 30)))
                         .withSecondRow(row(1, 1, Lists.newArrayList(11, 21, 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("l CONTAINS 10")
                         .secondQueryExpression("l CONTAINS 11")
                         .updateExpression("SET l = [40, 50, 60]")
@@ -158,7 +157,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("l_index2")
                         .withFirstRow(row(0, 0, Lists.newArrayList(10, 20, 30)))
                         .withSecondRow(row(1, 1, Lists.newArrayList(11, 21, 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("l CONTAINS 10")
                         .secondQueryExpression("l CONTAINS 11")
                         .updateExpression("SET l = l - [10]")
@@ -174,7 +173,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("s_index1")
                         .withFirstRow(row(0, 0, Sets.newHashSet(10, 20, 30)))
                         .withSecondRow(row(1, 1, Sets.newHashSet(11, 21, 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("s CONTAINS 10")
                         .secondQueryExpression("s CONTAINS 11")
                         .updateExpression("SET s = {40, 50, 60}")
@@ -190,7 +189,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("s_index2")
                         .withFirstRow(row(0, 0, Sets.newHashSet(10, 20, 30)))
                         .withSecondRow(row(1, 1, Sets.newHashSet(11, 21, 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("s CONTAINS 10")
                         .secondQueryExpression("s CONTAINS 11")
                         .updateExpression("SET s = s - {10}")
@@ -206,7 +205,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("m_index1")
                         .withFirstRow(row(0, 0, ImmutableMap.of("a", 10, "b", 20, "c", 30)))
                         .withSecondRow(row(1, 1, ImmutableMap.of("d", 11, "e", 21, "f", 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("m CONTAINS 10")
                         .secondQueryExpression("m CONTAINS 11")
                         .updateExpression("SET m = {'x':40, 'y':50, 'z':60}")
@@ -222,7 +221,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("m_index2")
                         .withFirstRow(row(0, 0, ImmutableMap.of("a", 10, "b", 20, "c", 30)))
                         .withSecondRow(row(1, 1, ImmutableMap.of("d", 11, "e", 21, "f", 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("m CONTAINS 10")
                         .secondQueryExpression("m CONTAINS 11")
                         .updateExpression("SET m['a'] = 40")
@@ -238,7 +237,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("m_index3")
                         .withFirstRow(row(0, 0, ImmutableMap.of("a", 10, "b", 20, "c", 30)))
                         .withSecondRow(row(1, 1, ImmutableMap.of("d", 11, "e", 21, "f", 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("m CONTAINS KEY 'a'")
                         .secondQueryExpression("m CONTAINS KEY 'd'")
                         .updateExpression("SET m = {'x':40, 'y':50, 'z':60}")
@@ -254,7 +253,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("m_index4")
                         .withFirstRow(row(0, 0, ImmutableMap.of("a", 10, "b", 20, "c", 30)))
                         .withSecondRow(row(1, 1, ImmutableMap.of("d", 11, "e", 21, "f", 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("m CONTAINS KEY 'a'")
                         .secondQueryExpression("m CONTAINS KEY 'd'")
                         .updateExpression("SET m['a'] = NULL")
@@ -270,7 +269,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("m_index5")
                         .withFirstRow(row(0, 0, ImmutableMap.of("a", 10, "b", 20, "c", 30)))
                         .withSecondRow(row(1, 1, ImmutableMap.of("d", 11, "e", 21, "f", 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("m['a'] = 10")
                         .secondQueryExpression("m['d'] = 11")
                         .updateExpression("SET m = {'x':40, 'y':50, 'z':60}")
@@ -286,7 +285,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("m_index6")
                         .withFirstRow(row(0, 0, ImmutableMap.of("a", 10, "b", 20, "c", 30)))
                         .withSecondRow(row(1, 1, ImmutableMap.of("d", 11, "e", 21, "f", 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("m['a'] = 10")
                         .secondQueryExpression("m['d'] = 11")
                         .updateExpression("SET m['a'] = 40")
@@ -302,7 +301,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("fl_index")
                         .withFirstRow(row(0, 0, Lists.newArrayList(10, 20, 30)))
                         .withSecondRow(row(1, 1, Lists.newArrayList(11, 21, 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("l = [10, 20, 30]")
                         .secondQueryExpression("l = [11, 21, 31]")
                         .updateExpression("SET l = [40, 50, 60]")
@@ -318,7 +317,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("fs_index")
                         .withFirstRow(row(0, 0, Sets.newHashSet(10, 20, 30)))
                         .withSecondRow(row(1, 1, Sets.newHashSet(11, 21, 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("s = {10, 20, 30}")
                         .secondQueryExpression("s = {11, 21, 31}")
                         .updateExpression("SET s = {40, 50, 60}")
@@ -334,7 +333,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("fm_index")
                         .withFirstRow(row(0, 0, ImmutableMap.of("a", 10, "b", 20, "c", 30)))
                         .withSecondRow(row(1, 1, ImmutableMap.of("d", 11, "e", 21, "f", 31)))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("m = {'a':10, 'b':20, 'c':30}")
                         .secondQueryExpression("m = {'d':11, 'e':21, 'f':31}")
                         .updateExpression("SET m = {'x':40, 'y':50, 'z':60}")
@@ -350,7 +349,7 @@ public class CassandraIndexTest extends CQLTester
                         .indexName("cv_index")
                         .withFirstRow(row(0, 0))
                         .withSecondRow(row(1,1))
-                        .missingIndexMessage(StatementRestrictions.NO_INDEX_FOUND_MESSAGE)
+                        .missingIndexMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
                         .firstQueryExpression("v=0")
                         .secondQueryExpression("v=1")
                         .updateExpression("SET v=2")
@@ -468,6 +467,26 @@ public class CassandraIndexTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE c = 3"), row(2, 3, 3));
     }
 
+    @Test
+    public void indexCorrectlyMarkedAsBuildAndRemoved() throws Throwable
+    {
+        String indexName = "build_remove_test_idx";
+        String tableName = createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        createIndex(String.format("CREATE INDEX %s ON %%s(c)", indexName));
+        waitForIndex(KEYSPACE, tableName, indexName);
+        // check that there are no other rows in the built indexes table
+        assertRows(execute(String.format("SELECT * FROM %s.\"%s\"", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.BUILT_INDEXES)),
+                   row(KEYSPACE, indexName));
+
+        // rebuild the index and verify the built status table
+        getCurrentColumnFamilyStore().rebuildSecondaryIndex(indexName);
+        waitForIndex(KEYSPACE, tableName, indexName);
+
+        // check that there are no other rows in the built indexes table
+        assertRows(execute(String.format("SELECT * FROM %s.\"%s\"", SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.BUILT_INDEXES)),
+                   row(KEYSPACE, indexName));
+    }
+
     // this is slightly annoying, but we cannot read rows from the methods in Util as
     // ReadCommand#executeInternal uses metadata retrieved via the cfId, which the index
     // CFS inherits from the base CFS. This has the 'wrong' partitioner (the index table
@@ -484,8 +503,8 @@ public class CassandraIndexTest extends CQLTester
                                                                                indexKey,
                                                                                ColumnFilter.all(indexCfs.metadata),
                                                                                filter);
-        try (ReadExecutionController executionController = ReadExecutionController.forCommand(command);
-             UnfilteredRowIterator iter = command.queryMemtableAndDisk(indexCfs, executionController.indexReadOpOrderGroup()))
+        try (ReadExecutionController executionController = command.executionController();
+             UnfilteredRowIterator iter = command.queryMemtableAndDisk(indexCfs, executionController))
         {
             while( iter.hasNext())
             {
@@ -619,9 +638,18 @@ public class CassandraIndexTest extends CQLTester
             assertRows(execute(selectFirstRowCql), firstRow);
             assertEmpty(execute(selectSecondRowCql));
 
+            // reload the base cfs and verify queries still work as expected
+            getCurrentColumnFamilyStore().reload();
+            assertRows(execute(selectFirstRowCql), firstRow);
+            assertEmpty(execute(selectSecondRowCql));
+
             // drop the index and assert we can no longer query using it
             execute(dropIndexCql);
             assertInvalidThrowMessage(missingIndexMessage, InvalidRequestException.class, selectFirstRowCql);
+            // reload the base cfs and verify again
+            getCurrentColumnFamilyStore().reload();
+            assertInvalidThrowMessage(missingIndexMessage, InvalidRequestException.class, selectFirstRowCql);
+
             flush();
             compact();
 

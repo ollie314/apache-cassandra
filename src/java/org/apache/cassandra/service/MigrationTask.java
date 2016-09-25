@@ -17,14 +17,19 @@
  */
 package org.apache.cassandra.service;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.util.Collection;
+import java.util.EnumSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.SystemKeyspace.BootstrapState;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.net.IAsyncCallback;
@@ -39,11 +44,20 @@ class MigrationTask extends WrappedRunnable
 {
     private static final Logger logger = LoggerFactory.getLogger(MigrationTask.class);
 
+    private static final ConcurrentLinkedQueue<CountDownLatch> inflightTasks = new ConcurrentLinkedQueue<>();
+
+    private static final Set<BootstrapState> monitoringBootstrapStates = EnumSet.of(BootstrapState.NEEDS_BOOTSTRAP, BootstrapState.IN_PROGRESS);
+
     private final InetAddress endpoint;
 
     MigrationTask(InetAddress endpoint)
     {
         this.endpoint = endpoint;
+    }
+
+    public static ConcurrentLinkedQueue<CountDownLatch> getInflightTasks()
+    {
+        return inflightTasks;
     }
 
     public void runMayThrow() throws Exception
@@ -65,6 +79,8 @@ class MigrationTask extends WrappedRunnable
 
         MessageOut message = new MessageOut<>(MessagingService.Verb.MIGRATION_REQUEST, null, MigrationManager.MigrationsSerializer.instance);
 
+        final CountDownLatch completionLatch = new CountDownLatch(1);
+
         IAsyncCallback<Collection<Mutation>> cb = new IAsyncCallback<Collection<Mutation>>()
         {
             @Override
@@ -74,13 +90,13 @@ class MigrationTask extends WrappedRunnable
                 {
                     SchemaKeyspace.mergeSchemaAndAnnounceVersion(message.payload);
                 }
-                catch (IOException e)
-                {
-                    logger.error("IOException merging remote schema", e);
-                }
                 catch (ConfigurationException e)
                 {
                     logger.error("Configuration exception merging remote schema", e);
+                }
+                finally
+                {
+                    completionLatch.countDown();
                 }
             }
 
@@ -89,6 +105,11 @@ class MigrationTask extends WrappedRunnable
                 return false;
             }
         };
+
+        // Only save the latches if we need bootstrap or are bootstrapping
+        if (monitoringBootstrapStates.contains(SystemKeyspace.getBootstrapState()))
+            inflightTasks.offer(completionLatch);
+
         MessagingService.instance().sendRR(message, endpoint, cb);
     }
 }

@@ -20,7 +20,6 @@ package org.apache.cassandra.db;
 import java.util.Objects;
 import java.security.MessageDigest;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -30,6 +29,12 @@ import org.apache.cassandra.utils.FBUtilities;
  * A {@code LivenessInfo} can first be empty. If it isn't, it contains at least a timestamp,
  * which is the timestamp for the row primary key columns. On top of that, the info can be
  * ttl'ed, in which case the {@code LivenessInfo} also has both a ttl and a local expiration time.
+ * <p>
+ * Please note that if a liveness info is ttl'ed, that expiration is <b>only</b> an expiration
+ * of the liveness info itself (so, of the timestamp), and once the info expires it becomes
+ * {@code EMPTY}. But if a row has a liveness info which expires, the rest of the row data is
+ * unaffected (of course, the rest of said row data might be ttl'ed on its own but this is
+ * separate).
  */
 public class LivenessInfo
 {
@@ -46,12 +51,8 @@ public class LivenessInfo
         this.timestamp = timestamp;
     }
 
-    public static LivenessInfo create(CFMetaData metadata, long timestamp, int nowInSec)
+    public static LivenessInfo create(long timestamp, int nowInSec)
     {
-        int defaultTTL = metadata.params.defaultTimeToLive;
-        if (defaultTTL != NO_TTL)
-            return expiring(timestamp, defaultTTL, nowInSec);
-
         return new LivenessInfo(timestamp);
     }
 
@@ -60,16 +61,16 @@ public class LivenessInfo
         return new ExpiringLivenessInfo(timestamp, ttl, nowInSec + ttl);
     }
 
-    public static LivenessInfo create(CFMetaData metadata, long timestamp, int ttl, int nowInSec)
+    public static LivenessInfo create(long timestamp, int ttl, int nowInSec)
     {
         return ttl == NO_TTL
-             ? create(metadata, timestamp, nowInSec)
+             ? create(timestamp, nowInSec)
              : expiring(timestamp, ttl, nowInSec);
     }
 
-    // Note that this ctor ignores the default table ttl and takes the expiration time, not the current time.
+    // Note that this ctor takes the expiration time, not the current time.
     // Use when you know that's what you want.
-    public static LivenessInfo create(long timestamp, int ttl, int localExpirationTime)
+    public static LivenessInfo withExpirationTime(long timestamp, int ttl, int localExpirationTime)
     {
         return ttl == NO_TTL ? new LivenessInfo(timestamp) : new ExpiringLivenessInfo(timestamp, ttl, localExpirationTime);
     }

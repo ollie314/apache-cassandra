@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.selection.Selection.ResultSetBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -55,7 +56,7 @@ public final class SimpleSelector extends Selector
             }
 
             @Override
-            public Selector newInstance()
+            public Selector newInstance(QueryOptions options)
             {
                 return new SimpleSelector(def.name.toString(), idx, def.type);
             }

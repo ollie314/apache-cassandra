@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.io.IOError;
 import java.util.Iterator;
 
+import org.apache.cassandra.io.util.RewindableDataInput;
 import org.apache.cassandra.utils.AbstractIterator;
 
 import org.apache.cassandra.config.CFMetaData;
@@ -28,8 +29,8 @@ import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataPosition;
 import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.FileMark;
 import org.apache.cassandra.net.MessagingService;
 
 /**
@@ -57,6 +58,14 @@ public abstract class SSTableSimpleIterator extends AbstractIterator<Unfiltered>
             return new OldFormatIterator(metadata, in, helper, partitionDeletion);
         else
             return new CurrentFormatIterator(metadata, in, header, helper);
+    }
+
+    public static SSTableSimpleIterator createTombstoneOnly(CFMetaData metadata, DataInputPlus in, SerializationHeader header, SerializationHelper helper, DeletionTime partitionDeletion)
+    {
+        if (helper.version < MessagingService.VERSION_30)
+            return new OldFormatTombstoneIterator(metadata, in, helper, partitionDeletion);
+        else
+            return new CurrentFormatTombstoneIterator(metadata, in, header, helper);
     }
 
     public abstract Row readStaticRow() throws IOException;
@@ -93,6 +102,41 @@ public abstract class SSTableSimpleIterator extends AbstractIterator<Unfiltered>
         }
     }
 
+    private static class CurrentFormatTombstoneIterator extends SSTableSimpleIterator
+    {
+        private final SerializationHeader header;
+
+        private CurrentFormatTombstoneIterator(CFMetaData metadata, DataInputPlus in, SerializationHeader header, SerializationHelper helper)
+        {
+            super(metadata, in, helper);
+            this.header = header;
+        }
+
+        public Row readStaticRow() throws IOException
+        {
+            if (header.hasStatic())
+            {
+                Row staticRow = UnfilteredSerializer.serializer.deserializeStaticRow(in, header, helper);
+                if (!staticRow.deletion().isLive())
+                    return BTreeRow.emptyDeletedRow(staticRow.clustering(), staticRow.deletion());
+            }
+            return Rows.EMPTY_STATIC_ROW;
+        }
+
+        protected Unfiltered computeNext()
+        {
+            try
+            {
+                Unfiltered unfiltered = UnfilteredSerializer.serializer.deserializeTombstonesOnly((FileDataInput) in, header, helper);
+                return unfiltered == null ? endOfData() : unfiltered;
+            }
+            catch (IOException e)
+            {
+                throw new IOError(e);
+            }
+        }
+    }
+
     private static class OldFormatIterator extends SSTableSimpleIterator
     {
         private final UnfilteredDeserializer deserializer;
@@ -113,11 +157,9 @@ public abstract class SSTableSimpleIterator extends AbstractIterator<Unfiltered>
                 // need to extract them. Which imply 2 passes (one to extract the static, then one for other value).
                 if (metadata.isStaticCompactTable())
                 {
-                    // Because we don't support streaming from old file version, the only case we should get there is for compaction,
-                    // where the DataInput should be a file based one.
-                    assert in instanceof FileDataInput;
-                    FileDataInput file = (FileDataInput)in;
-                    FileMark mark = file.mark();
+                    assert in instanceof RewindableDataInput;
+                    RewindableDataInput file = (RewindableDataInput)in;
+                    DataPosition mark = file.mark();
                     Row staticRow = LegacyLayout.extractStaticColumns(metadata, file, metadata.partitionColumns().statics);
                     file.reset(mark);
 
@@ -139,27 +181,61 @@ public abstract class SSTableSimpleIterator extends AbstractIterator<Unfiltered>
 
         protected Unfiltered computeNext()
         {
-            try
+            while (true)
             {
-                if (!deserializer.hasNext())
-                    return endOfData();
-
-                Unfiltered unfiltered = deserializer.readNext();
-                if (metadata.isStaticCompactTable() && unfiltered.kind() == Unfiltered.Kind.ROW)
+                try
                 {
-                    Row row = (Row) unfiltered;
-                    ColumnDefinition def = metadata.getColumnDefinition(LegacyLayout.encodeClustering(metadata, row.clustering()));
-                    if (def != null && def.isStatic())
-                        return computeNext();
+                    if (!deserializer.hasNext())
+                        return endOfData();
+
+                    Unfiltered unfiltered = deserializer.readNext();
+                    if (metadata.isStaticCompactTable() && unfiltered.kind() == Unfiltered.Kind.ROW)
+                    {
+                        Row row = (Row) unfiltered;
+                        ColumnDefinition def = metadata.getColumnDefinition(LegacyLayout.encodeClustering(metadata, row.clustering()));
+                        if (def != null && def.isStatic())
+                            continue;
+                    }
+                    return unfiltered;
                 }
-                return unfiltered;
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
+                catch (IOException e)
+                {
+                    throw new IOError(e);
+                }
             }
         }
 
     }
 
+    private static class OldFormatTombstoneIterator extends OldFormatIterator
+    {
+        private OldFormatTombstoneIterator(CFMetaData metadata, DataInputPlus in, SerializationHelper helper, DeletionTime partitionDeletion)
+        {
+            super(metadata, in, helper, partitionDeletion);
+        }
+
+        public Row readStaticRow() throws IOException
+        {
+            Row row = super.readStaticRow();
+            if (!row.deletion().isLive())
+                return BTreeRow.emptyDeletedRow(row.clustering(), row.deletion());
+            return Rows.EMPTY_STATIC_ROW;
+        }
+
+        protected Unfiltered computeNext()
+        {
+            while (true)
+            {
+                Unfiltered unfiltered = super.computeNext();
+                if (unfiltered == null || unfiltered.isRangeTombstoneMarker())
+                    return unfiltered;
+
+                Row row = (Row) unfiltered;
+                if (!row.deletion().isLive())
+                    return BTreeRow.emptyDeletedRow(row.clustering(), row.deletion());
+                // Otherwise read next.
+            }
+        }
+
+    }
 }

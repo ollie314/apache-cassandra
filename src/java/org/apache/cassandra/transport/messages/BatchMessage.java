@@ -84,7 +84,7 @@ public class BatchMessage extends Message.Request
                 CBUtil.writeValueList(msg.values.get(i), dest);
             }
 
-            if (version < 3)
+            if (version < Server.VERSION_3)
                 CBUtil.writeConsistencyLevel(msg.options.getConsistency(), dest);
             else
                 QueryOptions.codec.encode(msg.options, dest, version);
@@ -102,7 +102,7 @@ public class BatchMessage extends Message.Request
 
                 size += CBUtil.sizeOfValueList(msg.values.get(i));
             }
-            size += version < 3
+            size += version < Server.VERSION_3
                   ? CBUtil.sizeOfConsistencyLevel(msg.options.getConsistency())
                   : QueryOptions.codec.encodedSize(msg.options, version);
             return size;
@@ -147,7 +147,7 @@ public class BatchMessage extends Message.Request
         this.options = options;
     }
 
-    public Message.Response execute(QueryState state)
+    public Message.Response execute(QueryState state, long queryStartNanoTime)
     {
         try
         {
@@ -214,7 +214,7 @@ public class BatchMessage extends Message.Request
             // Note: It's ok at this point to pass a bogus value for the number of bound terms in the BatchState ctor
             // (and no value would be really correct, so we prefer passing a clearly wrong one).
             BatchStatement batch = new BatchStatement(-1, batchType, statements, Attributes.none());
-            Message.Response response = handler.processBatch(batch, state, batchOptions, getCustomPayload());
+            Message.Response response = handler.processBatch(batch, state, batchOptions, getCustomPayload(), queryStartNanoTime);
 
             if (tracingId != null)
                 response.setTracingId(tracingId);

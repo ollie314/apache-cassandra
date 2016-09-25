@@ -22,6 +22,7 @@ package org.apache.cassandra.locator;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.EnumMap;
 import java.util.Map;
 
 import org.junit.AfterClass;
@@ -30,6 +31,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.ApplicationState;
@@ -48,6 +50,7 @@ public class EC2SnitchTest
     @BeforeClass
     public static void setup() throws Exception
     {
+        DatabaseDescriptor.daemonInitialization();
         SchemaLoader.mkdirs();
         SchemaLoader.cleanup();
         Keyspace.setInitialized();
@@ -77,9 +80,10 @@ public class EC2SnitchTest
         InetAddress nonlocal = InetAddress.getByName("127.0.0.7");
 
         Gossiper.instance.addSavedEndpoint(nonlocal);
-        Map<ApplicationState,VersionedValue> stateMap = Gossiper.instance.getEndpointStateForEndpoint(nonlocal).getApplicationStateMap();
+        Map<ApplicationState, VersionedValue> stateMap = new EnumMap<>(ApplicationState.class);
         stateMap.put(ApplicationState.DC, StorageService.instance.valueFactory.datacenter("us-west"));
         stateMap.put(ApplicationState.RACK, StorageService.instance.valueFactory.datacenter("1a"));
+        Gossiper.instance.getEndpointStateForEndpoint(nonlocal).addApplicationStates(stateMap);
 
         assertEquals("us-west", snitch.getDatacenter(nonlocal));
         assertEquals("1a", snitch.getRack(nonlocal));

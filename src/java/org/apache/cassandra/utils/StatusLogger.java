@@ -18,19 +18,15 @@
 package org.apache.cassandra.utils;
 
 import java.lang.management.ManagementFactory;
-import java.util.Set;
+import java.util.Map;
 import javax.management.*;
-
-import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.cache.*;
 
-import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.metrics.ThreadPoolMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutorMBean;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.RowIndexEntry;
@@ -50,15 +46,15 @@ public class StatusLogger
         // everything from o.a.c.concurrent
         logger.info(String.format("%-25s%10s%10s%15s%10s%18s", "Pool Name", "Active", "Pending", "Completed", "Blocked", "All Time Blocked"));
 
-        for (Stage stage : Stage.jmxEnabledStages())
+        for (Map.Entry<String, String> tpool : ThreadPoolMetrics.getJmxThreadPools(server).entries())
         {
             logger.info(String.format("%-25s%10s%10s%15s%10s%18s%n",
-                              stage.getJmxName(),
-                              ThreadPoolMetrics.getJmxMetric(server, stage.getJmxType(), stage.getJmxName(), "ActiveTasks"),
-                              ThreadPoolMetrics.getJmxMetric(server, stage.getJmxType(), stage.getJmxName(), "PendingTasks"),
-                              ThreadPoolMetrics.getJmxMetric(server, stage.getJmxType(), stage.getJmxName(), "CompletedTasks"),
-                              ThreadPoolMetrics.getJmxMetric(server, stage.getJmxType(), stage.getJmxName(), "CurrentlyBlockedTasks"),
-                              ThreadPoolMetrics.getJmxMetric(server, stage.getJmxType(), stage.getJmxName(), "TotalBlockedTasks")));
+                                      tpool.getValue(),
+                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "ActiveTasks"),
+                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "PendingTasks"),
+                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "CompletedTasks"),
+                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "CurrentlyBlockedTasks"),
+                                      ThreadPoolMetrics.getJmxMetric(server, tpool.getKey(), tpool.getValue(), "TotalBlockedTasks")));
         }
 
         // one offs

@@ -25,6 +25,7 @@ import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TimeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -32,11 +33,12 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.UUID;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class JsonTest extends CQLTester
@@ -63,10 +65,12 @@ public class JsonTest extends CQLTester
                 "floatval float, " +
                 "inetval inet, " +
                 "intval int, " +
+                "smallintval smallint, " +
                 "textval text, " +
                 "timeval time, " +
                 "timestampval timestamp, " +
                 "timeuuidval timeuuid, " +
+                "tinyintval tinyint, " +
                 "uuidval uuid," +
                 "varcharval varchar, " +
                 "varintval varint, " +
@@ -265,6 +269,48 @@ public class JsonTest extends CQLTester
 
         assertInvalidMessage("Expected an int value, but got a",
                 "INSERT INTO %s (k, intval) VALUES (?, fromJson(?))", 0, "true");
+
+        // ================ smallint ================
+        execute("INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "32767");
+        assertRows(execute("SELECT k, smallintval FROM %s WHERE k = ?", 0), row(0, (short) 32767));
+
+        // strings are also accepted
+        execute("INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "\"32767\"");
+        assertRows(execute("SELECT k, smallintval FROM %s WHERE k = ?", 0), row(0, (short) 32767));
+
+        // smallint overflow (Short.MAX_VALUE + 1)
+        assertInvalidMessage("Unable to make short from",
+                "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "32768");
+
+        assertInvalidMessage("Unable to make short from",
+                "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "123.456");
+
+        assertInvalidMessage("Unable to make short from",
+                "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "\"xyzz\"");
+
+        assertInvalidMessage("Expected a short value, but got a Boolean",
+                "INSERT INTO %s (k, smallintval) VALUES (?, fromJson(?))", 0, "true");
+
+        // ================ tinyint ================
+        execute("INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "127");
+        assertRows(execute("SELECT k, tinyintval FROM %s WHERE k = ?", 0), row(0, (byte) 127));
+
+        // strings are also accepted
+        execute("INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "\"127\"");
+        assertRows(execute("SELECT k, tinyintval FROM %s WHERE k = ?", 0), row(0, (byte) 127));
+
+        // tinyint overflow (Byte.MAX_VALUE + 1)
+        assertInvalidMessage("Unable to make byte from",
+                "INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "128");
+
+        assertInvalidMessage("Unable to make byte from",
+                "INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "123.456");
+
+        assertInvalidMessage("Unable to make byte from",
+                "INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "\"xyzz\"");
+
+        assertInvalidMessage("Expected a byte value, but got a Boolean",
+                "INSERT INTO %s (k, tinyintval) VALUES (?, fromJson(?))", 0, "true");
 
         // ================ text (varchar) ================
         execute("INSERT INTO %s (k, textval) VALUES (?, fromJson(?))", 0, "\"\"");
@@ -501,10 +547,12 @@ public class JsonTest extends CQLTester
                 "floatval float, " +
                 "inetval inet, " +
                 "intval int, " +
+                "smallintval smallint, " +
                 "textval text, " +
                 "timeval time, " +
                 "timestampval timestamp, " +
                 "timeuuidval timeuuid, " +
+                "tinyintval tinyint, " +
                 "uuidval uuid," +
                 "varcharval varchar, " +
                 "varintval varint, " +
@@ -598,6 +646,26 @@ public class JsonTest extends CQLTester
         execute("INSERT INTO %s (k, intval) VALUES (?, ?)", 0, -123123);
         assertRows(execute("SELECT k, toJson(intval) FROM %s WHERE k = ?", 0), row(0, "-123123"));
 
+        // ================ smallint ================
+        execute("INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, (short) 32767);
+        assertRows(execute("SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), row(0, "32767"));
+
+        execute("INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, (short) 0);
+        assertRows(execute("SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), row(0, "0"));
+
+        execute("INSERT INTO %s (k, smallintval) VALUES (?, ?)", 0, (short) -32768);
+        assertRows(execute("SELECT k, toJson(smallintval) FROM %s WHERE k = ?", 0), row(0, "-32768"));
+
+        // ================ tinyint ================
+        execute("INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, (byte) 127);
+        assertRows(execute("SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), row(0, "127"));
+
+        execute("INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, (byte) 0);
+        assertRows(execute("SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), row(0, "0"));
+
+        execute("INSERT INTO %s (k, tinyintval) VALUES (?, ?)", 0, (byte) -128);
+        assertRows(execute("SELECT k, toJson(tinyintval) FROM %s WHERE k = ?", 0), row(0, "-128"));
+
         // ================ text (varchar) ================
         execute("INSERT INTO %s (k, textval) VALUES (?, ?)", 0, "");
         assertRows(execute("SELECT k, toJson(textval) FROM %s WHERE k = ?", 0), row(0, "\"\""));
@@ -616,8 +684,10 @@ public class JsonTest extends CQLTester
         assertRows(execute("SELECT k, toJson(timeval) FROM %s WHERE k = ?", 0), row(0, "\"00:00:00.000000123\""));
 
         // ================ timestamp ================
-        execute("INSERT INTO %s (k, timestampval) VALUES (?, ?)", 0, new SimpleDateFormat("y-M-d").parse("2014-01-01"));
-        assertRows(execute("SELECT k, toJson(timestampval) FROM %s WHERE k = ?", 0), row(0, "\"2014-01-01 00:00:00.000\""));
+        SimpleDateFormat sdf = new SimpleDateFormat("y-M-d");
+        sdf.setTimeZone(TimeZone.getTimeZone("UDT"));
+        execute("INSERT INTO %s (k, timestampval) VALUES (?, ?)", 0, sdf.parse("2014-01-01"));
+        assertRows(execute("SELECT k, toJson(timestampval) FROM %s WHERE k = ?", 0), row(0, "\"2014-01-01 00:00:00.000Z\""));
 
         // ================ timeuuid ================
         execute("INSERT INTO %s (k, timeuuidval) VALUES (?, ?)", 0, UUID.fromString("6bddc89a-5644-11e4-97fc-56847afe9799"));
@@ -790,6 +860,52 @@ public class JsonTest extends CQLTester
     }
 
     @Test
+    public void testInsertJsonSyntaxDefaultUnset() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int primary key, v1 int, v2 int)");
+        execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"v1\": 0, \"v2\": 0}");
+
+        // leave v1 unset
+        execute("INSERT INTO %s JSON ? DEFAULT UNSET", "{\"k\": 0, \"v2\": 2}");
+        assertRows(execute("SELECT * FROM %s"),
+                row(0, 0, 2)
+        );
+
+        // explicit specification DEFAULT NULL
+        execute("INSERT INTO %s JSON ? DEFAULT NULL", "{\"k\": 0, \"v2\": 2}");
+        assertRows(execute("SELECT * FROM %s"),
+                row(0, null, 2)
+        );
+
+        // implicitly setting v2 to null
+        execute("INSERT INTO %s JSON ? DEFAULT NULL", "{\"k\": 0}");
+        assertRows(execute("SELECT * FROM %s"),
+                row(0, null, null)
+        );
+
+        // mix setting null explicitly with default unset:
+        // set values for all fields
+        execute("INSERT INTO %s JSON ?", "{\"k\": 1, \"v1\": 1, \"v2\": 1}");
+        // explicitly set v1 to null while leaving v2 unset which retains its value
+        execute("INSERT INTO %s JSON ? DEFAULT UNSET", "{\"k\": 1, \"v1\": null}");
+        assertRows(execute("SELECT * FROM %s WHERE k=1"),
+                row(1, null, 1)
+        );
+
+        // test string literal instead of bind marker
+        execute("INSERT INTO %s JSON '{\"k\": 2, \"v1\": 2, \"v2\": 2}'");
+        // explicitly set v1 to null while leaving v2 unset which retains its value
+        execute("INSERT INTO %s JSON '{\"k\": 2, \"v1\": null}' DEFAULT UNSET");
+        assertRows(execute("SELECT * FROM %s WHERE k=2"),
+                row(2, null, 2)
+        );
+        execute("INSERT INTO %s JSON '{\"k\": 2}' DEFAULT NULL");
+        assertRows(execute("SELECT * FROM %s WHERE k=2"),
+                row(2, null, null)
+        );
+    }
+
+    @Test
     public void testCaseSensitivity() throws Throwable
     {
         createTable("CREATE TABLE %s (k int primary key, \"Foo\" int)");
@@ -865,6 +981,8 @@ public class JsonTest extends CQLTester
                 "intmap map<int, boolean>, " +
                 "bigintmap map<bigint, boolean>, " +
                 "varintmap map<varint, boolean>, " +
+                "smallintmap map<smallint, boolean>, " +
+                "tinyintmap map<tinyint, boolean>, " +
                 "booleanmap map<boolean, boolean>, " +
                 "floatmap map<float, boolean>, " +
                 "doublemap map<double, boolean>, " +
@@ -888,6 +1006,14 @@ public class JsonTest extends CQLTester
         // varint keys
         execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"varintmap\": {\"0\": true, \"1\": false}}");
         assertRows(execute("SELECT JSON k, varintmap FROM %s"), row("{\"k\": 0, \"varintmap\": {\"0\": true, \"1\": false}}"));
+
+        // smallint keys
+        execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"smallintmap\": {\"0\": true, \"1\": false}}");
+        assertRows(execute("SELECT JSON k, smallintmap FROM %s"), row("{\"k\": 0, \"smallintmap\": {\"0\": true, \"1\": false}}"));
+
+        // tinyint keys
+        execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"tinyintmap\": {\"0\": true, \"1\": false}}");
+        assertRows(execute("SELECT JSON k, tinyintmap FROM %s"), row("{\"k\": 0, \"tinyintmap\": {\"0\": true, \"1\": false}}"));
 
         // boolean keys
         execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"booleanmap\": {\"true\": true, \"false\": false}}");
@@ -927,11 +1053,11 @@ public class JsonTest extends CQLTester
 
         // map<set<text>, text> keys
         String innerKey1 = "[\"0\", \"1\"]";
-        String fullKey1 = String.format("{\"%s\": \"%s\"}", new String(Json.JSON_STRING_ENCODER.quoteAsString(innerKey1)), "a");
-        String stringKey1 = new String(Json.JSON_STRING_ENCODER.quoteAsString(fullKey1));
+        String fullKey1 = String.format("{\"%s\": \"%s\"}", Json.quoteAsJsonString(innerKey1), "a");
+        String stringKey1 = Json.quoteAsJsonString(fullKey1);
         String innerKey2 = "[\"3\", \"4\"]";
-        String fullKey2 = String.format("{\"%s\": \"%s\"}", new String(Json.JSON_STRING_ENCODER.quoteAsString(innerKey2)), "b");
-        String stringKey2 = new String(Json.JSON_STRING_ENCODER.quoteAsString(fullKey2));
+        String fullKey2 = String.format("{\"%s\": \"%s\"}", Json.quoteAsJsonString(innerKey2), "b");
+        String stringKey2 = Json.quoteAsJsonString(fullKey2);
         execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"nestedsetmap\": {\"" + stringKey1 + "\": true, \"" + stringKey2 + "\": false}}");
         assertRows(execute("SELECT JSON k, nestedsetmap FROM %s"), row("{\"k\": 0, \"nestedsetmap\": {\"" + stringKey1 + "\": true, \"" + stringKey2 + "\": false}}"));
 
@@ -954,5 +1080,76 @@ public class JsonTest extends CQLTester
 
         execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"a\": {\"a\": 0, \"b\": [1, 2, 3], \"c\": null}, \"b\": null}");
         assertRows(execute("SELECT k, a.a, a.b, a.c, b FROM %s"), row(0, 0, set(1, 2, 3), null, null));
+    }
+
+    // done for CASSANDRA-11146
+    @Test
+    public void testAlterUDT() throws Throwable
+    {
+        String typeName = createType("CREATE TYPE %s (a int)");
+        createTable("CREATE TABLE %s (" +
+                "k int PRIMARY KEY, " +
+                "a frozen<" + typeName + ">)");
+
+        execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"a\": {\"a\": 0}}");
+        assertRows(execute("SELECT JSON * FROM %s"), row("{\"k\": 0, \"a\": {\"a\": 0}}"));
+
+        schemaChange("ALTER TYPE " + KEYSPACE + "." + typeName + " ADD b boolean");
+        assertRows(execute("SELECT JSON * FROM %s"), row("{\"k\": 0, \"a\": {\"a\": 0, \"b\": null}}"));
+
+        execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"a\": {\"a\": 0, \"b\": true}}");
+        assertRows(execute("SELECT JSON * FROM %s"), row("{\"k\": 0, \"a\": {\"a\": 0, \"b\": true}}"));
+    }
+
+    // done for CASSANDRA-11048
+    @Test
+    public void testJsonThreadSafety() throws Throwable
+    {
+        int numThreads = 10;
+        final int numRows = 5000;
+
+        createTable("CREATE TABLE %s (" +
+                "k text PRIMARY KEY, " +
+                "v text)");
+
+        for (int i = 0; i < numRows; i++)
+            execute("INSERT INTO %s (k, v) VALUES (?, ?)", "" + i, "" + i);
+
+        long seed = System.nanoTime();
+        System.out.println("Seed " + seed);
+        final Random rand = new Random(seed);
+
+        final Runnable worker = new Runnable()
+        {
+            @Override
+            public void run()
+            {
+                try
+                {
+                    for (int i = 0; i < numRows; i++)
+                    {
+                        String key = "" + rand.nextInt(numRows);
+                        assertRows(execute("SELECT JSON * FROM %s WHERE k = ?", key),
+                                row(String.format("{\"k\": \"%s\", \"v\": \"%s\"}", key, key)));
+                    }
+                }
+                catch (Throwable exc)
+                {
+                    exc.printStackTrace();
+                    fail(exc.getMessage());
+                }
+            }
+        };
+
+        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+        List<Future> futures = new ArrayList<>();
+        for (int i = 0; i < numThreads; i++)
+            futures.add(executor.submit(worker));
+
+        for (Future future : futures)
+            future.get(30, TimeUnit.SECONDS);
+
+        executor.shutdown();
+        Assert.assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
     }
 }

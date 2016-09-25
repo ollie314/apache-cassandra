@@ -21,6 +21,7 @@ package org.apache.cassandra.schema;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.util.*;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import com.google.common.base.Objects;
@@ -46,6 +47,10 @@ import org.apache.cassandra.utils.UUIDSerializer;
 public final class IndexMetadata
 {
     private static final Logger logger = LoggerFactory.getLogger(IndexMetadata.class);
+    
+    private static final Pattern PATTERN_NON_WORD_CHAR = Pattern.compile("\\W");
+    private static final Pattern PATTERN_WORD_CHARS = Pattern.compile("\\w+");
+
 
     public static final Serializer serializer = new Serializer();
 
@@ -127,18 +132,18 @@ public final class IndexMetadata
 
     public static boolean isNameValid(String name)
     {
-        return name != null && !name.isEmpty() && name.matches("\\w+");
+        return name != null && !name.isEmpty() && PATTERN_WORD_CHARS.matcher(name).matches();
     }
 
     public static String getDefaultIndexName(String cfName, String root)
     {
         if (root == null)
-            return (cfName + "_" + "idx").replaceAll("\\W", "");
+            return PATTERN_NON_WORD_CHAR.matcher(cfName + "_" + "idx").replaceAll("");
         else
-            return (cfName + "_" + root + "_idx").replaceAll("\\W", "");
+            return PATTERN_NON_WORD_CHAR.matcher(cfName + "_" + root + "_idx").replaceAll("");
     }
 
-    public void validate()
+    public void validate(CFMetaData cfm)
     {
         if (!isNameValid(name))
             throw new ConfigurationException("Illegal index name " + name);
@@ -155,11 +160,14 @@ public final class IndexMetadata
             Class<Index> indexerClass = FBUtilities.classForName(className, "custom indexer");
             if(!Index.class.isAssignableFrom(indexerClass))
                 throw new ConfigurationException(String.format("Specified Indexer class (%s) does not implement the Indexer interface", className));
-            validateCustomIndexOptions(indexerClass, options);
+            validateCustomIndexOptions(cfm, indexerClass, options);
         }
     }
 
-    private void validateCustomIndexOptions(Class<? extends Index> indexerClass, Map<String, String> options) throws ConfigurationException
+    private void validateCustomIndexOptions(CFMetaData cfm,
+                                            Class<? extends Index> indexerClass,
+                                            Map<String, String> options)
+    throws ConfigurationException
     {
         try
         {
@@ -169,7 +177,16 @@ public final class IndexMetadata
             if (filteredOptions.isEmpty())
                 return;
 
-            Map<?,?> unknownOptions = (Map) indexerClass.getMethod("validateOptions", Map.class).invoke(null, filteredOptions);
+            Map<?,?> unknownOptions;
+            try
+            {
+                unknownOptions = (Map) indexerClass.getMethod("validateOptions", Map.class, CFMetaData.class).invoke(null, filteredOptions, cfm);
+            }
+            catch (NoSuchMethodException e)
+            {
+                unknownOptions = (Map) indexerClass.getMethod("validateOptions", Map.class).invoke(null, filteredOptions);
+            }
+
             if (!unknownOptions.isEmpty())
                 throw new ConfigurationException(String.format("Properties specified %s are not understood by %s", unknownOptions.keySet(), indexerClass.getSimpleName()));
         }

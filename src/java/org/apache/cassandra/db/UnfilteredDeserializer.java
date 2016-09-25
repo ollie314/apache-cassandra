@@ -29,6 +29,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.net.MessagingService;
 
 /**
@@ -80,7 +81,7 @@ public abstract class UnfilteredDeserializer
      * comparison. Whenever we know what to do with this atom (read it or skip it),
      * readNext or skipNext should be called.
      */
-    public abstract int compareNextTo(Slice.Bound bound) throws IOException;
+    public abstract int compareNextTo(ClusteringBound bound) throws IOException;
 
     /**
      * Returns whether the next atom is a row or not.
@@ -106,6 +107,20 @@ public abstract class UnfilteredDeserializer
      * Skips the next atom.
      */
     public abstract void skipNext() throws IOException;
+
+
+    /**
+     * For the legacy layout deserializer, we have to deal with the fact that a row can span multiple index blocks and that
+     * the call to hasNext() reads the next element upfront. We must take that into account when we check in AbstractSSTableIterator if
+     * we're past the end of an index block boundary as that check expect to account for only consumed data (that is, if hasNext has
+     * been called and made us cross an index boundary but neither readNext() or skipNext() as yet been called, we shouldn't consider
+     * the index block boundary crossed yet).
+     *
+     * TODO: we don't care about this for the current file format because a row can never span multiple index blocks (further, hasNext()
+     * only just basically read 2 bytes from disk in that case). So once we drop backward compatibility with pre-3.0 sstable, we should
+     * remove this.
+     */
+    public abstract long bytesReadForUnconsumedData();
 
     private static class CurrentDeserializer extends UnfilteredDeserializer
     {
@@ -158,7 +173,7 @@ public abstract class UnfilteredDeserializer
             isReady = true;
         }
 
-        public int compareNextTo(Slice.Bound bound) throws IOException
+        public int compareNextTo(ClusteringBound bound) throws IOException
         {
             if (!isReady)
                 prepareNext();
@@ -187,7 +202,7 @@ public abstract class UnfilteredDeserializer
             isReady = false;
             if (UnfilteredSerializer.kind(nextFlags) == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)
             {
-                RangeTombstone.Bound bound = clusteringDeserializer.deserializeNextBound();
+                ClusteringBoundOrBoundary bound = clusteringDeserializer.deserializeNextBound();
                 return UnfilteredSerializer.serializer.deserializeMarkerBody(in, header, bound);
             }
             else
@@ -216,6 +231,13 @@ public abstract class UnfilteredDeserializer
             isReady = false;
             isDone = false;
         }
+
+        public long bytesReadForUnconsumedData()
+        {
+            // In theory, hasNext() does consume 2-3 bytes, but we don't care about this for the current file format so returning
+            // 0 to mean "do nothing".
+            return 0;
+        }
     }
 
     public static class OldFormatDeserializer extends UnfilteredDeserializer
@@ -233,8 +255,8 @@ public abstract class UnfilteredDeserializer
         // The Unfiltered as read from the old format input
         private final UnfilteredIterator iterator;
 
-        // Tracks which tombstone are opened at any given point of the deserialization. Note that this
-        // is directly populated by UnfilteredIterator.
+        // The position in the input after the last data consumption (readNext/skipNext).
+        private long lastConsumedPosition;
 
         private OldFormatDeserializer(CFMetaData metadata,
                                       DataInputPlus in,
@@ -245,6 +267,7 @@ public abstract class UnfilteredDeserializer
             super(metadata, in, helper);
             this.iterator = new UnfilteredIterator(partitionDeletion);
             this.readAllAsDynamic = readAllAsDynamic;
+            this.lastConsumedPosition = currentPosition();
         }
 
         public void setSkipStatic()
@@ -303,7 +326,7 @@ public abstract class UnfilteredDeserializer
             return tombstone.isCollectionTombstone() || tombstone.isRowDeletion(metadata);
         }
 
-        public int compareNextTo(Slice.Bound bound) throws IOException
+        public int compareNextTo(ClusteringBound bound) throws IOException
         {
             if (!hasNext())
                 throw new IllegalStateException();
@@ -322,12 +345,20 @@ public abstract class UnfilteredDeserializer
             return nextIsRow() && ((Row)next).isStatic();
         }
 
+        private long currentPosition()
+        {
+            // We return a bogus value if the input is not file based, but check we never rely
+            // on that value in that case in bytesReadForUnconsumedData
+            return in instanceof FileDataInput ? ((FileDataInput)in).getFilePointer() : 0;
+        }
+
         public Unfiltered readNext() throws IOException
         {
             if (!hasNext())
                 throw new IllegalStateException();
             Unfiltered toReturn = next;
             next = null;
+            lastConsumedPosition = currentPosition();
             return toReturn;
         }
 
@@ -336,6 +367,15 @@ public abstract class UnfilteredDeserializer
             if (!hasNext())
                 throw new UnsupportedOperationException();
             next = null;
+            lastConsumedPosition = currentPosition();
+        }
+
+        public long bytesReadForUnconsumedData()
+        {
+            if (!(in instanceof FileDataInput))
+                throw new AssertionError();
+
+            return currentPosition() - lastConsumedPosition;
         }
 
         public void clearState()
@@ -343,6 +383,7 @@ public abstract class UnfilteredDeserializer
             next = null;
             saved = null;
             iterator.clearState();
+            lastConsumedPosition = currentPosition();
         }
 
         // Groups atoms from the input into proper Unfiltered.
@@ -360,12 +401,12 @@ public abstract class UnfilteredDeserializer
             {
                 this.grouper = new LegacyLayout.CellGrouper(metadata, helper);
                 this.tombstoneTracker = new TombstoneTracker(partitionDeletion);
-                this.atoms = new AtomIterator(tombstoneTracker);
+                this.atoms = new AtomIterator();
             }
 
             public boolean hasNext()
             {
-                // Note that we loop on next == null because TombstoneTracker.openNew() could return null below.
+                // Note that we loop on next == null because TombstoneTracker.openNew() could return null below or the atom might be shadowed.
                 while (next == null)
                 {
                     if (atoms.hasNext())
@@ -378,7 +419,8 @@ public abstract class UnfilteredDeserializer
                         else
                         {
                             LegacyLayout.LegacyAtom atom = atoms.next();
-                            next = isRow(atom) ? readRow(atom) : tombstoneTracker.openNew(atom.asRangeTombstone());
+                            if (!tombstoneTracker.isShadowed(atom))
+                                next = isRow(atom) ? readRow(atom) : tombstoneTracker.openNew(atom.asRangeTombstone());
                         }
                     }
                     else if (tombstoneTracker.hasOpenTombstones())
@@ -390,7 +432,7 @@ public abstract class UnfilteredDeserializer
                         return false;
                     }
                 }
-                return next != null;
+                return true;
             }
 
             private Unfiltered readRow(LegacyLayout.LegacyAtom first)
@@ -443,13 +485,11 @@ public abstract class UnfilteredDeserializer
         // the internal state of the iterator so it's cleaner to do it ourselves.
         private class AtomIterator implements PeekingIterator<LegacyLayout.LegacyAtom>
         {
-            private final TombstoneTracker tombstoneTracker;
             private boolean isDone;
             private LegacyLayout.LegacyAtom next;
 
-            private AtomIterator(TombstoneTracker tombstoneTracker)
+            private AtomIterator()
             {
-                this.tombstoneTracker = tombstoneTracker;
             }
 
             public boolean hasNext()
@@ -457,7 +497,7 @@ public abstract class UnfilteredDeserializer
                 if (isDone)
                     return false;
 
-                while (next == null)
+                if (next == null)
                 {
                     next = readAtom();
                     if (next == null)
@@ -465,9 +505,6 @@ public abstract class UnfilteredDeserializer
                         isDone = true;
                         return false;
                     }
-
-                    if (tombstoneTracker.isShadowed(next))
-                        next = null;
                 }
                 return true;
             }
@@ -535,6 +572,7 @@ public abstract class UnfilteredDeserializer
              */
             public boolean isShadowed(LegacyLayout.LegacyAtom atom)
             {
+                assert !hasClosingMarkerBefore(atom);
                 long timestamp = atom.isCell() ? atom.asCell().timestamp : atom.asRangeTombstone().deletionTime.markedForDeleteAt();
 
                 if (partitionDeletion.deletes(timestamp))
@@ -616,11 +654,6 @@ public abstract class UnfilteredDeserializer
             public boolean hasOpenTombstones()
             {
                 return !openTombstones.isEmpty();
-            }
-
-            private boolean formBoundary(LegacyLayout.LegacyRangeTombstone close, LegacyLayout.LegacyRangeTombstone open)
-            {
-                return metadata.comparator.compare(close.stop.bound, open.start.bound) == 0;
             }
 
             public void clearState()

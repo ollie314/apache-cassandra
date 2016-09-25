@@ -22,17 +22,23 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 import com.datastax.driver.core.DataType;
-import org.apache.cassandra.config.DatabaseDescriptor;
+import com.datastax.driver.core.TypeCodec;
 import org.apache.cassandra.cql3.functions.JavaUDF;
+import org.apache.cassandra.cql3.functions.UDFContext;
 
 /**
  * Used by {@link org.apache.cassandra.cql3.validation.entities.UFVerifierTest}.
  */
 public final class CallComDatastax extends JavaUDF
 {
-    public CallComDatastax(DataType returnDataType, DataType[] argDataTypes)
+    public CallComDatastax(TypeCodec<Object> returnDataType, TypeCodec<Object>[] argDataTypes, UDFContext udfContext)
     {
-        super(returnDataType, argDataTypes);
+        super(returnDataType, argDataTypes, udfContext);
+    }
+
+    protected Object executeAggregateImpl(int protocolVersion, Object firstParam, List<ByteBuffer> params)
+    {
+        throw new UnsupportedOperationException();
     }
 
     protected ByteBuffer executeImpl(int protocolVersion, List<ByteBuffer> params)

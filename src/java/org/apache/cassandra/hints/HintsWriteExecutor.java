@@ -35,7 +35,7 @@ import org.apache.cassandra.io.FSWriteError;
  */
 final class HintsWriteExecutor
 {
-    private static final int WRITE_BUFFER_SIZE = 256 << 10;
+    static final int WRITE_BUFFER_SIZE = 256 << 10;
 
     private final HintsCatalog catalog;
     private final ByteBuffer writeBuffer;
@@ -133,8 +133,7 @@ final class HintsWriteExecutor
             finally
             {
                 HintsBuffer recycledBuffer = buffer.recycle();
-                if (!bufferPool.offer(recycledBuffer))
-                    recycledBuffer.free();
+                bufferPool.offer(recycledBuffer);
             }
         }
     }
@@ -200,7 +199,8 @@ final class HintsWriteExecutor
     {
         while (true)
         {
-            flushInternal(iterator, store);
+            if (iterator.hasNext())
+                flushInternal(iterator, store);
 
             if (!iterator.hasNext())
                 break;

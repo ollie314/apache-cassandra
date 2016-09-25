@@ -46,7 +46,10 @@ import org.apache.cassandra.dht.tokenallocator.TokenAllocation;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.IFailureDetectionEventListener;
 import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.RackInferringSnitch;
 import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -58,6 +61,7 @@ public class BootStrapperTest
     @BeforeClass
     public static void setup() throws ConfigurationException
     {
+        DatabaseDescriptor.daemonInitialization();
         oldPartitioner = StorageService.instance.setPartitionerUnsafe(Murmur3Partitioner.instance);
         SchemaLoader.startGossiper();
         SchemaLoader.prepareServer();
@@ -74,7 +78,7 @@ public class BootStrapperTest
     public void testSourceTargetComputation() throws UnknownHostException
     {
         final int[] clusterSizes = new int[] { 1, 3, 5, 10, 100};
-        for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
+        for (String keyspaceName : Schema.instance.getNonLocalStrategyKeyspaces())
         {
             int replicationFactor = Keyspace.open(keyspaceName).getReplicationStrategy().getReplicationFactor();
             for (int clusterSize : clusterSizes)
@@ -93,7 +97,7 @@ public class BootStrapperTest
         InetAddress myEndpoint = InetAddress.getByName("127.0.0.1");
 
         assertEquals(numOldNodes, tmd.sortedTokens().size());
-        RangeStreamer s = new RangeStreamer(tmd, null, myEndpoint, "Bootstrap", true, DatabaseDescriptor.getEndpointSnitch(), new StreamStateStore());
+        RangeStreamer s = new RangeStreamer(tmd, null, myEndpoint, "Bootstrap", true, DatabaseDescriptor.getEndpointSnitch(), new StreamStateStore(), false);
         IFailureDetector mockFailureDetector = new IFailureDetector()
         {
             public boolean isAlive(InetAddress ep)
@@ -135,12 +139,17 @@ public class BootStrapperTest
     private void generateFakeEndpoints(TokenMetadata tmd, int numOldNodes, int numVNodes) throws UnknownHostException
     {
         tmd.clearUnsafe();
+        generateFakeEndpoints(tmd, numOldNodes, numVNodes, "0", "0");
+    }
+
+    private void generateFakeEndpoints(TokenMetadata tmd, int numOldNodes, int numVNodes, String dc, String rack) throws UnknownHostException
+    {
         IPartitioner p = tmd.partitioner;
 
         for (int i = 1; i <= numOldNodes; i++)
         {
             // leave .1 for myEndpoint
-            InetAddress addr = InetAddress.getByName("127.0.0." + (i + 1));
+            InetAddress addr = InetAddress.getByName("127." + dc + "." + rack + "." + (i + 1));
             List<Token> tokens = Lists.newArrayListWithCapacity(numVNodes);
             for (int j = 0; j < numVNodes; ++j)
                 tokens.add(p.getRandomToken());
@@ -158,6 +167,58 @@ public class BootStrapperTest
         generateFakeEndpoints(tm, 10, vn);
         InetAddress addr = FBUtilities.getBroadcastAddress();
         allocateTokensForNode(vn, ks, tm, addr);
+    }
+
+    public void testAllocateTokensNetworkStrategy(int rackCount, int replicas) throws UnknownHostException
+    {
+        IEndpointSnitch oldSnitch = DatabaseDescriptor.getEndpointSnitch();
+        try
+        {
+            DatabaseDescriptor.setEndpointSnitch(new RackInferringSnitch());
+            int vn = 16;
+            String ks = "BootStrapperTestNTSKeyspace" + rackCount + replicas;
+            String dc = "1";
+            SchemaLoader.createKeyspace(ks, KeyspaceParams.nts(dc, replicas, "15", 15), SchemaLoader.standardCFMD(ks, "Standard1"));
+            TokenMetadata tm = new TokenMetadata();
+            tm.clearUnsafe();
+            for (int i = 0; i < rackCount; ++i)
+                generateFakeEndpoints(tm, 10, vn, dc, Integer.toString(i));
+            InetAddress addr = InetAddress.getByName("127." + dc + ".0.99");
+            allocateTokensForNode(vn, ks, tm, addr);
+            // Note: Not matching replication factor in second datacentre, but this should not affect us.
+        } finally {
+            DatabaseDescriptor.setEndpointSnitch(oldSnitch);
+        }
+    }
+
+    @Test
+    public void testAllocateTokensNetworkStrategyOneRack() throws UnknownHostException
+    {
+        testAllocateTokensNetworkStrategy(1, 3);
+    }
+
+    @Test(expected = ConfigurationException.class)
+    public void testAllocateTokensNetworkStrategyTwoRacks() throws UnknownHostException
+    {
+        testAllocateTokensNetworkStrategy(2, 3);
+    }
+
+    @Test
+    public void testAllocateTokensNetworkStrategyThreeRacks() throws UnknownHostException
+    {
+        testAllocateTokensNetworkStrategy(3, 3);
+    }
+
+    @Test
+    public void testAllocateTokensNetworkStrategyFiveRacks() throws UnknownHostException
+    {
+        testAllocateTokensNetworkStrategy(5, 3);
+    }
+
+    @Test
+    public void testAllocateTokensNetworkStrategyOneRackOneReplica() throws UnknownHostException
+    {
+        testAllocateTokensNetworkStrategy(1, 1);
     }
 
     private void allocateTokensForNode(int vn, String ks, TokenMetadata tm, InetAddress addr)

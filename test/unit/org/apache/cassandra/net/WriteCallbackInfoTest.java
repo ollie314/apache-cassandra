@@ -21,10 +21,12 @@ package org.apache.cassandra.net;
 import java.net.InetAddress;
 import java.util.UUID;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import junit.framework.Assert;
 import org.apache.cassandra.MockSchema;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Mutation;
@@ -37,9 +39,14 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class WriteCallbackInfoTest
 {
+    @BeforeClass
+    public static void initDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
 
     @Test
-    public void testShouldHint()
+    public void testShouldHint() throws Exception
     {
         testShouldHint(Verb.COUNTER_MUTATION, ConsistencyLevel.ALL, true, false);
         for (Verb verb : new Verb[] { Verb.PAXOS_COMMIT, Verb.MUTATION })
@@ -50,13 +57,13 @@ public class WriteCallbackInfoTest
         }
     }
 
-    private void testShouldHint(Verb verb, ConsistencyLevel cl, boolean allowHints, boolean expectHint)
+    private void testShouldHint(Verb verb, ConsistencyLevel cl, boolean allowHints, boolean expectHint) throws Exception
     {
         Object payload = verb == Verb.PAXOS_COMMIT
                          ? new Commit(UUID.randomUUID(), new PartitionUpdate(MockSchema.newCFMetaData("", ""), ByteBufferUtil.EMPTY_BYTE_BUFFER, PartitionColumns.NONE, 1))
                          : new Mutation("", new BufferDecoratedKey(new Murmur3Partitioner.LongToken(0), ByteBufferUtil.EMPTY_BYTE_BUFFER));
 
-        WriteCallbackInfo wcbi = new WriteCallbackInfo(InetAddress.getLoopbackAddress(), null, new MessageOut(verb, payload, null), null, cl, allowHints);
+        WriteCallbackInfo wcbi = new WriteCallbackInfo(InetAddress.getByName("192.168.1.1"), null, new MessageOut(verb, payload, null), null, cl, allowHints);
         Assert.assertEquals(expectHint, wcbi.shouldHint());
         if (expectHint)
         {

@@ -86,7 +86,9 @@ public class RealTransactionsTest extends SchemaLoader
         SSTableReader newSSTable = replaceSSTable(cfs, txn, false);
         LogTransaction.waitForDeletions();
 
-        assertFiles(txn.log().getDataFolder(), new HashSet<>(newSSTable.getAllFilePaths()));
+        // both sstables are in the same folder
+        assertFiles(oldSSTable.descriptor.directory.getPath(), new HashSet<>(newSSTable.getAllFilePaths()));
+        assertFiles(newSSTable.descriptor.directory.getPath(), new HashSet<>(newSSTable.getAllFilePaths()));
     }
 
     @Test
@@ -101,7 +103,7 @@ public class RealTransactionsTest extends SchemaLoader
         replaceSSTable(cfs, txn, true);
         LogTransaction.waitForDeletions();
 
-        assertFiles(txn.log().getDataFolder(), new HashSet<>(oldSSTable.getAllFilePaths()));
+        assertFiles(oldSSTable.descriptor.directory.getPath(), new HashSet<>(oldSSTable.getAllFilePaths()));
     }
 
     @Test
@@ -151,7 +153,7 @@ public class RealTransactionsTest extends SchemaLoader
         int nowInSec = FBUtilities.nowInSeconds();
         try (CompactionController controller = new CompactionController(cfs, txn.originals(), cfs.gcBefore(FBUtilities.nowInSeconds())))
         {
-            try (SSTableRewriter rewriter = new SSTableRewriter(txn, 1000, false);
+            try (SSTableRewriter rewriter = SSTableRewriter.constructKeepingOriginals(txn, false, 1000);
                  AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(txn.originals());
                  CompactionIterator ci = new CompactionIterator(txn.opType(), scanners.scanners, controller, nowInSec, txn.opId())
             )
@@ -166,6 +168,7 @@ public class RealTransactionsTest extends SchemaLoader
                                                            0,
                                                            0,
                                                            SerializationHeader.make(cfs.metadata, txn.originals()),
+                                                           cfs.indexManager.listIndexes(),
                                                            txn));
                 while (ci.hasNext())
                 {

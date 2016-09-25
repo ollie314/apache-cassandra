@@ -17,7 +17,11 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -31,15 +35,19 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.view.View;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Refs;
 
 /**
@@ -57,13 +65,15 @@ public class StreamReceiveTask extends StreamTask
     private final long totalSize;
 
     // Transaction tracking new files received
-    public final LifecycleTransaction txn;
+    private final LifecycleTransaction txn;
 
     // true if task is done (either completed or aborted)
-    private boolean done = false;
+    private volatile boolean done = false;
 
     //  holds references to SSTables received
-    protected Collection<SSTableMultiWriter> sstables;
+    protected Collection<SSTableReader> sstables;
+
+    private int remoteSSTablesReceived = 0;
 
     public StreamReceiveTask(StreamSession session, UUID cfId, int totalFiles, long totalSize)
     {
@@ -72,7 +82,7 @@ public class StreamReceiveTask extends StreamTask
         this.totalSize = totalSize;
         // this is an "offline" transaction, as we currently manually expose the sstables once done;
         // this should be revisited at a later date, so that LifecycleTransaction manages all sstable state changes
-        this.txn = LifecycleTransaction.offline(OperationType.STREAM, Schema.instance.getCFMetaData(cfId));
+        this.txn = LifecycleTransaction.offline(OperationType.STREAM);
         this.sstables = new ArrayList<>(totalFiles);
     }
 
@@ -84,12 +94,29 @@ public class StreamReceiveTask extends StreamTask
     public synchronized void received(SSTableMultiWriter sstable)
     {
         if (done)
+        {
+            logger.warn("[{}] Received sstable {} on already finished stream received task. Aborting sstable.", session.planId(),
+                        sstable.getFilename());
+            Throwables.maybeFail(sstable.abort(null));
             return;
+        }
 
+        remoteSSTablesReceived++;
         assert cfId.equals(sstable.getCfId());
 
-        sstables.add(sstable);
-        if (sstables.size() == totalFiles)
+        Collection<SSTableReader> finished = null;
+        try
+        {
+            finished = sstable.finish(true);
+        }
+        catch (Throwable t)
+        {
+            Throwables.maybeFail(sstable.abort(t));
+        }
+        txn.update(finished, false);
+        sstables.addAll(finished);
+
+        if (remoteSSTablesReceived == totalFiles)
         {
             done = true;
             executor.submit(new OnCompletionRunnable(this));
@@ -106,6 +133,13 @@ public class StreamReceiveTask extends StreamTask
         return totalSize;
     }
 
+    public synchronized LifecycleTransaction getTransaction()
+    {
+        if (done)
+            throw new RuntimeException(String.format("Stream receive task %s of cf %s already finished.", session.planId(), cfId));
+        return txn;
+    }
+
     private static class OnCompletionRunnable implements Runnable
     {
         private final StreamReceiveTask task;
@@ -117,38 +151,38 @@ public class StreamReceiveTask extends StreamTask
 
         public void run()
         {
-            Pair<String, String> kscf = Schema.instance.getCF(task.cfId);
-            if (kscf == null)
-            {
-                // schema was dropped during streaming
-                task.sstables.forEach(SSTableMultiWriter::abortOrDie);
-
-                task.sstables.clear();
-                task.txn.abort();
-                return;
-            }
-            ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
-            boolean hasViews = !Iterables.isEmpty(View.findAll(kscf.left, kscf.right));
-
+            boolean hasViews = false;
+            boolean hasCDC = false;
+            ColumnFamilyStore cfs = null;
             try
             {
-                List<SSTableReader> readers = new ArrayList<>();
-                for (SSTableMultiWriter writer : task.sstables)
+                Pair<String, String> kscf = Schema.instance.getCF(task.cfId);
+                if (kscf == null)
                 {
-                    Collection<SSTableReader> newReaders = writer.finish(true);
-                    readers.addAll(newReaders);
-                    task.txn.update(newReaders, false);
+                    // schema was dropped during streaming
+                    task.sstables.clear();
+                    task.abortTransaction();
+                    task.session.taskCompleted(task);
+                    return;
                 }
+                cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
+                hasViews = !Iterables.isEmpty(View.findAll(kscf.left, kscf.right));
+                hasCDC = cfs.metadata.params.cdc;
 
-                task.sstables.clear();
+                Collection<SSTableReader> readers = task.sstables;
 
                 try (Refs<SSTableReader> refs = Refs.ref(readers))
                 {
-                    //We have a special path for views.
-                    //Since the view requires cleaning up any pre-existing state, we must put
-                    //all partitions through the same write path as normal mutations.
-                    //This also ensures any 2is are also updated
-                    if (hasViews)
+                    /*
+                     * We have a special path for views and for CDC.
+                     *
+                     * For views, since the view requires cleaning up any pre-existing state, we must put all partitions
+                     * through the same write path as normal mutations. This also ensures any 2is are also updated.
+                     *
+                     * For CDC-enabled tables, we want to ensure that the mutations are run through the CommitLog so they
+                     * can be archived by the CDC process on discard.
+                     */
+                    if (hasViews || hasCDC)
                     {
                         for (SSTableReader reader : readers)
                         {
@@ -158,8 +192,17 @@ public class StreamReceiveTask extends StreamTask
                                 {
                                     try (UnfilteredRowIterator rowIterator = scanner.next())
                                     {
-                                        //Apply unsafe (we will flush below before transaction is done)
-                                        new Mutation(PartitionUpdate.fromIterator(rowIterator)).applyUnsafe();
+                                        Mutation m = new Mutation(PartitionUpdate.fromIterator(rowIterator, ColumnFilter.all(cfs.metadata)));
+
+                                        // MV *can* be applied unsafe if there's no CDC on the CFS as we flush below
+                                        // before transaction is done.
+                                        //
+                                        // If the CFS has CDC, however, these updates need to be written to the CommitLog
+                                        // so they get archived into the cdc_raw folder
+                                        if (hasCDC)
+                                            m.apply();
+                                        else
+                                            m.applyUnsafe();
                                     }
                                 }
                             }
@@ -167,33 +210,56 @@ public class StreamReceiveTask extends StreamTask
                     }
                     else
                     {
-                        task.txn.finish();
+                        task.finishTransaction();
 
                         // add sstables and build secondary indexes
                         cfs.addSSTables(readers);
                         cfs.indexManager.buildAllIndexesBlocking(readers);
-                    }
-                }
-                catch (Throwable t)
-                {
-                    logger.error("Error applying streamed sstable: ", t);
 
-                    JVMStabilityInspector.inspectThrowable(t);
-                }
-                finally
-                {
-                    //We don't keep the streamed sstables since we've applied them manually
-                    //So we abort the txn and delete the streamed sstables
-                    if (hasViews)
-                    {
-                        cfs.forceBlockingFlush();
-                        task.txn.abort();
+                        //invalidate row and counter cache
+                        if (cfs.isRowCacheEnabled() || cfs.metadata.isCounter())
+                        {
+                            List<Bounds<Token>> boundsToInvalidate = new ArrayList<>(readers.size());
+                            readers.forEach(sstable -> boundsToInvalidate.add(new Bounds<Token>(sstable.first.getToken(), sstable.last.getToken())));
+                            Set<Bounds<Token>> nonOverlappingBounds = Bounds.getNonOverlappingBounds(boundsToInvalidate);
+
+                            if (cfs.isRowCacheEnabled())
+                            {
+                                int invalidatedKeys = cfs.invalidateRowCache(nonOverlappingBounds);
+                                if (invalidatedKeys > 0)
+                                    logger.debug("[Stream #{}] Invalidated {} row cache entries on table {}.{} after stream " +
+                                                 "receive task completed.", task.session.planId(), invalidatedKeys,
+                                                 cfs.keyspace.getName(), cfs.getTableName());
+                            }
+
+                            if (cfs.metadata.isCounter())
+                            {
+                                int invalidatedKeys = cfs.invalidateCounterCache(nonOverlappingBounds);
+                                if (invalidatedKeys > 0)
+                                    logger.debug("[Stream #{}] Invalidated {} counter cache entries on table {}.{} after stream " +
+                                                 "receive task completed.", task.session.planId(), invalidatedKeys,
+                                                 cfs.keyspace.getName(), cfs.getTableName());
+                            }
+                        }
                     }
                 }
+                task.session.taskCompleted(task);
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                task.session.onError(t);
             }
             finally
             {
-                task.session.taskCompleted(task);
+                // We don't keep the streamed sstables since we've applied them manually so we abort the txn and delete
+                // the streamed sstables.
+                if (hasViews || hasCDC)
+                {
+                    if (cfs != null)
+                        cfs.forceBlockingFlush();
+                    task.abortTransaction();
+                }
             }
         }
     }
@@ -210,8 +276,17 @@ public class StreamReceiveTask extends StreamTask
             return;
 
         done = true;
-        sstables.forEach(SSTableMultiWriter::abortOrDie);
-        txn.abort();
+        abortTransaction();
         sstables.clear();
+    }
+
+    private synchronized void abortTransaction()
+    {
+        txn.abort();
+    }
+
+    private synchronized void finishTransaction()
+    {
+        txn.finish();
     }
 }

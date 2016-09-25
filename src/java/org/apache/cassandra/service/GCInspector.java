@@ -48,9 +48,9 @@ public class GCInspector implements NotificationListener, GCInspectorMXBean
 {
     public static final String MBEAN_NAME = "org.apache.cassandra.service:type=GCInspector";
     private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);
-    final static long MIN_LOG_DURATION = 200;
+    final static long MIN_LOG_DURATION = DatabaseDescriptor.getGCLogThreshold();
     final static long GC_WARN_THRESHOLD_IN_MS = DatabaseDescriptor.getGCWarnThreshold();
-    final static long STAT_THRESHOLD = Math.min(GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION, MIN_LOG_DURATION);
+    final static long STAT_THRESHOLD = GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION;
 
     /*
      * The field from java.nio.Bits that tracks the total number of allocated

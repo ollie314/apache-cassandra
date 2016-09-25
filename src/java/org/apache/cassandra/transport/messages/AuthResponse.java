@@ -23,6 +23,7 @@ import io.netty.buffer.ByteBuf;
 import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.exceptions.AuthenticationException;
+import org.apache.cassandra.metrics.AuthMetrics;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.*;
 
@@ -67,16 +68,17 @@ public class AuthResponse extends Message.Request
     }
 
     @Override
-    public Response execute(QueryState queryState)
+    public Response execute(QueryState queryState, long queryStartNanoTime)
     {
         try
         {
-            IAuthenticator.SaslNegotiator negotiator = ((ServerConnection) connection).getSaslNegotiator();
+            IAuthenticator.SaslNegotiator negotiator = ((ServerConnection) connection).getSaslNegotiator(queryState);
             byte[] challenge = negotiator.evaluateResponse(token);
             if (negotiator.isComplete())
             {
                 AuthenticatedUser user = negotiator.getAuthenticatedUser();
                 queryState.getClientState().login(user);
+                AuthMetrics.instance.markSuccess();
                 // authentication is complete, send a ready message to the client
                 return new AuthSuccess(challenge);
             }
@@ -87,6 +89,7 @@ public class AuthResponse extends Message.Request
         }
         catch (AuthenticationException e)
         {
+            AuthMetrics.instance.markFailure();
             return ErrorMessage.fromException(e);
         }
     }

@@ -19,6 +19,7 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
@@ -38,6 +39,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.BTreeSearchIterator;
+import org.apache.cassandra.utils.btree.BTreeRemoval;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 
 /**
@@ -343,7 +345,7 @@ public class Columns extends AbstractCollection<ColumnDefinition> implements Col
         if (!contains(column))
             return this;
 
-        Object[] newColumns = BTree.<ColumnDefinition>transformAndFilter(columns, (c) -> c.equals(column) ? null : c);
+        Object[] newColumns = BTreeRemoval.<ColumnDefinition>remove(columns, Comparator.naturalOrder(), column);
         return new Columns(newColumns);
     }
 
@@ -363,6 +365,16 @@ public class Columns extends AbstractCollection<ColumnDefinition> implements Col
     {
         for (ColumnDefinition c : this)
             digest.update(c.name.bytes.duplicate());
+    }
+
+    /**
+     * Apply a function to each column definition in forwards or reversed order.
+     * @param function
+     * @param reversed
+     */
+    public void apply(Consumer<ColumnDefinition> function, boolean reversed)
+    {
+        BTree.apply(columns, function, reversed);
     }
 
     @Override

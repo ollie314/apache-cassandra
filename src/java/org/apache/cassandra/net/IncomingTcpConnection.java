@@ -29,6 +29,7 @@ import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.util.concurrent.FastThreadLocalThread;
 import net.jpountz.lz4.LZ4BlockInputStream;
 import net.jpountz.lz4.LZ4FastDecompressor;
 import net.jpountz.lz4.LZ4Factory;
@@ -42,7 +43,7 @@ import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
 import org.apache.cassandra.io.util.NIODataInputStream;
 
-public class IncomingTcpConnection extends Thread implements Closeable
+public class IncomingTcpConnection extends FastThreadLocalThread implements Closeable
 {
     private static final Logger logger = LoggerFactory.getLogger(IncomingTcpConnection.class);
 
@@ -115,6 +116,8 @@ public class IncomingTcpConnection extends Thread implements Closeable
     {
         try
         {
+            if (logger.isTraceEnabled())
+                logger.trace("Closing socket {} - isclosed: {}", socket, socket.isClosed());
             if (!socket.isClosed())
             {
                 socket.close();
@@ -185,7 +188,7 @@ public class IncomingTcpConnection extends Thread implements Closeable
         else
             id = input.readInt();
 
-        MessageIn message = MessageIn.read(input, version, id, MessageIn.readTimestamp(input));
+        MessageIn message = MessageIn.read(input, version, id, MessageIn.readTimestamp(from, input, System.currentTimeMillis()));
         if (message == null)
         {
             // callback expired; nothing to do

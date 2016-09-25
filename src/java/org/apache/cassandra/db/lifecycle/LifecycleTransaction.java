@@ -30,6 +30,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.SSTable;
@@ -141,26 +142,16 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
      * construct an empty Transaction with no existing readers
      */
     @SuppressWarnings("resource") // log closed during postCleanup
-    public static LifecycleTransaction offline(OperationType operationType, CFMetaData metadata)
+    public static LifecycleTransaction offline(OperationType operationType)
     {
         Tracker dummy = new Tracker(null, false);
-        return new LifecycleTransaction(dummy, new LogTransaction(operationType, metadata, dummy), Collections.emptyList());
-    }
-
-    /**
-     * construct an empty Transaction with no existing readers
-     */
-    @SuppressWarnings("resource") // log closed during postCleanup
-    public static LifecycleTransaction offline(OperationType operationType, File operationFolder)
-    {
-        Tracker dummy = new Tracker(null, false);
-        return new LifecycleTransaction(dummy, new LogTransaction(operationType, operationFolder, dummy), Collections.emptyList());
+        return new LifecycleTransaction(dummy, new LogTransaction(operationType, dummy), Collections.emptyList());
     }
 
     @SuppressWarnings("resource") // log closed during postCleanup
     LifecycleTransaction(Tracker tracker, OperationType operationType, Iterable<SSTableReader> readers)
     {
-        this(tracker, new LogTransaction(operationType, getMetadata(tracker, readers), tracker), readers);
+        this(tracker, new LogTransaction(operationType, tracker), readers);
     }
 
     LifecycleTransaction(Tracker tracker, LogTransaction log, Iterable<SSTableReader> readers)
@@ -175,21 +166,6 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
         }
     }
 
-    private static CFMetaData getMetadata(Tracker tracker, Iterable<SSTableReader> readers)
-    {
-        if (tracker.cfstore != null)
-            return tracker.cfstore.metadata;
-
-        for (SSTableReader reader : readers)
-        {
-            if (reader.metadata != null)
-                return reader.metadata;
-        }
-
-        assert false : "Expected cfstore or at least one reader with metadata";
-        return null;
-    }
-
     public LogTransaction log()
     {
         return log;
@@ -197,12 +173,12 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
 
     public OperationType opType()
     {
-        return log.getType();
+        return log.type();
     }
 
     public UUID opId()
     {
-        return log.getId();
+        return log.id();
     }
 
     public void doPrepare()
@@ -240,7 +216,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
         accumulate = markObsolete(obsoletions, accumulate);
         accumulate = tracker.updateSizeTracking(logged.obsolete, logged.update, accumulate);
         accumulate = release(selfRefs(logged.obsolete), accumulate);
-        accumulate = tracker.notifySSTablesChanged(originals, logged.update, log.getType(), accumulate);
+        accumulate = tracker.notifySSTablesChanged(originals, logged.update, log.type(), accumulate);
 
         return accumulate;
     }
@@ -269,7 +245,10 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
         accumulate = markObsolete(obsoletions, accumulate);
 
         // replace all updated readers with a version restored to its original state
-        accumulate = tracker.apply(updateLiveSet(logged.update, restoreUpdatedOriginals()), accumulate);
+        List<SSTableReader> restored = restoreUpdatedOriginals();
+        List<SSTableReader> invalid = Lists.newArrayList(Iterables.concat(logged.update, logged.obsolete));
+        accumulate = tracker.apply(updateLiveSet(logged.update, restored), accumulate);
+        accumulate = tracker.notifySSTablesChanged(invalid, restored, OperationType.COMPACTION, accumulate);
         // setReplaced immediately preceding versions that have not been obsoleted
         accumulate = setReplaced(logged.update, accumulate);
         // we have replaced all of logged.update and never made visible staged.update,
@@ -506,7 +485,7 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
             originals.remove(reader);
             marked.remove(reader);
         }
-        return new LifecycleTransaction(tracker, log.getType(), readers);
+        return new LifecycleTransaction(tracker, log.type(), readers);
     }
 
     /**
@@ -547,9 +526,14 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional
         log.untrackNew(table);
     }
 
-    public static void removeUnfinishedLeftovers(CFMetaData metadata)
+    public static boolean removeUnfinishedLeftovers(ColumnFamilyStore cfs)
     {
-        LogTransaction.removeUnfinishedLeftovers(metadata);
+        return LogTransaction.removeUnfinishedLeftovers(cfs.getDirectories().getCFDirectories());
+    }
+
+    public static boolean removeUnfinishedLeftovers(CFMetaData cfMetaData)
+    {
+        return LogTransaction.removeUnfinishedLeftovers(cfMetaData);
     }
 
     /**

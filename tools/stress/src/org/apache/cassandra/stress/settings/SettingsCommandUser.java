@@ -33,9 +33,11 @@ import org.apache.cassandra.stress.StressProfile;
 import org.apache.cassandra.stress.generate.DistributionFactory;
 import org.apache.cassandra.stress.generate.PartitionGenerator;
 import org.apache.cassandra.stress.generate.SeedManager;
+import org.apache.cassandra.stress.generate.TokenRangeIterator;
 import org.apache.cassandra.stress.operations.OpDistributionFactory;
 import org.apache.cassandra.stress.operations.SampledOpDistributionFactory;
-import org.apache.cassandra.stress.util.Timer;
+import org.apache.cassandra.stress.report.Timer;
+import org.apache.cassandra.stress.util.ResultLogger;
 
 // Settings unique to the mixed command type
 public class SettingsCommandUser extends SettingsCommand
@@ -45,22 +47,19 @@ public class SettingsCommandUser extends SettingsCommand
     private final Map<String, Double> ratios;
     private final DistributionFactory clustering;
     public final StressProfile profile;
+    private final Options options;
 
     public SettingsCommandUser(Options options)
     {
         super(Command.USER, options.parent);
 
+        this.options = options;
         clustering = options.clustering.get();
         ratios = options.ops.ratios();
 
         String yamlPath = options.profile.value();
         File yamlFile = new File(yamlPath);
-        if (yamlFile.exists())
-        {
-            yamlPath = "file:///" + yamlFile.getAbsolutePath();
-        }
-
-        profile = StressProfile.load(URI.create(yamlPath));
+        profile = StressProfile.load(yamlFile.exists() ? yamlFile.toURI() : URI.create(yamlPath));
 
         if (ratios.size() == 0)
             throw new IllegalArgumentException("Must specify at least one command with a non-zero ratio");
@@ -74,15 +73,24 @@ public class SettingsCommandUser extends SettingsCommand
     public OpDistributionFactory getFactory(final StressSettings settings)
     {
         final SeedManager seeds = new SeedManager(settings);
+        final TokenRangeIterator tokenRangeIterator = profile.tokenRangeQueries.isEmpty()
+                                                      ? null
+                                                      : new TokenRangeIterator(settings,
+                                                                               profile.maybeLoadTokenRanges(settings));
+
         return new SampledOpDistributionFactory<String>(ratios, clustering)
         {
-            protected List<? extends Operation> get(Timer timer, PartitionGenerator generator, String key)
+            protected List<? extends Operation> get(Timer timer, PartitionGenerator generator, String key, boolean isWarmup)
             {
                 if (key.equalsIgnoreCase("insert"))
                     return Collections.singletonList(profile.getInsert(timer, generator, seeds, settings));
                 if (key.equalsIgnoreCase("validate"))
                     return profile.getValidate(timer, generator, seeds, settings);
-                return Collections.singletonList(profile.getQuery(key, timer, generator, seeds, settings));
+
+                if (profile.tokenRangeQueries.containsKey(key))
+                    return Collections.singletonList(profile.getBulkReadQueries(key, timer, settings, tokenRangeIterator, isWarmup));
+
+                return Collections.singletonList(profile.getQuery(key, timer, generator, seeds, settings, isWarmup));
             }
 
             protected PartitionGenerator newGenerator()
@@ -116,6 +124,16 @@ public class SettingsCommandUser extends SettingsCommand
     }
 
     // CLI utility methods
+
+    public void printSettings(ResultLogger out)
+    {
+        super.printSettings(out);
+        out.printf("  Command Ratios: %s%n", ratios);
+        out.printf("  Command Clustering Distribution: %s%n", options.clustering.getOptionAsString());
+        out.printf("  Profile File: %s%n", options.profile.value());
+        // profile.noSettings(out);
+    }
+
 
     public static SettingsCommandUser build(String[] params)
     {

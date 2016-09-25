@@ -92,6 +92,11 @@ public abstract class AbstractRow extends AbstractCollection<ColumnData> impleme
 
     public String toString(CFMetaData metadata, boolean fullDetails)
     {
+        return toString(metadata, true, fullDetails);
+    }
+
+    public String toString(CFMetaData metadata, boolean includeClusterKeys, boolean fullDetails)
+    {
         StringBuilder sb = new StringBuilder();
         sb.append("Row");
         if (fullDetails)
@@ -101,7 +106,12 @@ public abstract class AbstractRow extends AbstractCollection<ColumnData> impleme
                 sb.append(" del=").append(deletion());
             sb.append(" ]");
         }
-        sb.append(": ").append(clustering().toString(metadata)).append(" | ");
+        sb.append(": ");
+        if(includeClusterKeys)
+            sb.append(clustering().toString(metadata));
+        else
+            sb.append(clustering().toCQLString(metadata));
+        sb.append(" | ");
         boolean isFirst = true;
         for (ColumnData cd : this)
         {
@@ -126,7 +136,11 @@ public abstract class AbstractRow extends AbstractCollection<ColumnData> impleme
                 if (cd.column().isSimple())
                 {
                     Cell cell = (Cell)cd;
-                    sb.append(cell.column().name).append('=').append(cell.column().type.getString(cell.value()));
+                    sb.append(cell.column().name).append('=');
+                    if (cell.isTombstone())
+                        sb.append("<tombstone>");
+                    else
+                        sb.append(cell.column().type.getString(cell.value()));
                 }
                 else
                 {
@@ -164,7 +178,7 @@ public abstract class AbstractRow extends AbstractCollection<ColumnData> impleme
     @Override
     public int hashCode()
     {
-        int hash = Objects.hash(clustering(), columns(), primaryKeyLivenessInfo(), deletion());
+        int hash = Objects.hash(clustering(), primaryKeyLivenessInfo(), deletion());
         for (ColumnData cd : this)
             hash += 31 * cd.hashCode();
         return hash;

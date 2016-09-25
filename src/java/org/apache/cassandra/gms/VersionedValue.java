@@ -64,6 +64,7 @@ public class VersionedValue implements Comparable<VersionedValue>
 
     // values for ApplicationState.STATUS
     public final static String STATUS_BOOTSTRAPPING = "BOOT";
+    public final static String STATUS_BOOTSTRAPPING_REPLACE = "BOOT_REPLACE";
     public final static String STATUS_NORMAL = "NORMAL";
     public final static String STATUS_LEAVING = "LEAVING";
     public final static String STATUS_LEFT = "LEFT";
@@ -108,6 +109,11 @@ public class VersionedValue implements Comparable<VersionedValue>
         return "Value(" + value + "," + version + ")";
     }
 
+    public byte[] toBytes()
+    {
+        return value.getBytes(ISO_8859_1);
+    }
+
     private static String versionString(String... args)
     {
         return StringUtils.join(args, VersionedValue.DELIMITER);
@@ -125,6 +131,11 @@ public class VersionedValue implements Comparable<VersionedValue>
         public VersionedValue cloneWithHigherVersion(VersionedValue value)
         {
             return new VersionedValue(value.value);
+        }
+
+        public VersionedValue bootReplacing(InetAddress oldNode)
+        {
+            return new VersionedValue(versionString(VersionedValue.STATUS_BOOTSTRAPPING_REPLACE, oldNode.getHostAddress()));
         }
 
         public VersionedValue bootstrapping(Collection<Token> tokens)

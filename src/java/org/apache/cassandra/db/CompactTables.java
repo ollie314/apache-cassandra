@@ -56,6 +56,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  *
  * As far as thrift is concerned, one exception to this is super column families, which have a different layout. Namely, a super
  * column families is encoded with:
+ * {@code
  *   CREATE TABLE super (
  *      key [key_validation_class],
  *      super_column_name [comparator],
@@ -65,6 +66,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  *      "" map<[sub_comparator], [default_validation_class]>
  *      PRIMARY KEY (key, super_column_name)
  *   )
+ * }
  * In other words, every super column is encoded by a row. That row has one column for each defined "column_metadata", but it also
  * has a special map column (whose name is the empty string as this is guaranteed to never conflict with a user-defined
  * "column_metadata") which stores the super column "dynamic" sub-columns.
@@ -91,12 +93,12 @@ public abstract class CompactTables
         return columns.regulars.getSimple(0);
     }
 
-    public static AbstractType<?> columnDefinitionComparator(ColumnDefinition.Kind kind, boolean isSuper, AbstractType<?> rawComparator, AbstractType<?> rawSubComparator)
+    public static AbstractType<?> columnDefinitionComparator(String kind, boolean isSuper, AbstractType<?> rawComparator, AbstractType<?> rawSubComparator)
     {
-        if (isSuper)
-            return kind == ColumnDefinition.Kind.REGULAR ? rawSubComparator : UTF8Type.instance;
-        else
-            return kind == ColumnDefinition.Kind.STATIC ? rawComparator : UTF8Type.instance;
+        if (!"regular".equals(kind))
+            return UTF8Type.instance;
+
+        return isSuper ? rawSubComparator : rawComparator;
     }
 
     public static boolean hasEmptyCompactValue(CFMetaData metadata)

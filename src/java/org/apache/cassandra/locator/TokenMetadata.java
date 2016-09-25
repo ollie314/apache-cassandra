@@ -28,6 +28,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,10 +82,13 @@ public class TokenMetadata
     // means we can detect and reject the addition of multiple nodes at the same token
     // before one becomes part of the ring.
     private final BiMultiValMap<Token, InetAddress> bootstrapTokens = new BiMultiValMap<>();
+
+    private final BiMap<InetAddress, InetAddress> replacementToOriginal = HashBiMap.create();
+
     // (don't need to record Token here since it's still part of tokenToEndpointMap until it's done leaving)
     private final Set<InetAddress> leavingEndpoints = new HashSet<>();
     // this is a cache of the calculation from {tokenToEndpointMap, bootstrapTokens, leavingEndpoints}
-    private final ConcurrentMap<String, Multimap<Range<Token>, InetAddress>> pendingRanges = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, PendingRangeMaps> pendingRanges = new ConcurrentHashMap<String, PendingRangeMaps>();
 
     // nodes which are migrating to the new tokens in the ring
     private final Set<Pair<Token, InetAddress>> movingEndpoints = new HashSet<>();
@@ -125,7 +129,7 @@ public class TokenMetadata
     }
 
     /**
-     * To be used by tests only (via {@link StorageService.setPartitionerUnsafe}).
+     * To be used by tests only (via {@link org.apache.cassandra.service.StorageService#setPartitionerUnsafe}).
      */
     @VisibleForTesting
     public TokenMetadata cloneWithNewPartitioner(IPartitioner newPartitioner)
@@ -199,6 +203,7 @@ public class TokenMetadata
                 tokenToEndpointMap.removeValue(endpoint);
                 topology.addEndpoint(endpoint);
                 leavingEndpoints.remove(endpoint);
+                replacementToOriginal.remove(endpoint);
                 removeFromMoving(endpoint); // also removing this endpoint from moving
 
                 for (Token token : tokens)
@@ -311,6 +316,11 @@ public class TokenMetadata
 
     public void addBootstrapTokens(Collection<Token> tokens, InetAddress endpoint)
     {
+        addBootstrapTokens(tokens, endpoint, null);
+    }
+
+    private void addBootstrapTokens(Collection<Token> tokens, InetAddress endpoint, InetAddress original)
+    {
         assert tokens != null && !tokens.isEmpty();
         assert endpoint != null;
 
@@ -327,7 +337,7 @@ public class TokenMetadata
                     throw new RuntimeException("Bootstrap Token collision between " + oldEndpoint + " and " + endpoint + " (token " + token);
 
                 oldEndpoint = tokenToEndpointMap.get(token);
-                if (oldEndpoint != null && !oldEndpoint.equals(endpoint))
+                if (oldEndpoint != null && !oldEndpoint.equals(endpoint) && !oldEndpoint.equals(original))
                     throw new RuntimeException("Bootstrap Token collision between " + oldEndpoint + " and " + endpoint + " (token " + token);
             }
 
@@ -340,6 +350,43 @@ public class TokenMetadata
         {
             lock.writeLock().unlock();
         }
+    }
+
+    public void addReplaceTokens(Collection<Token> replacingTokens, InetAddress newNode, InetAddress oldNode)
+    {
+        assert replacingTokens != null && !replacingTokens.isEmpty();
+        assert newNode != null && oldNode != null;
+
+        lock.writeLock().lock();
+        try
+        {
+            Collection<Token> oldNodeTokens = tokenToEndpointMap.inverse().get(oldNode);
+            if (!replacingTokens.containsAll(oldNodeTokens) || !oldNodeTokens.containsAll(replacingTokens))
+            {
+                throw new RuntimeException(String.format("Node %s is trying to replace node %s with tokens %s with a " +
+                                                         "different set of tokens %s.", newNode, oldNode, oldNodeTokens,
+                                                         replacingTokens));
+            }
+
+            logger.debug("Replacing {} with {}", newNode, oldNode);
+            replacementToOriginal.put(newNode, oldNode);
+
+            addBootstrapTokens(replacingTokens, newNode, oldNode);
+        }
+        finally
+        {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public Optional<InetAddress> getReplacementNode(InetAddress endpoint)
+    {
+        return Optional.ofNullable(replacementToOriginal.inverse().get(endpoint));
+    }
+
+    public Optional<InetAddress> getReplacingNode(InetAddress endpoint)
+    {
+        return Optional.ofNullable((replacementToOriginal.get(endpoint)));
     }
 
     public void removeBootstrapTokens(Collection<Token> tokens)
@@ -405,6 +452,10 @@ public class TokenMetadata
             tokenToEndpointMap.removeValue(endpoint);
             topology.removeEndpoint(endpoint);
             leavingEndpoints.remove(endpoint);
+            if (replacementToOriginal.remove(endpoint) != null)
+            {
+                logger.debug("Node {} failed during replace.", endpoint);
+            }
             endpointToHostIdMap.remove(endpoint);
             sortedTokens = sortTokens();
             invalidateCachedRings();
@@ -688,23 +739,30 @@ public class TokenMetadata
         return sortedTokens;
     }
 
-    private Multimap<Range<Token>, InetAddress> getPendingRangesMM(String keyspaceName)
+    public Multimap<Range<Token>, InetAddress> getPendingRangesMM(String keyspaceName)
     {
-        Multimap<Range<Token>, InetAddress> map = pendingRanges.get(keyspaceName);
-        if (map == null)
+        Multimap<Range<Token>, InetAddress> map = HashMultimap.create();
+        PendingRangeMaps pendingRangeMaps = this.pendingRanges.get(keyspaceName);
+
+        if (pendingRangeMaps != null)
         {
-            map = HashMultimap.create();
-            Multimap<Range<Token>, InetAddress> priorMap = pendingRanges.putIfAbsent(keyspaceName, map);
-            if (priorMap != null)
-                map = priorMap;
+            for (Map.Entry<Range<Token>, List<InetAddress>> entry : pendingRangeMaps)
+            {
+                Range<Token> range = entry.getKey();
+                for (InetAddress address : entry.getValue())
+                {
+                    map.put(range, address);
+                }
+            }
         }
+
         return map;
     }
 
     /** a mutable map may be returned but caller should not modify it */
-    public Map<Range<Token>, Collection<InetAddress>> getPendingRanges(String keyspaceName)
+    public PendingRangeMaps getPendingRanges(String keyspaceName)
     {
-        return getPendingRangesMM(keyspaceName).asMap();
+        return this.pendingRanges.get(keyspaceName);
     }
 
     public List<Range<Token>> getPendingRanges(String keyspaceName, InetAddress endpoint)
@@ -748,7 +806,7 @@ public class TokenMetadata
         lock.readLock().lock();
         try
         {
-            Multimap<Range<Token>, InetAddress> newPendingRanges = HashMultimap.create();
+            PendingRangeMaps newPendingRanges = new PendingRangeMaps();
 
             if (bootstrapTokens.isEmpty() && leavingEndpoints.isEmpty() && movingEndpoints.isEmpty())
             {
@@ -776,7 +834,10 @@ public class TokenMetadata
             {
                 Set<InetAddress> currentEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, metadata));
                 Set<InetAddress> newEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, allLeftMetadata));
-                newPendingRanges.putAll(range, Sets.difference(newEndpoints, currentEndpoints));
+                for (InetAddress address : Sets.difference(newEndpoints, currentEndpoints))
+                {
+                    newPendingRanges.addPendingRange(range, address);
+                }
             }
 
             // At this stage newPendingRanges has been updated according to leave operations. We can
@@ -791,7 +852,9 @@ public class TokenMetadata
 
                 allLeftMetadata.updateNormalTokens(tokens, endpoint);
                 for (Range<Token> range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))
-                    newPendingRanges.put(range, endpoint);
+                {
+                    newPendingRanges.addPendingRange(range, endpoint);
+                }
                 allLeftMetadata.removeEndpoint(endpoint);
             }
 
@@ -802,14 +865,42 @@ public class TokenMetadata
             // simply add and remove them one by one to allLeftMetadata and check in between what their ranges would be.
             for (Pair<Token, InetAddress> moving : movingEndpoints)
             {
+                //Calculate all the ranges which will could be affected. This will include the ranges before and after the move.
+                Set<Range<Token>> moveAffectedRanges = new HashSet<>();
                 InetAddress endpoint = moving.right; // address of the moving node
-
-                //  moving.left is a new token of the endpoint
-                allLeftMetadata.updateNormalToken(moving.left, endpoint);
-
+                //Add ranges before the move
                 for (Range<Token> range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))
                 {
-                    newPendingRanges.put(range, endpoint);
+                    moveAffectedRanges.add(range);
+                }
+
+                allLeftMetadata.updateNormalToken(moving.left, endpoint);
+                //Add ranges after the move
+                for (Range<Token> range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))
+                {
+                    moveAffectedRanges.add(range);
+                }
+
+                for(Range<Token> range : moveAffectedRanges)
+                {
+                    Set<InetAddress> currentEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, metadata));
+                    Set<InetAddress> newEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, allLeftMetadata));
+                    Set<InetAddress> difference = Sets.difference(newEndpoints, currentEndpoints);
+                    for(final InetAddress address : difference)
+                    {
+                        Collection<Range<Token>> newRanges = strategy.getAddressRanges(allLeftMetadata).get(address);
+                        Collection<Range<Token>> oldRanges = strategy.getAddressRanges(metadata).get(address);
+                        //We want to get rid of any ranges which the node is currently getting.
+                        newRanges.removeAll(oldRanges);
+
+                        for(Range<Token> newRange : newRanges)
+                        {
+                            for(Range<Token> pendingRange : newRange.subtractAll(oldRanges))
+                            {
+                                newPendingRanges.addPendingRange(pendingRange, address);
+                            }
+                        }
+                    }
                 }
 
                 allLeftMetadata.removeEndpoint(endpoint);
@@ -828,20 +919,18 @@ public class TokenMetadata
 
     public Token getPredecessor(Token token)
     {
-        List tokens = sortedTokens();
+        List<Token> tokens = sortedTokens();
         int index = Collections.binarySearch(tokens, token);
-//        assert index >= 0 : token + " not found in " + StringUtils.join(tokenToEndpointMap.keySet(), ", ");
-        if (index < 0) index = -index-1;
-        return (Token) (index == 0 ? tokens.get(tokens.size() - 1) : tokens.get(index - 1));
+        assert index >= 0 : token + " not found in " + StringUtils.join(tokenToEndpointMap.keySet(), ", ");
+        return index == 0 ? tokens.get(tokens.size() - 1) : tokens.get(index - 1);
     }
 
     public Token getSuccessor(Token token)
     {
-        List tokens = sortedTokens();
+        List<Token> tokens = sortedTokens();
         int index = Collections.binarySearch(tokens, token);
-//        assert index >= 0 : token + " not found in " + StringUtils.join(tokenToEndpointMap.keySet(), ", ");
-        if (index < 0) return (Token) tokens.get(-index-1);
-        return (Token) ((index == (tokens.size() - 1)) ? tokens.get(0) : tokens.get(index + 1));
+        assert index >= 0 : token + " not found in " + StringUtils.join(tokenToEndpointMap.keySet(), ", ");
+        return (index == (tokens.size() - 1)) ? tokens.get(0) : tokens.get(index + 1);
     }
 
     /** @return a copy of the bootstrapping tokens map */
@@ -902,7 +991,7 @@ public class TokenMetadata
         }
     }
 
-    public static int firstTokenIndex(final ArrayList ring, Token start, boolean insertMin)
+    public static int firstTokenIndex(final ArrayList<Token> ring, Token start, boolean insertMin)
     {
         assert ring.size() > 0;
         // insert the minimum token (at index == -1) if we were asked to include it and it isn't a member of the ring
@@ -930,7 +1019,7 @@ public class TokenMetadata
     {
         if (ring.isEmpty())
             return includeMin ? Iterators.singletonIterator(start.getPartitioner().getMinimumToken())
-                              : Iterators.<Token>emptyIterator();
+                              : Collections.emptyIterator();
 
         final boolean insertMin = includeMin && !ring.get(0).isMinimum();
         final int startIndex = firstTokenIndex(ring, start, insertMin);
@@ -990,7 +1079,8 @@ public class TokenMetadata
         lock.readLock().lock();
         try
         {
-            Set<InetAddress> eps = tokenToEndpointMap.inverse().keySet();
+            Multimap<InetAddress, Token> endpointToTokenMap = tokenToEndpointMap.inverse();
+            Set<InetAddress> eps = endpointToTokenMap.keySet();
 
             if (!eps.isEmpty())
             {
@@ -1000,7 +1090,7 @@ public class TokenMetadata
                 {
                     sb.append(ep);
                     sb.append(':');
-                    sb.append(tokenToEndpointMap.inverse().get(ep));
+                    sb.append(endpointToTokenMap.get(ep));
                     sb.append(System.getProperty("line.separator"));
                 }
             }
@@ -1046,13 +1136,9 @@ public class TokenMetadata
     {
         StringBuilder sb = new StringBuilder();
 
-        for (Map.Entry<String, Multimap<Range<Token>, InetAddress>> entry : pendingRanges.entrySet())
+        for (PendingRangeMaps pendingRangeMaps : pendingRanges.values())
         {
-            for (Map.Entry<Range<Token>, InetAddress> rmap : entry.getValue().entries())
-            {
-                sb.append(rmap.getValue()).append(':').append(rmap.getKey());
-                sb.append(System.getProperty("line.separator"));
-            }
+            sb.append(pendingRangeMaps.printPendingRanges());
         }
 
         return sb.toString();
@@ -1060,18 +1146,11 @@ public class TokenMetadata
 
     public Collection<InetAddress> pendingEndpointsFor(Token token, String keyspaceName)
     {
-        Map<Range<Token>, Collection<InetAddress>> ranges = getPendingRanges(keyspaceName);
-        if (ranges.isEmpty())
+        PendingRangeMaps pendingRangeMaps = this.pendingRanges.get(keyspaceName);
+        if (pendingRangeMaps == null)
             return Collections.emptyList();
 
-        Set<InetAddress> endpoints = new HashSet<>();
-        for (Map.Entry<Range<Token>, Collection<InetAddress>> entry : ranges.entrySet())
-        {
-            if (entry.getKey().contains(token))
-                endpoints.addAll(entry.getValue());
-        }
-
-        return endpoints;
+        return pendingRangeMaps.pendingEndpointsFor(token);
     }
 
     /**
@@ -1279,5 +1358,14 @@ public class TokenMetadata
         {
             return dcRacks;
         }
+
+        /**
+         * @return The DC and rack of the given endpoint.
+         */
+        public Pair<String, String> getLocation(InetAddress addr)
+        {
+            return currentLocations.get(addr);
+        }
+
     }
 }

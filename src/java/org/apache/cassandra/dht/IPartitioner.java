@@ -20,6 +20,8 @@ package org.apache.cassandra.dht;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Random;
 
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -49,6 +51,17 @@ public interface IPartitioner
     public Token getMinimumToken();
 
     /**
+     * The biggest token for this partitioner, unlike getMinimumToken, this token is actually used and users wanting to
+     * include all tokens need to do getMaximumToken().maxKeyBound()
+     *
+     * Not implemented for the ordered partitioners
+     */
+    default Token getMaximumToken()
+    {
+        throw new UnsupportedOperationException("If you are using a splitting partitioner, getMaximumToken has to be implemented");
+    }
+
+    /**
      * @return a Token that can be used to route a given key
      * (This is NOT a method to create a Token from its string representation;
      * for that, use TokenFactory.fromString.)
@@ -59,6 +72,13 @@ public interface IPartitioner
      * @return a randomly generated token
      */
     public Token getRandomToken();
+
+    /**
+     * @param random instance of Random to use when generating the token
+     *
+     * @return a randomly generated token
+     */
+    public Token getRandomToken(Random random);
 
     public Token.TokenFactory getTokenFactory();
 
@@ -84,4 +104,9 @@ public interface IPartitioner
      * Used by secondary indices.
      */
     public AbstractType<?> partitionOrdering();
+
+    default Optional<Splitter> splitter()
+    {
+        return Optional.empty();
+    }
 }

@@ -56,8 +56,8 @@ import com.google.common.util.concurrent.Uninterruptibles;
  * Slightly modified version of the Apache Thrift TThreadPoolServer.
  * <p>
  * This allows passing an executor so you have more control over the actual
- * behaviour of the tasks being run.
- * <p/>
+ * behavior of the tasks being run.
+ * </p>
  * Newer version of Thrift should make this obsolete.
  */
 public class CustomTThreadPoolServer extends TServer
@@ -78,7 +78,8 @@ public class CustomTThreadPoolServer extends TServer
     private final AtomicInteger activeClients = new AtomicInteger(0);
 
 
-    public CustomTThreadPoolServer(TThreadPoolServer.Args args, ExecutorService executorService) {
+    public CustomTThreadPoolServer(TThreadPoolServer.Args args, ExecutorService executorService)
+    {
         super(args);
         this.executorService = executorService;
         this.args = args;
@@ -245,7 +246,7 @@ public class CustomTThreadPoolServer extends TServer
                 if (clientEnc.enabled)
                 {
                     logger.info("enabling encrypted thrift connections between client and server");
-                    TSSLTransportParameters params = new TSSLTransportParameters(clientEnc.protocol, clientEnc.cipher_suites);
+                    TSSLTransportParameters params = new TSSLTransportParameters(clientEnc.protocol, new String[0]);
                     params.setKeyStore(clientEnc.keystore, clientEnc.keystore_password);
                     if (clientEnc.require_client_auth)
                     {
@@ -254,8 +255,9 @@ public class CustomTThreadPoolServer extends TServer
                     }
                     TServerSocket sslServer = TSSLTransportFactory.getServerSocket(addr.getPort(), 0, addr.getAddress(), params);
                     SSLServerSocket sslServerSocket = (SSLServerSocket) sslServer.getServerSocket();
-                    sslServerSocket.setEnabledProtocols(SSLFactory.ACCEPTED_PROTOCOLS);
-                    serverTransport = new TCustomServerSocket(sslServer.getServerSocket(), args.keepAlive, args.sendBufferSize, args.recvBufferSize);
+                    String[] suites = SSLFactory.filterCipherSuites(sslServerSocket.getSupportedCipherSuites(), clientEnc.cipher_suites);
+                    sslServerSocket.setEnabledCipherSuites(suites);
+                    serverTransport = new TCustomServerSocket(sslServerSocket, args.keepAlive, args.sendBufferSize, args.recvBufferSize);
                 }
                 else
                 {

@@ -18,11 +18,10 @@
 package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
-import java.util.Collections;
 import java.util.List;
-import java.util.Set;
 
 import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 
 /**
@@ -70,7 +69,7 @@ public interface Term
      */
     public abstract boolean containsBindMarker();
 
-    Iterable<Function> getFunctions();
+    public void addFunctionsTo(List<Function> functions);
 
     /**
      * A parsed, non prepared (thus untyped) term.
@@ -99,6 +98,17 @@ public interface Term
          * @return a String representation of the raw term that can be used when reconstructing a CQL query string.
          */
         public abstract String getText();
+
+        /**
+         * The type of the {@code term} if it can be infered.
+         *
+         * @param keyspace the keyspace on which the statement containing this term is on.
+         * @return the type of this {@code Term} if inferrable, or {@code null}
+         * otherwise (for instance, the type isn't inferable for a bind marker. Even for
+         * literals, the exact type is not inferrable since they are valid for many
+         * different types and so this will return {@code null} too).
+         */
+        public abstract AbstractType<?> getExactTypeIfKnown(String keyspace);
 
         @Override
         public String toString()
@@ -131,9 +141,8 @@ public interface Term
         public void collectMarkerSpecification(VariableSpecifications boundNames) {}
         public Terminal bind(QueryOptions options) { return this; }
 
-        public Set<Function> getFunctions()
+        public void addFunctionsTo(List<Function> functions)
         {
-            return Collections.emptySet();
         }
 
         // While some NonTerminal may not have bind markers, no Term can be Terminal

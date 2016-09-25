@@ -23,7 +23,7 @@ import org.apache.cassandra.db.*;
 /**
  * Interface that allows to act on the result of merging multiple rows.
  *
- * More precisely, given N rows and the result of merging them, one can call {@link Rows#diff()}
+ * More precisely, given N rows and the result of merging them, one can call {@link Rows#diff(RowDiffListener, Row, Row...)}
  * with a {@code RowDiffListener} and that listener will be informed for each input row of the diff between
  * that input and merge row.
  */
@@ -71,7 +71,7 @@ public interface RowDiffListener
      * @param i the input row from which {@code original} is from.
      * @param clustering the clustering for the row that is merged.
      * @param merged the cell of the merged row. Will be {@code null} if input {@code i} had a cell but that cell is no present
-     * in the mergd result (it has been deleted/shadowed).
+     * in the merged result (it has been deleted/shadowed).
      * @param original the cell of input {@code i}. May be {@code null} if input {@code i} had cell corresponding to {@code merged}.
      */
     public void onCell(int i, Clustering clustering, Cell merged, Cell original);

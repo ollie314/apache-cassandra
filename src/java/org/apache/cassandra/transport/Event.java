@@ -27,7 +27,8 @@ import io.netty.buffer.ByteBuf;
 
 public abstract class Event
 {
-    public enum Type {
+    public enum Type
+    {
         TOPOLOGY_CHANGE(Server.VERSION_3),
         STATUS_CHANGE(Server.VERSION_3),
         SCHEMA_CHANGE(Server.VERSION_3),
@@ -270,7 +271,7 @@ public abstract class Event
         public static SchemaChange deserializeEvent(ByteBuf cb, int version)
         {
             Change change = CBUtil.readEnumValue(Change.class, cb);
-            if (version >= 3)
+            if (version >= Server.VERSION_3)
             {
                 Target target = CBUtil.readEnumValue(Target.class, cb);
                 String keyspace = CBUtil.readString(cb);
@@ -293,7 +294,7 @@ public abstract class Event
         {
             if (target == Target.FUNCTION || target == Target.AGGREGATE)
             {
-                if (version >= 4)
+                if (version >= Server.VERSION_4)
                 {
                     // available since protocol version 4
                     CBUtil.writeEnumValue(change, dest);
@@ -314,7 +315,7 @@ public abstract class Event
                 return;
             }
 
-            if (version >= 3)
+            if (version >= Server.VERSION_3)
             {
                 CBUtil.writeEnumValue(change, dest);
                 CBUtil.writeEnumValue(target, dest);
@@ -345,13 +346,13 @@ public abstract class Event
         {
             if (target == Target.FUNCTION || target == Target.AGGREGATE)
             {
-                if (version >= 4)
+                if (version >= Server.VERSION_4)
                     return CBUtil.sizeOfEnumValue(change)
                                + CBUtil.sizeOfEnumValue(target)
                                + CBUtil.sizeOfString(keyspace)
                                + CBUtil.sizeOfString(name)
                                + CBUtil.sizeOfStringList(argTypes);
-                if (version >= 3)
+                if (version >= Server.VERSION_3)
                     return CBUtil.sizeOfEnumValue(Change.UPDATED)
                            + CBUtil.sizeOfEnumValue(Target.KEYSPACE)
                            + CBUtil.sizeOfString(keyspace);
@@ -360,7 +361,7 @@ public abstract class Event
                        + CBUtil.sizeOfString("");
             }
 
-            if (version >= 3)
+            if (version >= Server.VERSION_3)
             {
                 int size = CBUtil.sizeOfEnumValue(change)
                          + CBUtil.sizeOfEnumValue(target)

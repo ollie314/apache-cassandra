@@ -42,9 +42,9 @@ public class SnitchProperties
             URL url;
             if (configURL == null)
                 url = SnitchProperties.class.getClassLoader().getResource(RACKDC_PROPERTY_FILENAME);
-            else 
+            else
             	url = new URL(configURL);
-            
+
             stream = url.openStream(); // catch block handles potential NPE
             properties.load(stream);
         }
@@ -65,5 +65,10 @@ public class SnitchProperties
     public String get(String propertyName, String defaultValue)
     {
         return properties.getProperty(propertyName, defaultValue);
+    }
+
+    public boolean contains(String propertyName)
+    {
+        return properties.containsKey(propertyName);
     }
 }

@@ -32,7 +32,6 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.UnknownColumnFamilyException;
 import org.apache.cassandra.io.FSReadError;
-import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CLibrary;
@@ -48,7 +47,7 @@ import org.apache.cassandra.utils.CLibrary;
  * The latter is required for dispatch of hints to nodes that have a different messaging version, and in general is just an
  * easy way to enable backward and future compatibilty.
  */
-final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
+class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
 {
     private static final Logger logger = LoggerFactory.getLogger(HintsReader.class);
 
@@ -63,7 +62,7 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
     @Nullable
     private final RateLimiter rateLimiter;
 
-    private HintsReader(HintsDescriptor descriptor, File file, ChecksummedDataInput reader, RateLimiter rateLimiter)
+    protected HintsReader(HintsDescriptor descriptor, File file, ChecksummedDataInput reader, RateLimiter rateLimiter)
     {
         this.descriptor = descriptor;
         this.file = file;
@@ -78,6 +77,14 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
         try
         {
             HintsDescriptor descriptor = HintsDescriptor.deserialize(reader);
+            if (descriptor.isCompressed())
+            {
+                // since the hints descriptor is always uncompressed, it needs to be read with the normal ChecksummedDataInput.
+                // The compressed input is instantiated with the uncompressed input's position
+                reader = CompressedChecksummedDataInput.upgradeInput(reader, descriptor.createCompressor());
+            }
+            else if (descriptor.isEncrypted())
+                reader = EncryptedChecksummedDataInput.upgradeInput(reader, descriptor.getCipher(), descriptor.createCompressor());
             return new HintsReader(descriptor, file, reader, rateLimiter);
         }
         catch (IOException e)
@@ -102,7 +109,7 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
         return descriptor;
     }
 
-    void seek(long newPosition)
+    void seek(InputPosition newPosition)
     {
         input.seek(newPosition);
     }
@@ -112,23 +119,28 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
         return new PagesIterator();
     }
 
+    public ChecksummedDataInput getInput()
+    {
+        return input;
+    }
+
     final class Page
     {
-        public final long offset;
+        public final InputPosition position;
 
-        private Page(long offset)
+        private Page(InputPosition inputPosition)
         {
-            this.offset = offset;
+            this.position = inputPosition;
         }
 
         Iterator<Hint> hintsIterator()
         {
-            return new HintsIterator(offset);
+            return new HintsIterator(position);
         }
 
         Iterator<ByteBuffer> buffersIterator()
         {
-            return new BuffersIterator(offset);
+            return new BuffersIterator(position);
         }
     }
 
@@ -137,12 +149,12 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
         @SuppressWarnings("resource")
         protected Page computeNext()
         {
-            CLibrary.trySkipCache(input.getChannel().getFileDescriptor(), 0, input.getFilePointer(), input.getPath());
+            input.tryUncacheRead();
 
-            if (input.length() == input.getFilePointer())
+            if (input.isEOF())
                 return endOfData();
 
-            return new Page(input.getFilePointer());
+            return new Page(input.getSeekPosition());
         }
     }
 
@@ -151,9 +163,9 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
      */
     final class HintsIterator extends AbstractIterator<Hint>
     {
-        private final long offset;
+        private final InputPosition offset;
 
-        HintsIterator(long offset)
+        HintsIterator(InputPosition offset)
         {
             super();
             this.offset = offset;
@@ -165,12 +177,12 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
 
             do
             {
-                long position = input.getFilePointer();
+                InputPosition position = input.getSeekPosition();
 
-                if (input.length() == position)
+                if (input.isEOF())
                     return endOfData(); // reached EOF
 
-                if (position - offset >= PAGE_SIZE)
+                if (position.subtract(offset) >= PAGE_SIZE)
                     return endOfData(); // read page size or more bytes
 
                 try
@@ -241,9 +253,9 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
      */
     final class BuffersIterator extends AbstractIterator<ByteBuffer>
     {
-        private final long offset;
+        private final InputPosition offset;
 
-        BuffersIterator(long offset)
+        BuffersIterator(InputPosition offset)
         {
             super();
             this.offset = offset;
@@ -255,12 +267,12 @@ final class HintsReader implements AutoCloseable, Iterable<HintsReader.Page>
 
             do
             {
-                long position = input.getFilePointer();
+                InputPosition position = input.getSeekPosition();
 
-                if (input.length() == position)
+                if (input.isEOF())
                     return endOfData(); // reached EOF
 
-                if (position - offset >= PAGE_SIZE)
+                if (position.subtract(offset) >= PAGE_SIZE)
                     return endOfData(); // read page size or more bytes
 
                 try

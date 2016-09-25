@@ -22,6 +22,7 @@ import java.util.*;
 import com.google.common.base.Optional;
 import com.google.common.base.Strings;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -105,16 +106,7 @@ public class CreateIndexStatement extends SchemaAlteringStatement
             if (cfm.isCompactTable() && cd.isPrimaryKeyColumn())
                 throw new InvalidRequestException("Secondary indexes are not supported on PRIMARY KEY columns in COMPACT STORAGE tables");
 
-            // It would be possible to support 2ndary index on static columns (but not without modifications of at least ExtendedFilter and
-            // CompositesIndex) and maybe we should, but that means a query like:
-            //     SELECT * FROM foo WHERE static_column = 'bar'
-            // would pull the full partition every time the static column of partition is 'bar', which sounds like offering a
-            // fair potential for foot-shooting, so I prefer leaving that to a follow up ticket once we have identified cases where
-            // such indexing is actually useful.
-            if (!cfm.isCompactTable() && cd.isStatic())
-                throw new InvalidRequestException("Secondary indexes are not allowed on static columns");
-
-            if (cd.kind == ColumnDefinition.Kind.PARTITION_KEY && cd.isOnAllComponents())
+            if (cd.kind == ColumnDefinition.Kind.PARTITION_KEY && cfm.getKeyValidatorAsClusteringComparator().size() == 1)
                 throw new InvalidRequestException(String.format("Cannot create secondary index on partition key column %s", target.column));
 
             boolean isMap = cd.type instanceof MapType;
@@ -182,13 +174,13 @@ public class CreateIndexStatement extends SchemaAlteringStatement
         if (!properties.isCustom)
             throw new InvalidRequestException("Only CUSTOM indexes support multiple columns");
 
-        Set<ColumnIdentifier> columns = new HashSet<>();
+        Set<ColumnIdentifier> columns = Sets.newHashSetWithExpectedSize(targets.size());
         for (IndexTarget target : targets)
             if (!columns.add(target.column))
                 throw new InvalidRequestException("Duplicate column " + target.column + " in index target list");
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws RequestValidationException
+    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws RequestValidationException
     {
         CFMetaData cfm = Schema.instance.getCFMetaData(keyspace(), columnFamily()).copy();
         List<IndexTarget> targets = new ArrayList<>(rawTargets.size());
@@ -206,7 +198,7 @@ public class CreateIndexStatement extends SchemaAlteringStatement
         if (Schema.instance.getKSMetaData(keyspace()).existingIndexNames(null).contains(acceptedName))
         {
             if (ifNotExists)
-                return false;
+                return null;
             else
                 throw new InvalidRequestException(String.format("Index %s already exists", acceptedName));
         }
@@ -229,19 +221,20 @@ public class CreateIndexStatement extends SchemaAlteringStatement
         // check to disallow creation of an index which duplicates an existing one in all but name
         Optional<IndexMetadata> existingIndex = Iterables.tryFind(cfm.getIndexes(), existing -> existing.equalsWithoutName(index));
         if (existingIndex.isPresent())
-            throw new InvalidRequestException(String.format("Index %s is a duplicate of existing index %s",
-                                                            index.name,
-                                                            existingIndex.get().name));
+        {
+            if (ifNotExists)
+                return null;
+            else
+                throw new InvalidRequestException(String.format("Index %s is a duplicate of existing index %s",
+                                                                index.name,
+                                                                existingIndex.get().name));
+        }
 
         logger.trace("Updating index definition for {}", indexName);
         cfm.indexes(cfm.getIndexes().with(index));
 
-        MigrationManager.announceColumnFamilyUpdate(cfm, false, isLocalOnly);
-        return true;
-    }
+        MigrationManager.announceColumnFamilyUpdate(cfm, isLocalOnly);
 
-    public Event.SchemaChange changeEvent()
-    {
         // Creating an index is akin to updating the CF
         return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
     }

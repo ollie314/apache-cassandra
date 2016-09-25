@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.io.IOException;
 import java.util.concurrent.TimeoutException;
 
 import org.apache.cassandra.auth.Permission;
@@ -60,7 +59,7 @@ public class TruncateStatement extends CFStatement implements CQLStatement
         ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
     }
 
-    public ResultMessage execute(QueryState state, QueryOptions options) throws InvalidRequestException, TruncateException
+    public ResultMessage execute(QueryState state, QueryOptions options, long queryStartNanoTime) throws InvalidRequestException, TruncateException
     {
         try
         {
@@ -70,7 +69,7 @@ public class TruncateStatement extends CFStatement implements CQLStatement
 
             StorageProxy.truncateBlocking(keyspace(), columnFamily());
         }
-        catch (UnavailableException | TimeoutException | IOException e)
+        catch (UnavailableException | TimeoutException e)
         {
             throw new TruncateException(e);
         }

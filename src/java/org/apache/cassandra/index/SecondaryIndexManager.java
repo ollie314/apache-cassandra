@@ -29,6 +29,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import com.google.common.primitives.Longs;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.MoreExecutors;
@@ -51,7 +52,6 @@ import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.index.transactions.*;
-import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Indexes;
@@ -65,11 +65,11 @@ import org.apache.cassandra.utils.concurrent.Refs;
  * a table, (re)building during bootstrap or other streaming operations, flushing, reloading metadata
  * and so on.
  *
- * The Index interface defines a number of methods which return Callable<?>. These are primarily the
+ * The Index interface defines a number of methods which return {@code Callable<?>}. These are primarily the
  * management tasks for an index implementation. Most of them are currently executed in a blocking
  * fashion via submission to SIM's blockingExecutor. This provides the desired behaviour in pretty
  * much all cases, as tasks like flushing an index needs to be executed synchronously to avoid potentially
- * deadlocking on the FlushWriter or PostFlusher. Several of these Callable<?> returning methods on Index could
+ * deadlocking on the FlushWriter or PostFlusher. Several of these {@code Callable<?>} returning methods on Index could
  * then be defined with as void and called directly from SIM (rather than being run via the executor service).
  * Separating the task defintion from execution gives us greater flexibility though, so that in future, for example,
  * if the flush process allows it we leave open the possibility of executing more of these tasks asynchronously.
@@ -98,6 +98,11 @@ public class SecondaryIndexManager implements IndexRegistry
     private static final Logger logger = LoggerFactory.getLogger(SecondaryIndexManager.class);
 
     private Map<String, Index> indexes = Maps.newConcurrentMap();
+
+    /**
+     * The indexes that are ready to server requests.
+     */
+    private Set<String> builtIndexes = Sets.newConcurrentHashSet();
 
     // executes tasks returned by Indexer#addIndexColumn which may require index(es) to be (re)built
     private static final ExecutorService asyncExecutor =
@@ -142,27 +147,30 @@ public class SecondaryIndexManager implements IndexRegistry
 
     private Future<?> reloadIndex(IndexMetadata indexDef)
     {
-        // if the index metadata has changed, reload the index
-        IndexMetadata registered = indexes.get(indexDef.name).getIndexMetadata();
-        if (!registered.equals(indexDef))
-        {
-            Index index = indexes.remove(registered.name);
-            index.register(this);
-            return blockingExecutor.submit(index.getMetadataReloadTask(indexDef));
-        }
-
-        // otherwise, nothing to do
-        return Futures.immediateFuture(null);
+        Index index = indexes.get(indexDef.name);
+        Callable<?> reloadTask = index.getMetadataReloadTask(indexDef);
+        return reloadTask == null
+               ? Futures.immediateFuture(null)
+               : blockingExecutor.submit(reloadTask);
     }
 
     private Future<?> createIndex(IndexMetadata indexDef)
     {
         Index index = createInstance(indexDef);
         index.register(this);
-        final Callable<?> initialBuildTask = index.getInitializationTask();
-        return initialBuildTask == null
-               ? Futures.immediateFuture(null)
-               : asyncExecutor.submit(initialBuildTask);
+
+        // if the index didn't register itself, we can probably assume that no initialization needs to happen
+        final Callable<?> initialBuildTask = indexes.containsKey(indexDef.name)
+                                           ? index.getInitializationTask()
+                                           : null;
+        if (initialBuildTask == null)
+        {
+            // We need to make sure that the index is marked as built in the case where the initialBuildTask
+            // does not need to be run (if the index didn't register itself or if the base table was empty).
+            markIndexBuilt(indexDef.name);
+            return Futures.immediateFuture(null);
+        }
+        return asyncExecutor.submit(index.getInitializationTask());
     }
 
     /**
@@ -177,13 +185,24 @@ public class SecondaryIndexManager implements IndexRegistry
             return createIndex(indexDef);
     }
 
+    /**
+     * Checks if the specified index is queryable.
+     *
+     * @param index the index
+     * @return <code>true</code> if the specified index is queryable, <code>false</code> otherwise
+     */
+    public boolean isIndexQueryable(Index index)
+    {
+        return builtIndexes.contains(index.getIndexMetadata().name);
+    }
+
     public synchronized void removeIndex(String indexName)
     {
-        Index index = indexes.remove(indexName);
+        Index index = unregisterIndex(indexName);
         if (null != index)
         {
+            markIndexRemoved(indexName);
             executeBlocking(index.getInvalidateTask());
-            unregisterIndex(index);
         }
     }
 
@@ -200,7 +219,6 @@ public class SecondaryIndexManager implements IndexRegistry
 
         return dependentIndexes;
     }
-
 
     /**
      * Called when dropping a Table
@@ -223,7 +241,7 @@ public class SecondaryIndexManager implements IndexRegistry
     public void rebuildIndexesBlocking(Collection<SSTableReader> sstables, Set<String> indexNames)
     {
         Set<Index> toRebuild = indexes.values().stream()
-                                               .filter(index -> indexNames.contains(index.getIndexName()))
+                                               .filter(index -> indexNames.contains(index.getIndexMetadata().name))
                                                .filter(Index::shouldBuildBlocking)
                                                .collect(Collectors.toSet());
         if (toRebuild.isEmpty())
@@ -232,11 +250,11 @@ public class SecondaryIndexManager implements IndexRegistry
             return;
         }
 
-        toRebuild.forEach(indexer -> markIndexRemoved(indexer.getIndexName()));
+        toRebuild.forEach(indexer -> markIndexRemoved(indexer.getIndexMetadata().name));
 
         buildIndexesBlocking(sstables, toRebuild);
 
-        toRebuild.forEach(indexer -> markIndexBuilt(indexer.getIndexName()));
+        toRebuild.forEach(indexer -> markIndexBuilt(indexer.getIndexMetadata().name));
     }
 
     public void buildAllIndexesBlocking(Collection<SSTableReader> sstables)
@@ -252,11 +270,11 @@ public class SecondaryIndexManager implements IndexRegistry
     {
         if (index.shouldBuildBlocking())
         {
-            try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.select(SSTableSet.CANONICAL));
+            try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL));
                  Refs<SSTableReader> sstables = viewFragment.refs)
             {
                 buildIndexesBlocking(sstables, Collections.singleton(index));
-                markIndexBuilt(index.getIndexName());
+                markIndexBuilt(index.getIndexMetadata().name);
             }
         }
     }
@@ -276,7 +294,7 @@ public class SecondaryIndexManager implements IndexRegistry
     /**
      * Checks if the specified {@link ColumnFamilyStore} is the one secondary index.
      *
-     * @param cfs the name of the <code>ColumnFamilyStore</code> to check.
+     * @param cfName the name of the <code>ColumnFamilyStore</code> to check.
      * @return <code>true</code> if the specified <code>ColumnFamilyStore</code> is a secondary index,
      * <code>false</code> otherwise.
      */
@@ -312,7 +330,7 @@ public class SecondaryIndexManager implements IndexRegistry
     /**
      * Returns the index name
      *
-     * @param cfName the <code>ColumnFamilyStore</code> name
+     * @param cfs the <code>ColumnFamilyStore</code>
      * @return the index name
      */
     public static String getIndexName(ColumnFamilyStore cfs)
@@ -338,30 +356,49 @@ public class SecondaryIndexManager implements IndexRegistry
             return;
 
         logger.info("Submitting index build of {} for data in {}",
-                    indexes.stream().map(Index::getIndexName).collect(Collectors.joining(",")),
+                    indexes.stream().map(i -> i.getIndexMetadata().name).collect(Collectors.joining(",")),
                     sstables.stream().map(SSTableReader::toString).collect(Collectors.joining(",")));
 
-        SecondaryIndexBuilder builder = new SecondaryIndexBuilder(baseCfs,
-                                                                  indexes,
-                                                                  new ReducingKeyIterator(sstables));
-        Future<?> future = CompactionManager.instance.submitIndexBuild(builder);
-        FBUtilities.waitOnFuture(future);
+        Map<Index.IndexBuildingSupport, Set<Index>> byType = new HashMap<>();
+        for (Index index : indexes)
+        {
+            Set<Index> stored = byType.computeIfAbsent(index.getBuildTaskSupport(), i -> new HashSet<>());
+            stored.add(index);
+        }
+
+        List<Future<?>> futures = byType.entrySet()
+                                        .stream()
+                                        .map((e) -> e.getKey().getIndexBuildTask(baseCfs, e.getValue(), sstables))
+                                        .map(CompactionManager.instance::submitIndexBuild)
+                                        .collect(Collectors.toList());
+
+        FBUtilities.waitOnFutures(futures);
 
         flushIndexesBlocking(indexes);
         logger.info("Index build of {} complete",
-                    indexes.stream().map(Index::getIndexName).collect(Collectors.joining(",")));
+                    indexes.stream().map(i -> i.getIndexMetadata().name).collect(Collectors.joining(",")));
     }
 
-    private void markIndexBuilt(String indexName)
+    /**
+     * Marks the specified index as build.
+     * <p>This method is public as it need to be accessible from the {@link Index} implementations</p>
+     * @param indexName the index name
+     */
+    public void markIndexBuilt(String indexName)
     {
-        SystemKeyspace.setIndexBuilt(baseCfs.name, indexName);
+        builtIndexes.add(indexName);
+        SystemKeyspace.setIndexBuilt(baseCfs.keyspace.getName(), indexName);
     }
 
-    private void markIndexRemoved(String indexName)
+    /**
+     * Marks the specified index as removed.
+     * <p>This method is public as it need to be accessible from the {@link Index} implementations</p>
+     * @param indexName the index name
+     */
+    public void markIndexRemoved(String indexName)
     {
-        SystemKeyspace.setIndexRemoved(baseCfs.name, indexName);
+        SystemKeyspace.setIndexRemoved(baseCfs.keyspace.getName(), indexName);
     }
-
 
     public Index getIndexByName(String indexName)
     {
@@ -379,7 +416,7 @@ public class SecondaryIndexManager implements IndexRegistry
             try
             {
                 Class<? extends Index> indexClass = FBUtilities.classForName(className, "Index");
-                Constructor ctor = indexClass.getConstructor(ColumnFamilyStore.class, IndexMetadata.class);
+                Constructor<? extends Index> ctor = indexClass.getConstructor(ColumnFamilyStore.class, IndexMetadata.class);
                 newIndex = (Index)ctor.newInstance(baseCfs, indexDef);
             }
             catch (Exception e)
@@ -407,6 +444,7 @@ public class SecondaryIndexManager implements IndexRegistry
      */
     public void invalidateAllIndexesBlocking()
     {
+        markAllIndexesRemoved();
         executeAllBlocking(indexes.values().stream(), Index::getInvalidateTask);
     }
 
@@ -448,10 +486,21 @@ public class SecondaryIndexManager implements IndexRegistry
      */
     public void flushAllNonCFSBackedIndexesBlocking()
     {
-        Set<Index> customIndexers = indexes.values().stream()
-                                                    .filter(index -> !(index.getBackingTable().isPresent()))
-                                                    .collect(Collectors.toSet());
-        flushIndexesBlocking(customIndexers);
+        executeAllBlocking(indexes.values()
+                                  .stream()
+                                  .filter(index -> !index.getBackingTable().isPresent()),
+                           Index::getBlockingFlushTask);
+    }
+
+    /**
+     * Performs a blocking execution of pre-join tasks of all indexes
+     */
+    public void executePreJoinTasksBlocking(boolean hadBootstrap)
+    {
+        logger.info("Executing pre-join{} tasks for: {}", hadBootstrap ? " post-bootstrap" : "", this.baseCfs);
+        executeAllBlocking(indexes.values().stream(), (index) -> {
+            return index.getPreJoinTask(hadBootstrap);
+        });
     }
 
     /**
@@ -461,7 +510,7 @@ public class SecondaryIndexManager implements IndexRegistry
     {
         Set<String> allIndexNames = new HashSet<>();
         indexes.values().stream()
-                .map(Index::getIndexName)
+                .map(i -> i.getIndexMetadata().name)
                 .forEach(allIndexNames::add);
         return SystemKeyspace.getBuiltIndexes(baseCfs.keyspace.getName(), allIndexNames);
     }
@@ -494,9 +543,11 @@ public class SecondaryIndexManager implements IndexRegistry
             DecoratedKey key = partition.partitionKey();
             Set<Index.Indexer> indexers = indexes.stream()
                                                  .map(index -> index.indexerFor(key,
+                                                                                partition.columns(),
                                                                                 nowInSec,
                                                                                 opGroup,
                                                                                 IndexTransaction.Type.UPDATE))
+                                                 .filter(Objects::nonNull)
                                                  .collect(Collectors.toSet());
 
             indexers.forEach(Index.Indexer::begin);
@@ -521,7 +572,7 @@ public class SecondaryIndexManager implements IndexRegistry
      * Delete all data from all indexes for this partition.
      * For when cleanup rips a partition out entirely.
      *
-     * TODO : improve cleanup transaction to batch updates & perform them async
+     * TODO : improve cleanup transaction to batch updates and perform them async
      */
     public void deletePartition(UnfilteredRowIterator partition, int nowInSec)
     {
@@ -532,7 +583,7 @@ public class SecondaryIndexManager implements IndexRegistry
                                                                     partition.columns(),
                                                                     nowInSec);
         indexTransaction.start();
-        indexTransaction.onPartitionDeletion(partition.partitionLevelDeletion());
+        indexTransaction.onPartitionDeletion(new DeletionTime(FBUtilities.timestampMicros(), nowInSec));
         indexTransaction.commit();
 
         while (partition.hasNext())
@@ -592,7 +643,7 @@ public class SecondaryIndexManager implements IndexRegistry
                 Tracing.trace("Command contains a custom index expression, using target index {}", customExpression.getTargetIndex().name);
                 return indexes.get(customExpression.getTargetIndex().name);
             }
-            else
+            else if (!expression.isUserDefined())
             {
                 indexes.values().stream()
                        .filter(index -> index.supportsExpression(expression.column(), expression.operator()))
@@ -618,11 +669,16 @@ public class SecondaryIndexManager implements IndexRegistry
         if (Tracing.isTracing())
         {
             Tracing.trace("Index mean cardinalities are {}. Scanning with {}.",
-                          searchableIndexes.stream().map(i -> i.getIndexName() + ':' + i.getEstimatedResultRows())
+                          searchableIndexes.stream().map(i -> i.getIndexMetadata().name + ':' + i.getEstimatedResultRows())
                                            .collect(Collectors.joining(",")),
-                          selected.getIndexName());
+                          selected.getIndexMetadata().name);
         }
         return selected;
+    }
+
+    public Optional<Index> getBestIndexFor(RowFilter.Expression expression)
+    {
+        return indexes.values().stream().filter((i) -> i.supportsExpression(expression.column(), expression.operator())).findFirst();
     }
 
     /**
@@ -636,10 +692,8 @@ public class SecondaryIndexManager implements IndexRegistry
      */
     public void validate(PartitionUpdate update) throws InvalidRequestException
     {
-        indexes.values()
-               .stream()
-               .filter(i -> i.indexes(update.columns()))
-               .forEach(i -> i.validate(update));
+        for (Index index : indexes.values())
+            index.validate(update);
     }
 
     /**
@@ -647,15 +701,23 @@ public class SecondaryIndexManager implements IndexRegistry
      */
     public void registerIndex(Index index)
     {
-        indexes.put(index.getIndexMetadata().name, index);
-        logger.trace("Registered index {}", index.getIndexMetadata().name);
+        String name = index.getIndexMetadata().name;
+        indexes.put(name, index);
+        logger.trace("Registered index {}", name);
     }
 
     public void unregisterIndex(Index index)
     {
-        Index removed = indexes.remove(index.getIndexMetadata().name);
+        unregisterIndex(index.getIndexMetadata().name);
+    }
+
+    private Index unregisterIndex(String name)
+    {
+        Index removed = indexes.remove(name);
+        builtIndexes.remove(name);
         logger.trace(removed == null ? "Index {} was not registered" : "Removed index {} from registry",
-                     index.getIndexMetadata().name);
+                     name);
+        return removed;
     }
 
     public Index getIndex(IndexMetadata metadata)
@@ -682,15 +744,13 @@ public class SecondaryIndexManager implements IndexRegistry
         if (!hasIndexes())
             return UpdateTransaction.NO_OP;
 
-        // todo : optimize lookup, we can probably cache quite a bit of stuff, rather than doing
-        // a linear scan every time. Holding off that though until CASSANDRA-7771 to figure out
-        // exactly how indexes are to be identified & associated with a given partition update
         Index.Indexer[] indexers = indexes.values().stream()
-                                          .filter(i -> i.indexes(update.columns()))
                                           .map(i -> i.indexerFor(update.partitionKey(),
+                                                                 update.columns(),
                                                                  nowInSec,
                                                                  opGroup,
                                                                  IndexTransaction.Type.UPDATE))
+                                          .filter(Objects::nonNull)
                                           .toArray(Index.Indexer[]::new);
 
         return indexers.length == 0 ? UpdateTransaction.NO_OP : new WriteTimeTransaction(indexers);
@@ -705,14 +765,7 @@ public class SecondaryIndexManager implements IndexRegistry
                                                           int nowInSec)
     {
         // the check for whether there are any registered indexes is already done in CompactionIterator
-
-        Index[] interestedIndexes = indexes.values().stream()
-                                           .filter(i -> i.indexes(partitionColumns))
-                                           .toArray(Index[]::new);
-
-        return interestedIndexes.length == 0
-               ? CompactionTransaction.NO_OP
-               : new IndexGCTransaction(key, versions, nowInSec, interestedIndexes);
+        return new IndexGCTransaction(key, partitionColumns, versions, nowInSec, listIndexes());
     }
 
     /**
@@ -722,17 +775,10 @@ public class SecondaryIndexManager implements IndexRegistry
                                                     PartitionColumns partitionColumns,
                                                     int nowInSec)
     {
-        //
         if (!hasIndexes())
             return CleanupTransaction.NO_OP;
 
-        Index[] interestedIndexes = indexes.values().stream()
-                                           .filter(i -> i.indexes(partitionColumns))
-                                           .toArray(Index[]::new);
-
-        return interestedIndexes.length == 0
-               ? CleanupTransaction.NO_OP
-               : new CleanupGCTransaction(key, nowInSec, interestedIndexes);
+        return new CleanupGCTransaction(key, partitionColumns, nowInSec, listIndexes());
     }
 
     /**
@@ -769,7 +815,8 @@ public class SecondaryIndexManager implements IndexRegistry
 
         public void onInserted(Row row)
         {
-            Arrays.stream(indexers).forEach(h -> h.insertRow(row));
+            for (Index.Indexer indexer : indexers)
+                indexer.insertRow(row);
         }
 
         public void onUpdated(Row existing, Row updated)
@@ -777,9 +824,11 @@ public class SecondaryIndexManager implements IndexRegistry
             final Row.Builder toRemove = BTreeRow.sortedBuilder();
             toRemove.newRow(existing.clustering());
             toRemove.addPrimaryKeyLivenessInfo(existing.primaryKeyLivenessInfo());
+            toRemove.addRowDeletion(existing.deletion());
             final Row.Builder toInsert = BTreeRow.sortedBuilder();
             toInsert.newRow(updated.clustering());
             toInsert.addPrimaryKeyLivenessInfo(updated.primaryKeyLivenessInfo());
+            toInsert.addRowDeletion(updated.deletion());
             // diff listener collates the columns to be added & removed from the indexes
             RowDiffListener diffListener = new RowDiffListener()
             {
@@ -842,21 +891,21 @@ public class SecondaryIndexManager implements IndexRegistry
     private static final class IndexGCTransaction implements CompactionTransaction
     {
         private final DecoratedKey key;
+        private final PartitionColumns columns;
         private final int versions;
         private final int nowInSec;
-        private final Index[] indexes;
+        private final Collection<Index> indexes;
 
         private Row[] rows;
 
         private IndexGCTransaction(DecoratedKey key,
+                                   PartitionColumns columns,
                                    int versions,
                                    int nowInSec,
-                                   Index...indexes)
+                                   Collection<Index> indexes)
         {
-            // don't allow null indexers, if we don't have any, use a noop transaction
-            for (Index index : indexes) assert index != null;
-
             this.key = key;
+            this.columns = columns;
             this.versions = versions;
             this.indexes = indexes;
             this.nowInSec = nowInSec;
@@ -877,6 +926,8 @@ public class SecondaryIndexManager implements IndexRegistry
             {
                 public void onPrimaryKeyLivenessInfo(int i, Clustering clustering, LivenessInfo merged, LivenessInfo original)
                 {
+                    if (original != null && (merged == null || !merged.isLive(nowInSec)))
+                        getBuilder(i, clustering).addPrimaryKeyLivenessInfo(original);
                 }
 
                 public void onDeletion(int i, Clustering clustering, Row.Deletion merged, Row.Deletion original)
@@ -889,15 +940,18 @@ public class SecondaryIndexManager implements IndexRegistry
 
                 public void onCell(int i, Clustering clustering, Cell merged, Cell original)
                 {
-                    if (original != null && merged == null)
+                    if (original != null && (merged == null || !merged.isLive(nowInSec)))
+                        getBuilder(i, clustering).addCell(original);
+                }
+
+                private Row.Builder getBuilder(int index, Clustering clustering)
+                {
+                    if (builders[index] == null)
                     {
-                        if (builders[i] == null)
-                        {
-                            builders[i] = BTreeRow.sortedBuilder();
-                            builders[i].newRow(clustering);
-                        }
-                        builders[i].addCell(original);
+                        builders[index] = BTreeRow.sortedBuilder();
+                        builders[index].newRow(clustering);
                     }
+                    return builders[index];
                 }
             };
 
@@ -917,7 +971,10 @@ public class SecondaryIndexManager implements IndexRegistry
             {
                 for (Index index : indexes)
                 {
-                    Index.Indexer indexer = index.indexerFor(key, nowInSec, opGroup, Type.COMPACTION);
+                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, opGroup, Type.COMPACTION);
+                    if (indexer == null)
+                        continue;
+
                     indexer.begin();
                     for (Row row : rows)
                         if (row != null)
@@ -937,20 +994,20 @@ public class SecondaryIndexManager implements IndexRegistry
     private static final class CleanupGCTransaction implements CleanupTransaction
     {
         private final DecoratedKey key;
+        private final PartitionColumns columns;
         private final int nowInSec;
-        private final Index[] indexes;
+        private final Collection<Index> indexes;
 
         private Row row;
         private DeletionTime partitionDelete;
 
         private CleanupGCTransaction(DecoratedKey key,
+                                     PartitionColumns columns,
                                      int nowInSec,
-                                     Index...indexes)
+                                     Collection<Index> indexes)
         {
-            // don't allow null indexers, if we don't have any, use a noop transaction
-            for (Index index : indexes) assert index != null;
-
             this.key = key;
+            this.columns = columns;
             this.indexes = indexes;
             this.nowInSec = nowInSec;
         }
@@ -978,10 +1035,18 @@ public class SecondaryIndexManager implements IndexRegistry
             {
                 for (Index index : indexes)
                 {
-                    Index.Indexer indexer = index.indexerFor(key, nowInSec, opGroup, Type.CLEANUP);
+                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, opGroup, Type.CLEANUP);
+                    if (indexer == null)
+                        continue;
+
                     indexer.begin();
+
+                    if (partitionDelete != null)
+                        indexer.partitionDelete(partitionDelete);
+
                     if (row != null)
                         indexer.removeRow(row);
+
                     indexer.finish();
                 }
             }
@@ -996,6 +1061,12 @@ public class SecondaryIndexManager implements IndexRegistry
 
     private static void executeAllBlocking(Stream<Index> indexers, Function<Index, Callable<?>> function)
     {
+        if (function == null)
+        {
+            logger.error("failed to flush indexes: {} because flush task is missing.", indexers);
+            return;
+        }
+
         List<Future<?>> waitFor = new ArrayList<>();
         indexers.forEach(indexer -> {
             Callable<?> task = function.apply(indexer);

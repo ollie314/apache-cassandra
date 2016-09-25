@@ -150,6 +150,7 @@ public abstract class Message
     private int streamId;
     private Frame sourceFrame;
     private Map<String, ByteBuffer> customPayload;
+    protected Integer forcedProtocolVersion = null;
 
     protected Message(Type type)
     {
@@ -209,7 +210,7 @@ public abstract class Message
                 throw new IllegalArgumentException();
         }
 
-        public abstract Response execute(QueryState queryState);
+        public abstract Response execute(QueryState queryState, long queryStartNanoTime);
 
         public void setTracingRequested()
         {
@@ -321,6 +322,8 @@ public abstract class Message
             int version = connection == null ? Server.CURRENT_VERSION : connection.getVersion();
 
             EnumSet<Frame.Header.Flag> flags = EnumSet.noneOf(Frame.Header.Flag.class);
+            if (version == Server.BETA_VERSION)
+                flags.add(Frame.Header.Flag.USE_BETA);
 
             Codec<Message> codec = (Codec<Message>)message.type.codec;
             try
@@ -389,7 +392,12 @@ public abstract class Message
                     throw e;
                 }
 
-                results.add(Frame.create(message.type, message.getStreamId(), version, flags, body));
+                // if the driver attempted to connect with a protocol version lower than the minimum supported
+                // version, respond with a protocol error message with the correct frame header for that version
+                int responseVersion = message.forcedProtocolVersion == null
+                                    ? version
+                                    : message.forcedProtocolVersion;
+                results.add(Frame.create(message.type, message.getStreamId(), responseVersion, flags, body));
             }
             catch (Throwable e)
             {
@@ -493,20 +501,21 @@ public abstract class Message
 
             final Response response;
             final ServerConnection connection;
+            long queryStartNanoTime = System.nanoTime();
 
             try
             {
                 assert request.connection() instanceof ServerConnection;
                 connection = (ServerConnection)request.connection();
                 if (connection.getVersion() >= Server.VERSION_4)
-                    ClientWarn.captureWarnings();
+                    ClientWarn.instance.captureWarnings();
 
                 QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion(), request.getStreamId());
 
                 logger.trace("Received: {}, v={}", request, connection.getVersion());
-                response = request.execute(qstate);
+                response = request.execute(qstate, queryStartNanoTime);
                 response.setStreamId(request.getStreamId());
-                response.setWarnings(ClientWarn.getWarnings());
+                response.setWarnings(ClientWarn.instance.getWarnings());
                 response.attach(connection);
                 connection.applyStateTransition(request.type, response.type);
             }
@@ -519,7 +528,7 @@ public abstract class Message
             }
             finally
             {
-                ClientWarn.resetWarnings();
+                ClientWarn.instance.resetWarnings();
             }
 
             logger.trace("Responding: {}, v={}", response, connection.getVersion());
@@ -552,8 +561,10 @@ public abstract class Message
                 // On protocol exception, close the channel as soon as the message have been sent
                 if (cause instanceof ProtocolException)
                 {
-                    future.addListener(new ChannelFutureListener() {
-                        public void operationComplete(ChannelFuture future) {
+                    future.addListener(new ChannelFutureListener()
+                    {
+                        public void operationComplete(ChannelFuture future)
+                        {
                             ctx.close();
                         }
                     });

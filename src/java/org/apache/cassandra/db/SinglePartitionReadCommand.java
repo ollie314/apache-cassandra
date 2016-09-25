@@ -20,19 +20,28 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+
+import org.apache.commons.lang3.tuple.Pair;
+
 import org.apache.cassandra.cache.IRowCacheEntry;
 import org.apache.cassandra.cache.RowCacheKey;
 import org.apache.cassandra.cache.RowCacheSentinel;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.lifecycle.*;
 import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.metrics.TableMetrics;
@@ -43,29 +52,35 @@ import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.pager.*;
+import org.apache.cassandra.thrift.ThriftResultsMerger;
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.SearchIterator;
+import org.apache.cassandra.utils.btree.BTreeSet;
+
 
 /**
  * A read command that selects a (part of a) single partition.
  */
-public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter> extends ReadCommand
+public class SinglePartitionReadCommand extends ReadCommand
 {
     protected static final SelectionDeserializer selectionDeserializer = new Deserializer();
 
     private final DecoratedKey partitionKey;
-    private final F clusteringIndexFilter;
+    private final ClusteringIndexFilter clusteringIndexFilter;
 
-    protected SinglePartitionReadCommand(boolean isDigest,
-                                         int digestVersion,
-                                         boolean isForThrift,
-                                         CFMetaData metadata,
-                                         int nowInSec,
-                                         ColumnFilter columnFilter,
-                                         RowFilter rowFilter,
-                                         DataLimits limits,
-                                         DecoratedKey partitionKey,
-                                         F clusteringIndexFilter)
+    private int oldestUnrepairedTombstone = Integer.MAX_VALUE;
+
+    public SinglePartitionReadCommand(boolean isDigest,
+                                      int digestVersion,
+                                      boolean isForThrift,
+                                      CFMetaData metadata,
+                                      int nowInSec,
+                                      ColumnFilter columnFilter,
+                                      RowFilter rowFilter,
+                                      DataLimits limits,
+                                      DecoratedKey partitionKey,
+                                      ClusteringIndexFilter clusteringIndexFilter)
     {
         super(Kind.SINGLE_PARTITION, isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits);
         assert partitionKey.getPartitioner() == metadata.partitioner;
@@ -86,13 +101,13 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      *
      * @return a newly created read command.
      */
-    public static SinglePartitionReadCommand<?> create(CFMetaData metadata,
-                                                       int nowInSec,
-                                                       ColumnFilter columnFilter,
-                                                       RowFilter rowFilter,
-                                                       DataLimits limits,
-                                                       DecoratedKey partitionKey,
-                                                       ClusteringIndexFilter clusteringIndexFilter)
+    public static SinglePartitionReadCommand create(CFMetaData metadata,
+                                                    int nowInSec,
+                                                    ColumnFilter columnFilter,
+                                                    RowFilter rowFilter,
+                                                    DataLimits limits,
+                                                    DecoratedKey partitionKey,
+                                                    ClusteringIndexFilter clusteringIndexFilter)
     {
         return create(false, metadata, nowInSec, columnFilter, rowFilter, limits, partitionKey, clusteringIndexFilter);
     }
@@ -111,20 +126,16 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      *
      * @return a newly created read command.
      */
-    public static SinglePartitionReadCommand<?> create(boolean isForThrift,
-                                                       CFMetaData metadata,
-                                                       int nowInSec,
-                                                       ColumnFilter columnFilter,
-                                                       RowFilter rowFilter,
-                                                       DataLimits limits,
-                                                       DecoratedKey partitionKey,
-                                                       ClusteringIndexFilter clusteringIndexFilter)
+    public static SinglePartitionReadCommand create(boolean isForThrift,
+                                                    CFMetaData metadata,
+                                                    int nowInSec,
+                                                    ColumnFilter columnFilter,
+                                                    RowFilter rowFilter,
+                                                    DataLimits limits,
+                                                    DecoratedKey partitionKey,
+                                                    ClusteringIndexFilter clusteringIndexFilter)
     {
-        if (clusteringIndexFilter instanceof ClusteringIndexSliceFilter)
-            return new SinglePartitionSliceCommand(false, 0, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, partitionKey, (ClusteringIndexSliceFilter) clusteringIndexFilter);
-
-        assert clusteringIndexFilter instanceof ClusteringIndexNamesFilter;
-        return new SinglePartitionNamesCommand(false, 0, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, partitionKey, (ClusteringIndexNamesFilter) clusteringIndexFilter);
+        return new SinglePartitionReadCommand(false, 0, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, partitionKey, clusteringIndexFilter);
     }
 
     /**
@@ -138,7 +149,7 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      *
      * @return a newly created read command. The returned command will use no row filter and have no limits.
      */
-    public static SinglePartitionReadCommand<?> create(CFMetaData metadata, int nowInSec, DecoratedKey key, ColumnFilter columnFilter, ClusteringIndexFilter filter)
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, ColumnFilter columnFilter, ClusteringIndexFilter filter)
     {
         return create(metadata, nowInSec, columnFilter, RowFilter.NONE, DataLimits.NONE, key, filter);
     }
@@ -154,7 +165,7 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      */
     public static SinglePartitionReadCommand fullPartitionRead(CFMetaData metadata, int nowInSec, DecoratedKey key)
     {
-        return SinglePartitionSliceCommand.create(metadata, nowInSec, key, Slices.ALL);
+        return SinglePartitionReadCommand.create(metadata, nowInSec, key, Slices.ALL);
     }
 
     /**
@@ -168,7 +179,94 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      */
     public static SinglePartitionReadCommand fullPartitionRead(CFMetaData metadata, int nowInSec, ByteBuffer key)
     {
-        return SinglePartitionSliceCommand.create(metadata, nowInSec, metadata.decorateKey(key), Slices.ALL);
+        return SinglePartitionReadCommand.create(metadata, nowInSec, metadata.decorateKey(key), Slices.ALL);
+    }
+
+    /**
+     * Creates a new single partition slice command for the provided single slice.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are "now" for this query.
+     * @param key the partition key for the partition to query.
+     * @param slice the slice of rows to query.
+     *
+     * @return a newly created read command that queries {@code slice} in {@code key}. The returned query will
+     * query every columns for the table (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, Slice slice)
+    {
+        return create(metadata, nowInSec, key, Slices.with(metadata.comparator, slice));
+    }
+
+    /**
+     * Creates a new single partition slice command for the provided slices.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are "now" for this query.
+     * @param key the partition key for the partition to query.
+     * @param slices the slices of rows to query.
+     *
+     * @return a newly created read command that queries the {@code slices} in {@code key}. The returned query will
+     * query every columns for the table (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, Slices slices)
+    {
+        ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(slices, false);
+        return SinglePartitionReadCommand.create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);
+    }
+
+    /**
+     * Creates a new single partition slice command for the provided slices.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are "now" for this query.
+     * @param key the partition key for the partition to query.
+     * @param slices the slices of rows to query.
+     *
+     * @return a newly created read command that queries the {@code slices} in {@code key}. The returned query will
+     * query every columns for the table (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, ByteBuffer key, Slices slices)
+    {
+        return create(metadata, nowInSec, metadata.decorateKey(key), slices);
+    }
+
+    /**
+     * Creates a new single partition name command for the provided rows.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are "now" for this query.
+     * @param key the partition key for the partition to query.
+     * @param names the clustering for the rows to query.
+     *
+     * @return a newly created read command that queries the {@code names} in {@code key}. The returned query will
+     * query every columns (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, NavigableSet<Clustering> names)
+    {
+        ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(names, false);
+        return SinglePartitionReadCommand.create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);
+    }
+
+    /**
+     * Creates a new single partition name command for the provided row.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are "now" for this query.
+     * @param key the partition key for the partition to query.
+     * @param name the clustering for the row to query.
+     *
+     * @return a newly created read command that queries {@code name} in {@code key}. The returned query will
+     * query every columns (without limit or row filtering).
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, Clustering name)
+    {
+        return create(metadata, nowInSec, key, FBUtilities.singleton(name, metadata.comparator));
+    }
+
+    public SinglePartitionReadCommand copy()
+    {
+        return new SinglePartitionReadCommand(isDigestQuery(), digestVersion(), isForThrift(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), partitionKey(), clusteringIndexFilter());
     }
 
     public DecoratedKey partitionKey()
@@ -176,7 +274,7 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
         return partitionKey;
     }
 
-    public F clusteringIndexFilter()
+    public ClusteringIndexFilter clusteringIndexFilter()
     {
         return clusteringIndexFilter;
     }
@@ -216,11 +314,11 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      * @param lastReturned the last row returned by the previous page. The newly created command
      * will only query row that comes after this (in query order). This can be {@code null} if this
      * is the first page.
-     * @param pageSize the size to use for the page to query.
+     * @param limits the limits to use for the page to query.
      *
      * @return the newly create command.
      */
-    public SinglePartitionReadCommand forPaging(Clustering lastReturned, int pageSize)
+    public SinglePartitionReadCommand forPaging(Clustering lastReturned, DataLimits limits)
     {
         // We shouldn't have set digest yet when reaching that point
         assert !isDigestQuery();
@@ -229,14 +327,28 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
                       nowInSec(),
                       columnFilter(),
                       rowFilter(),
-                      limits().forPaging(pageSize),
+                      limits,
                       partitionKey(),
                       lastReturned == null ? clusteringIndexFilter() : clusteringIndexFilter.forPaging(metadata().comparator, lastReturned, false));
     }
 
-    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException
+    public SinglePartitionReadCommand withUpdatedLimit(DataLimits newLimits)
     {
-        return StorageProxy.read(Group.one(this), consistency, clientState);
+        return new SinglePartitionReadCommand(isDigestQuery(),
+                                              digestVersion(),
+                                              isForThrift(),
+                                              metadata(),
+                                              nowInSec(),
+                                              columnFilter(),
+                                              rowFilter(),
+                                              newLimits,
+                                              partitionKey,
+                                              clusteringIndexFilter);
+    }
+
+    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
+    {
+        return StorageProxy.read(Group.one(this), consistency, clientState, queryStartNanoTime);
     }
 
     public SinglePartitionPager getPager(PagingState pagingState, int protocolVersion)
@@ -298,7 +410,9 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
             {
                 cfs.metric.rowCacheHit.inc();
                 Tracing.trace("Row cache hit");
-                return clusteringIndexFilter().getUnfilteredRowIterator(columnFilter(), cachedPartition);
+                UnfilteredRowIterator unfilteredRowIterator = clusteringIndexFilter().getUnfilteredRowIterator(columnFilter(), cachedPartition);
+                cfs.metric.updateSSTableIterated(0);
+                return unfilteredRowIterator;
             }
 
             cfs.metric.rowCacheHitOutOfRange.inc();
@@ -309,7 +423,11 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
         cfs.metric.rowCacheMiss.inc();
         Tracing.trace("Row cache miss");
 
-        boolean cacheFullPartitions = metadata().params.caching.cacheAllRows();
+        // Note that on tables with no clustering keys, any positive value of
+        // rowsToCache implies caching the full partition
+        boolean cacheFullPartitions = metadata().clusteringColumns().size() > 0 ?
+                                      metadata().params.caching.cacheAllRows() :
+                                      metadata().params.caching.cacheRows();
 
         // To be able to cache what we read, what we read must at least covers what the cache holds, that
         // is the 'rowsToCache' first rows of the partition. We could read those 'rowsToCache' first rows
@@ -383,23 +501,423 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      * It is publicly exposed because there is a few places where that is exactly what we want,
      * but it should be used only where you know you don't need thoses things.
      * <p>
-     * Also note that one must have "started" a {@code OpOrder.Group} on the queried table, and that is
-     * to enforce that that it is required as parameter, even though it's not explicitlly used by the method.
+     * Also note that one must have created a {@code ReadExecutionController} on the queried table and we require it as
+     * a parameter to enforce that fact, even though it's not explicitlly used by the method.
      */
-    public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, OpOrder.Group readOp)
-    {
-        return queryMemtableAndDisk(cfs, ReadExecutionController.forReadOp(readOp));
-    }
-
     public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, ReadExecutionController executionController)
     {
+        assert executionController != null && executionController.validForReadOn(cfs);
         Tracing.trace("Executing single-partition query on {}", cfs.name);
 
-        boolean copyOnHeap = Memtable.MEMORY_POOL.needToCopyOnHeap();
-        return queryMemtableAndDiskInternal(cfs, copyOnHeap);
+        return queryMemtableAndDiskInternal(cfs);
     }
 
-    protected abstract UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs, boolean copyOnHeap);
+    @Override
+    protected int oldestUnrepairedTombstone()
+    {
+        return oldestUnrepairedTombstone;
+    }
+
+    private UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs)
+    {
+        /*
+         * We have 2 main strategies:
+         *   1) We query memtables and sstables simulateneously. This is our most generic strategy and the one we use
+         *      unless we have a names filter that we know we can optimize futher.
+         *   2) If we have a name filter (so we query specific rows), we can make a bet: that all column for all queried row
+         *      will have data in the most recent sstable(s), thus saving us from reading older ones. This does imply we
+         *      have a way to guarantee we have all the data for what is queried, which is only possible for name queries
+         *      and if we have neither collections nor counters (indeed, for a collection, we can't guarantee an older sstable
+         *      won't have some elements that weren't in the most recent sstables, and counters are intrinsically a collection
+         *      of shards so have the same problem).
+         */
+        if (clusteringIndexFilter() instanceof ClusteringIndexNamesFilter && queryNeitherCountersNorCollections())
+            return queryMemtableAndSSTablesInTimestampOrder(cfs, (ClusteringIndexNamesFilter)clusteringIndexFilter());
+
+        Tracing.trace("Acquiring sstable references");
+        ColumnFamilyStore.ViewFragment view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));
+        List<UnfilteredRowIterator> iterators = new ArrayList<>(Iterables.size(view.memtables) + view.sstables.size());
+        ClusteringIndexFilter filter = clusteringIndexFilter();
+        long minTimestamp = Long.MAX_VALUE;
+
+        try
+        {
+            for (Memtable memtable : view.memtables)
+            {
+                Partition partition = memtable.getPartition(partitionKey());
+                if (partition == null)
+                    continue;
+
+                minTimestamp = Math.min(minTimestamp, memtable.getMinTimestamp());
+
+                @SuppressWarnings("resource") // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
+                UnfilteredRowIterator iter = filter.getUnfilteredRowIterator(columnFilter(), partition);
+                oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, partition.stats().minLocalDeletionTime);
+                iterators.add(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, nowInSec()) : iter);
+            }
+
+            /*
+             * We can't eliminate full sstables based on the timestamp of what we've already read like
+             * in collectTimeOrderedData, but we still want to eliminate sstable whose maxTimestamp < mostRecentTombstone
+             * we've read. We still rely on the sstable ordering by maxTimestamp since if
+             *   maxTimestamp_s1 > maxTimestamp_s0,
+             * we're guaranteed that s1 cannot have a row tombstone such that
+             *   timestamp(tombstone) > maxTimestamp_s0
+             * since we necessarily have
+             *   timestamp(tombstone) <= maxTimestamp_s1
+             * In other words, iterating in maxTimestamp order allow to do our mostRecentPartitionTombstone elimination
+             * in one pass, and minimize the number of sstables for which we read a partition tombstone.
+             */
+            Collections.sort(view.sstables, SSTableReader.maxTimestampComparator);
+            long mostRecentPartitionTombstone = Long.MIN_VALUE;
+            int nonIntersectingSSTables = 0;
+            List<SSTableReader> skippedSSTablesWithTombstones = null;
+
+            for (SSTableReader sstable : view.sstables)
+            {
+                // if we've already seen a partition tombstone with a timestamp greater
+                // than the most recent update to this sstable, we can skip it
+                if (sstable.getMaxTimestamp() < mostRecentPartitionTombstone)
+                    break;
+
+                if (!shouldInclude(sstable))
+                {
+                    nonIntersectingSSTables++;
+                    if (sstable.hasTombstones())
+                    { // if sstable has tombstones we need to check after one pass if it can be safely skipped
+                        if (skippedSSTablesWithTombstones == null)
+                            skippedSSTablesWithTombstones = new ArrayList<>();
+                        skippedSSTablesWithTombstones.add(sstable);
+                    }
+                    continue;
+                }
+
+                minTimestamp = Math.min(minTimestamp, sstable.getMinTimestamp());
+
+                @SuppressWarnings("resource") // 'iter' is added to iterators which is closed on exception,
+                                              // or through the closing of the final merged iterator
+                UnfilteredRowIteratorWithLowerBound iter = makeIterator(cfs, sstable, true);
+                if (!sstable.isRepaired())
+                    oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
+
+                iterators.add(iter);
+                mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone,
+                                                        iter.partitionLevelDeletion().markedForDeleteAt());
+            }
+
+            int includedDueToTombstones = 0;
+            // Check for sstables with tombstones that are not expired
+            if (skippedSSTablesWithTombstones != null)
+            {
+                for (SSTableReader sstable : skippedSSTablesWithTombstones)
+                {
+                    if (sstable.getMaxTimestamp() <= minTimestamp)
+                        continue;
+
+                    @SuppressWarnings("resource") // 'iter' is added to iterators which is close on exception,
+                                                  // or through the closing of the final merged iterator
+                    UnfilteredRowIteratorWithLowerBound iter = makeIterator(cfs, sstable, false);
+                    if (!sstable.isRepaired())
+                        oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
+
+                    iterators.add(iter);
+                    includedDueToTombstones++;
+                }
+            }
+            if (Tracing.isTracing())
+                Tracing.trace("Skipped {}/{} non-slice-intersecting sstables, included {} due to tombstones",
+                               nonIntersectingSSTables, view.sstables.size(), includedDueToTombstones);
+
+            if (iterators.isEmpty())
+                return EmptyIterators.unfilteredRow(cfs.metadata, partitionKey(), filter.isReversed());
+
+            StorageHook.instance.reportRead(cfs.metadata.cfId, partitionKey());
+            return withStateTracking(withSSTablesIterated(iterators, cfs.metric));
+        }
+        catch (RuntimeException | Error e)
+        {
+            try
+            {
+                FBUtilities.closeAll(iterators);
+            }
+            catch (Exception suppressed)
+            {
+                e.addSuppressed(suppressed);
+            }
+            throw e;
+        }
+    }
+
+    private boolean shouldInclude(SSTableReader sstable)
+    {
+        // If some static columns are queried, we should always include the sstable: the clustering values stats of the sstable
+        // don't tell us if the sstable contains static values in particular.
+        // TODO: we could record if a sstable contains any static value at all.
+        if (!columnFilter().fetchedColumns().statics.isEmpty())
+            return true;
+
+        return clusteringIndexFilter().shouldInclude(sstable);
+    }
+
+    private UnfilteredRowIteratorWithLowerBound makeIterator(ColumnFamilyStore cfs, final SSTableReader sstable, boolean applyThriftTransformation)
+    {
+        return StorageHook.instance.makeRowIteratorWithLowerBound(cfs,
+                                                                  partitionKey(),
+                                                                  sstable,
+                                                                  clusteringIndexFilter(),
+                                                                  columnFilter(),
+                                                                  isForThrift(),
+                                                                  nowInSec(),
+                                                                  applyThriftTransformation);
+
+    }
+
+    /**
+     * Return a wrapped iterator that when closed will update the sstables iterated and READ sample metrics.
+     * Note that we cannot use the Transformations framework because they greedily get the static row, which
+     * would cause all iterators to be initialized and hence all sstables to be accessed.
+     */
+    private UnfilteredRowIterator withSSTablesIterated(List<UnfilteredRowIterator> iterators,
+                                                       TableMetrics metrics)
+    {
+        @SuppressWarnings("resource") //  Closed through the closing of the result of the caller method.
+        UnfilteredRowIterator merged = UnfilteredRowIterators.merge(iterators, nowInSec());
+
+        if (!merged.isEmpty())
+        {
+            DecoratedKey key = merged.partitionKey();
+            metrics.samplers.get(TableMetrics.Sampler.READS).addSample(key.getKey(), key.hashCode(), 1);
+        }
+
+        class UpdateSstablesIterated extends Transformation
+        {
+           public void onPartitionClose()
+           {
+               int sstablesIterated = (int)iterators.stream()
+                                                    .filter(it -> it instanceof LazilyInitializedUnfilteredRowIterator)
+                                                    .filter(it -> ((LazilyInitializedUnfilteredRowIterator)it).initialized())
+                                                    .count();
+
+               metrics.updateSSTableIterated(sstablesIterated);
+               Tracing.trace("Merged data from memtables and {} sstables", sstablesIterated);
+           }
+        };
+        return Transformation.apply(merged, new UpdateSstablesIterated());
+    }
+
+    private boolean queryNeitherCountersNorCollections()
+    {
+        for (ColumnDefinition column : columnFilter().fetchedColumns())
+        {
+            if (column.type.isCollection() || column.type.isCounter())
+                return false;
+        }
+        return true;
+    }
+
+    /**
+     * Do a read by querying the memtable(s) first, and then each relevant sstables sequentially by order of the sstable
+     * max timestamp.
+     *
+     * This is used for names query in the hope of only having to query the 1 or 2 most recent query and then knowing nothing
+     * more recent could be in the older sstables (which we can only guarantee if we know exactly which row we queries, and if
+     * no collection or counters are included).
+     * This method assumes the filter is a {@code ClusteringIndexNamesFilter}.
+     */
+    private UnfilteredRowIterator queryMemtableAndSSTablesInTimestampOrder(ColumnFamilyStore cfs, ClusteringIndexNamesFilter filter)
+    {
+        Tracing.trace("Acquiring sstable references");
+        ColumnFamilyStore.ViewFragment view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));
+
+        ImmutableBTreePartition result = null;
+
+        Tracing.trace("Merging memtable contents");
+        for (Memtable memtable : view.memtables)
+        {
+            Partition partition = memtable.getPartition(partitionKey());
+            if (partition == null)
+                continue;
+
+            try (UnfilteredRowIterator iter = filter.getUnfilteredRowIterator(columnFilter(), partition))
+            {
+                if (iter.isEmpty())
+                    continue;
+
+                result = add(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, nowInSec()) : iter, result, filter, false);
+            }
+        }
+
+        /* add the SSTables on disk */
+        Collections.sort(view.sstables, SSTableReader.maxTimestampComparator);
+        int sstablesIterated = 0;
+        boolean onlyUnrepaired = true;
+        // read sorted sstables
+        for (SSTableReader sstable : view.sstables)
+        {
+            // if we've already seen a partition tombstone with a timestamp greater
+            // than the most recent update to this sstable, we're done, since the rest of the sstables
+            // will also be older
+            if (result != null && sstable.getMaxTimestamp() < result.partitionLevelDeletion().markedForDeleteAt())
+                break;
+
+            long currentMaxTs = sstable.getMaxTimestamp();
+            filter = reduceFilter(filter, result, currentMaxTs);
+            if (filter == null)
+                break;
+
+            if (!shouldInclude(sstable))
+            {
+                // This mean that nothing queried by the filter can be in the sstable. One exception is the top-level partition deletion
+                // however: if it is set, it impacts everything and must be included. Getting that top-level partition deletion costs us
+                // some seek in general however (unless the partition is indexed and is in the key cache), so we first check if the sstable
+                // has any tombstone at all as a shortcut.
+                if (!sstable.hasTombstones())
+                    continue; // no tombstone at all, we can skip that sstable
+
+                // We need to get the partition deletion and include it if it's live. In any case though, we're done with that sstable.
+                sstable.incrementReadCount();
+                try (UnfilteredRowIterator iter = StorageHook.instance.makeRowIterator(cfs, sstable, partitionKey(), Slices.ALL, columnFilter(), filter.isReversed(), isForThrift()))
+                {
+                    if (iter.partitionLevelDeletion().isLive())
+                    {
+                        sstablesIterated++;
+                        result = add(UnfilteredRowIterators.noRowsIterator(iter.metadata(), iter.partitionKey(), Rows.EMPTY_STATIC_ROW, iter.partitionLevelDeletion(), filter.isReversed()), result, filter, sstable.isRepaired());
+                    }
+                }
+                continue;
+            }
+
+            Tracing.trace("Merging data from sstable {}", sstable.descriptor.generation);
+            sstable.incrementReadCount();
+            try (UnfilteredRowIterator iter = StorageHook.instance.makeRowIterator(cfs, sstable, partitionKey(), filter.getSlices(metadata()), columnFilter(), filter.isReversed(), isForThrift()))
+            {
+                if (iter.isEmpty())
+                    continue;
+
+                if (sstable.isRepaired())
+                    onlyUnrepaired = false;
+                sstablesIterated++;
+                result = add(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, nowInSec()) : iter, result, filter, sstable.isRepaired());
+            }
+        }
+
+        cfs.metric.updateSSTableIterated(sstablesIterated);
+
+        if (result == null || result.isEmpty())
+            return EmptyIterators.unfilteredRow(metadata(), partitionKey(), false);
+
+        DecoratedKey key = result.partitionKey();
+        cfs.metric.samplers.get(TableMetrics.Sampler.READS).addSample(key.getKey(), key.hashCode(), 1);
+        StorageHook.instance.reportRead(cfs.metadata.cfId, partitionKey());
+
+        // "hoist up" the requested data into a more recent sstable
+        if (sstablesIterated > cfs.getMinimumCompactionThreshold()
+            && onlyUnrepaired
+            && !cfs.isAutoCompactionDisabled()
+            && cfs.getCompactionStrategyManager().shouldDefragment())
+        {
+            // !!WARNING!!   if we stop copying our data to a heap-managed object,
+            //               we will need to track the lifetime of this mutation as well
+            Tracing.trace("Defragmenting requested data");
+
+            try (UnfilteredRowIterator iter = result.unfilteredIterator(columnFilter(), Slices.ALL, false))
+            {
+                final Mutation mutation = new Mutation(PartitionUpdate.fromIterator(iter, columnFilter()));
+                StageManager.getStage(Stage.MUTATION).execute(() -> {
+                    // skipping commitlog and index updates is fine since we're just de-fragmenting existing data
+                    Keyspace.open(mutation.getKeyspaceName()).apply(mutation, false, false);
+                });
+            }
+        }
+
+        return withStateTracking(result.unfilteredIterator(columnFilter(), Slices.ALL, clusteringIndexFilter().isReversed()));
+    }
+
+    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, boolean isRepaired)
+    {
+        if (!isRepaired)
+            oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, iter.stats().minLocalDeletionTime);
+
+        int maxRows = Math.max(filter.requestedRows().size(), 1);
+        if (result == null)
+            return ImmutableBTreePartition.create(iter, maxRows);
+
+        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(Arrays.asList(iter, result.unfilteredIterator(columnFilter(), Slices.ALL, filter.isReversed())), nowInSec()))
+        {
+            return ImmutableBTreePartition.create(merged, maxRows);
+        }
+    }
+
+    private ClusteringIndexNamesFilter reduceFilter(ClusteringIndexNamesFilter filter, Partition result, long sstableTimestamp)
+    {
+        if (result == null)
+            return filter;
+
+        SearchIterator<Clustering, Row> searchIter = result.searchIterator(columnFilter(), false);
+
+        PartitionColumns columns = columnFilter().fetchedColumns();
+        NavigableSet<Clustering> clusterings = filter.requestedRows();
+
+        // We want to remove rows for which we have values for all requested columns. We have to deal with both static and regular rows.
+        // TODO: we could also remove a selected column if we've found values for every requested row but we'll leave
+        // that for later.
+
+        boolean removeStatic = false;
+        if (!columns.statics.isEmpty())
+        {
+            Row staticRow = searchIter.next(Clustering.STATIC_CLUSTERING);
+            removeStatic = staticRow != null && canRemoveRow(staticRow, columns.statics, sstableTimestamp);
+        }
+
+        NavigableSet<Clustering> toRemove = null;
+        for (Clustering clustering : clusterings)
+        {
+            if (!searchIter.hasNext())
+                break;
+
+            Row row = searchIter.next(clustering);
+            if (row == null || !canRemoveRow(row, columns.regulars, sstableTimestamp))
+                continue;
+
+            if (toRemove == null)
+                toRemove = new TreeSet<>(result.metadata().comparator);
+            toRemove.add(clustering);
+        }
+
+        if (!removeStatic && toRemove == null)
+            return filter;
+
+        // Check if we have everything we need
+        boolean hasNoMoreStatic = columns.statics.isEmpty() || removeStatic;
+        boolean hasNoMoreClusterings = clusterings.isEmpty() || (toRemove != null && toRemove.size() == clusterings.size());
+        if (hasNoMoreStatic && hasNoMoreClusterings)
+            return null;
+
+        if (toRemove != null)
+        {
+            BTreeSet.Builder<Clustering> newClusterings = BTreeSet.builder(result.metadata().comparator);
+            newClusterings.addAll(Sets.difference(clusterings, toRemove));
+            clusterings = newClusterings.build();
+        }
+        return new ClusteringIndexNamesFilter(clusterings, filter.isReversed());
+    }
+
+    private boolean canRemoveRow(Row row, Columns requestedColumns, long sstableTimestamp)
+    {
+        // We can remove a row if it has data that is more recent that the next sstable to consider for the data that the query
+        // cares about. And the data we care about is 1) the row timestamp (since every query cares if the row exists or not)
+        // and 2) the requested columns.
+        if (row.primaryKeyLivenessInfo().isEmpty() || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp)
+            return false;
+
+        for (ColumnDefinition column : requestedColumns)
+        {
+            Cell cell = row.getCell(column);
+            if (cell == null || cell.timestamp() <= sstableTimestamp)
+                return false;
+        }
+        return true;
+    }
 
     @Override
     public String toString()
@@ -417,7 +935,7 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
 
     public MessageOut<ReadCommand> createMessage(int version)
     {
-        return new MessageOut<>(MessagingService.Verb.READ, this, version < MessagingService.VERSION_30 ? legacyReadCommandSerializer : serializer);
+        return new MessageOut<>(MessagingService.Verb.READ, this, readSerializer);
     }
 
     protected void appendCQLWhereClause(StringBuilder sb)
@@ -453,11 +971,11 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
      */
     public static class Group implements ReadQuery
     {
-        public final List<SinglePartitionReadCommand<?>> commands;
+        public final List<SinglePartitionReadCommand> commands;
         private final DataLimits limits;
         private final int nowInSec;
 
-        public Group(List<SinglePartitionReadCommand<?>> commands, DataLimits limits)
+        public Group(List<SinglePartitionReadCommand> commands, DataLimits limits)
         {
             assert !commands.isEmpty();
             this.commands = commands;
@@ -467,14 +985,14 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
                 assert commands.get(i).nowInSec() == nowInSec;
         }
 
-        public static Group one(SinglePartitionReadCommand<?> command)
+        public static Group one(SinglePartitionReadCommand command)
         {
-            return new Group(Collections.<SinglePartitionReadCommand<?>>singletonList(command), command.limits());
+            return new Group(Collections.singletonList(command), command.limits());
         }
 
-        public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException
+        public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
         {
-            return StorageProxy.read(this, consistency, clientState);
+            return StorageProxy.read(this, consistency, clientState, queryStartNanoTime);
         }
 
         public int nowInSec()
@@ -501,12 +1019,35 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
 
         public PartitionIterator executeInternal(ReadExecutionController controller)
         {
-            List<PartitionIterator> partitions = new ArrayList<>(commands.size());
-            for (SinglePartitionReadCommand cmd : commands)
-                partitions.add(cmd.executeInternal(controller));
+            return limits.filter(UnfilteredPartitionIterators.filter(executeLocally(controller, false), nowInSec), nowInSec);
+        }
 
-            // Because we only have enforce the limit per command, we need to enforce it globally.
-            return limits.filter(PartitionIterators.concat(partitions), nowInSec);
+        public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
+        {
+            return executeLocally(executionController, true);
+        }
+
+        /**
+         * Implementation of {@link ReadQuery#executeLocally(ReadExecutionController)}.
+         *
+         * @param executionController - the {@code ReadExecutionController} protecting the read.
+         * @param sort - whether to sort the inner commands by partition key, required for merging the iterator
+         *               later on. This will be false when called by {@link ReadQuery#executeInternal(ReadExecutionController)}
+         *               because in this case it is safe to do so as there is no merging involved and we don't want to
+         *               change the old behavior which was to not sort by partition.
+         *
+         * @return - the iterator that can be used to retrieve the query result.
+         */
+        private UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController, boolean sort)
+        {
+            List<Pair<DecoratedKey, UnfilteredPartitionIterator>> partitions = new ArrayList<>(commands.size());
+            for (SinglePartitionReadCommand cmd : commands)
+                partitions.add(Pair.of(cmd.partitionKey, cmd.executeLocally(executionController)));
+
+            if (sort)
+                Collections.sort(partitions, (p1, p2) -> p1.getLeft().compareTo(p2.getLeft()));
+
+            return UnfilteredPartitionIterators.concat(partitions.stream().map(p -> p.getRight()).collect(Collectors.toList()));
         }
 
         public QueryPager getPager(PagingState pagingState, int protocolVersion)
@@ -539,12 +1080,9 @@ public abstract class SinglePartitionReadCommand<F extends ClusteringIndexFilter
         public ReadCommand deserialize(DataInputPlus in, int version, boolean isDigest, int digestVersion, boolean isForThrift, CFMetaData metadata, int nowInSec, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limits, Optional<IndexMetadata> index)
         throws IOException
         {
-            DecoratedKey key = metadata.decorateKey(metadata.getKeyValidator().readValue(in));
+            DecoratedKey key = metadata.decorateKey(metadata.getKeyValidator().readValue(in, DatabaseDescriptor.getMaxValueSize()));
             ClusteringIndexFilter filter = ClusteringIndexFilter.serializer.deserialize(in, version, metadata);
-            if (filter instanceof ClusteringIndexNamesFilter)
-                return new SinglePartitionNamesCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, key, (ClusteringIndexNamesFilter)filter);
-            else
-                return new SinglePartitionSliceCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, key, (ClusteringIndexSliceFilter)filter);
+            return new SinglePartitionReadCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, key, filter);
         }
     }
 }

@@ -29,16 +29,21 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.cql3.functions.*;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.thrift.ThriftConversion;
+import org.apache.cassandra.utils.*;
 
 import static java.lang.String.format;
 import static junit.framework.Assert.assertEquals;
+import static junit.framework.Assert.assertFalse;
 import static junit.framework.Assert.assertTrue;
 import static org.apache.cassandra.cql3.QueryProcessor.executeOnceInternal;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
@@ -63,8 +68,7 @@ public class LegacySchemaMigratorTest
     {
         CQLTester.cleanupAndLeaveDirs();
 
-        List<KeyspaceMetadata> expected = keyspaceToMigrate();
-        expected.sort((k1, k2) -> k1.name.compareTo(k2.name));
+        Keyspaces expected = keyspacesToMigrate();
 
         // write the keyspaces into the legacy tables
         expected.forEach(LegacySchemaMigratorTest::legacySerializeKeyspace);
@@ -73,8 +77,7 @@ public class LegacySchemaMigratorTest
         LegacySchemaMigrator.migrate();
 
         // read back all the metadata from the new schema tables
-        List<KeyspaceMetadata> actual = SchemaKeyspace.readSchemaFromSystemTables();
-        actual.sort((k1, k2) -> k1.name.compareTo(k2.name));
+        Keyspaces actual = SchemaKeyspace.fetchNonSystemKeyspaces();
 
         // need to load back CFMetaData of those tables (CFS instances will still be loaded)
         loadLegacySchemaTables();
@@ -82,18 +85,28 @@ public class LegacySchemaMigratorTest
         // verify that nothing's left in the old schema tables
         for (CFMetaData table : LegacySchemaMigrator.LegacySchemaTables)
         {
-            String query = format("SELECT * FROM %s.%s", SystemKeyspace.NAME, table.cfName);
+            String query = format("SELECT * FROM %s.%s", SchemaConstants.SYSTEM_KEYSPACE_NAME, table.cfName);
             //noinspection ConstantConditions
             assertTrue(executeOnceInternal(query).isEmpty());
         }
 
         // make sure that we've read *exactly* the same set of keyspaces/tables/types/functions
-        assertEquals(expected, actual);
+        assertEquals(expected.diff(actual).toString(), expected, actual);
+
+        // check that the build status of all indexes has been updated to use the new
+        // format of index name: the index_name column of system.IndexInfo used to
+        // contain table_name.index_name. Now it should contain just the index_name.
+        expected.forEach(LegacySchemaMigratorTest::verifyIndexBuildStatus);
+    }
+
+    private static FieldIdentifier field(String field)
+    {
+        return FieldIdentifier.forQuoted(field);
     }
 
     private static void loadLegacySchemaTables()
     {
-        KeyspaceMetadata systemKeyspace = Schema.instance.getKSMetaData(SystemKeyspace.NAME);
+        KeyspaceMetadata systemKeyspace = Schema.instance.getKSMetaData(SchemaConstants.SYSTEM_KEYSPACE_NAME);
 
         Tables systemTables = systemKeyspace.tables;
         for (CFMetaData table : LegacySchemaMigrator.LegacySchemaTables)
@@ -104,9 +117,9 @@ public class LegacySchemaMigratorTest
         Schema.instance.setKeyspaceMetadata(systemKeyspace.withSwapped(systemTables));
     }
 
-    private static List<KeyspaceMetadata> keyspaceToMigrate()
+    private static Keyspaces keyspacesToMigrate()
     {
-        List<KeyspaceMetadata> keyspaces = new ArrayList<>();
+        Keyspaces.Builder keyspaces = Keyspaces.builder();
 
         // A whole bucket of shorthand
         String ks1 = KEYSPACE_PREFIX + "Keyspace1";
@@ -247,6 +260,9 @@ public class LegacySchemaMigratorTest
                                                                            + "PRIMARY KEY((bar, baz), qux, quz) ) "
                                                                            + "WITH COMPACT STORAGE", ks_cql))));
 
+        // NTS keyspace
+        keyspaces.add(KeyspaceMetadata.create("nts", KeyspaceParams.nts("dc1", 1, "dc2", 2)));
+
         keyspaces.add(keyspaceWithDroppedCollections());
         keyspaces.add(keyspaceWithTriggers());
         keyspaces.add(keyspaceWithUDTs());
@@ -255,7 +271,7 @@ public class LegacySchemaMigratorTest
         keyspaces.add(keyspaceWithUDAs());
         keyspaces.add(keyspaceWithUDAsAndUDTs());
 
-        return keyspaces;
+        return keyspaces.build();
     }
 
     private static KeyspaceMetadata keyspaceWithDroppedCollections()
@@ -277,7 +293,7 @@ public class LegacySchemaMigratorTest
         for (String name : collectionColumnNames)
         {
             ColumnDefinition column = table.getColumnDefinition(bytes(name));
-            table.recordColumnDrop(column);
+            table.recordColumnDrop(column, FBUtilities.timestampMicros());
             table.removeColumnDefinition(column);
         }
 
@@ -303,18 +319,21 @@ public class LegacySchemaMigratorTest
 
         UserType udt1 = new UserType(keyspace,
                                      bytes("udt1"),
-                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
-                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }});
+                                     new ArrayList<FieldIdentifier>() {{ add(field("col1")); add(field("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }},
+                                     true);
 
         UserType udt2 = new UserType(keyspace,
                                      bytes("udt2"),
-                                     new ArrayList<ByteBuffer>() {{ add(bytes("col3")); add(bytes("col4")); }},
-                                     new ArrayList<AbstractType<?>>() {{ add(BytesType.instance); add(BooleanType.instance); }});
+                                     new ArrayList<FieldIdentifier>() {{ add(field("col3")); add(field("col4")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(BytesType.instance); add(BooleanType.instance); }},
+                                     true);
 
         UserType udt3 = new UserType(keyspace,
                                      bytes("udt3"),
-                                     new ArrayList<ByteBuffer>() {{ add(bytes("col5")); }},
-                                     new ArrayList<AbstractType<?>>() {{ add(AsciiType.instance); }});
+                                     new ArrayList<FieldIdentifier>() {{ add(field("col5")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(AsciiType.instance); }},
+                                     true);
 
         return KeyspaceMetadata.create(keyspace,
                                        KeyspaceParams.simple(1),
@@ -423,13 +442,15 @@ public class LegacySchemaMigratorTest
 
         UserType udt1 = new UserType(keyspace,
                                      bytes("udt1"),
-                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
-                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }});
+                                     new ArrayList<FieldIdentifier>() {{ add(field("col1")); add(field("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }},
+                                     true);
 
         UserType udt2 = new UserType(keyspace,
                                      bytes("udt2"),
-                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
-                                     new ArrayList<AbstractType<?>>() {{ add(ListType.getInstance(udt1, false)); add(Int32Type.instance); }});
+                                     new ArrayList<FieldIdentifier>() {{ add(field("col1")); add(field("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(ListType.getInstance(udt1, false)); add(Int32Type.instance); }},
+                                     true);
 
         UDFunction udf1 = UDFunction.create(new FunctionName(keyspace, "udf"),
                                             ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
@@ -470,13 +491,15 @@ public class LegacySchemaMigratorTest
 
         UserType udt1 = new UserType(keyspace,
                                      bytes("udt1"),
-                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
-                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }});
+                                     new ArrayList<FieldIdentifier>() {{ add(field("col1")); add(field("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(UTF8Type.instance); add(Int32Type.instance); }},
+                                     true);
 
         UserType udt2 = new UserType(keyspace,
                                      bytes("udt2"),
-                                     new ArrayList<ByteBuffer>() {{ add(bytes("col1")); add(bytes("col2")); }},
-                                     new ArrayList<AbstractType<?>>() {{ add(ListType.getInstance(udt1, false)); add(Int32Type.instance); }});
+                                     new ArrayList<FieldIdentifier>() {{ add(field("col1")); add(field("col2")); }},
+                                     new ArrayList<AbstractType<?>>() {{ add(ListType.getInstance(udt1, false)); add(Int32Type.instance); }},
+                                     true);
 
         UDFunction udf1 = UDFunction.create(new FunctionName(keyspace, "udf1"),
                                             ImmutableList.of(new ColumnIdentifier("col1", false), new ColumnIdentifier("col2", false)),
@@ -513,13 +536,17 @@ public class LegacySchemaMigratorTest
                                               null
         );
 
+        ByteBuffer twoNullEntries = ByteBuffer.allocate(8);
+        twoNullEntries.putInt(-1);
+        twoNullEntries.putInt(-1);
+        twoNullEntries.flip();
         UDAggregate uda2 = UDAggregate.create(udfs, new FunctionName(keyspace, "uda2"),
                                               ImmutableList.of(udf2.argTypes().get(1)),
                                               udf3.returnType(),
                                               udf2.name(),
                                               udf3.name(),
                                               udf2.argTypes().get(0),
-                                              LongType.instance.decompose(0L)
+                                              twoNullEntries
         );
 
         return KeyspaceMetadata.create(keyspace,
@@ -537,37 +564,43 @@ public class LegacySchemaMigratorTest
     private static void legacySerializeKeyspace(KeyspaceMetadata keyspace)
     {
         makeLegacyCreateKeyspaceMutation(keyspace, TIMESTAMP).apply();
+        setLegacyIndexStatus(keyspace);
+    }
+
+    private static DecoratedKey decorate(CFMetaData metadata, Object value)
+    {
+        return metadata.decorateKey(((AbstractType)metadata.getKeyValidator()).decompose(value));
     }
 
     private static Mutation makeLegacyCreateKeyspaceMutation(KeyspaceMetadata keyspace, long timestamp)
     {
-        // Note that because Keyspaces is a COMPACT TABLE, we're really only setting static columns internally and shouldn't set any clustering.
-        RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyKeyspaces, timestamp, keyspace.name);
+        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(SchemaConstants.SYSTEM_KEYSPACE_NAME, decorate(SystemKeyspace.LegacyKeyspaces, keyspace.name))
+                                                 .timestamp(timestamp);
 
-        adder.add("durable_writes", keyspace.params.durableWrites)
-             .add("strategy_class", keyspace.params.replication.klass.getName())
-             .add("strategy_options", json(keyspace.params.replication.options));
+        builder.update(SystemKeyspace.LegacyKeyspaces)
+               .row()
+               .add("durable_writes", keyspace.params.durableWrites)
+               .add("strategy_class", keyspace.params.replication.klass.getName())
+               .add("strategy_options", json(keyspace.params.replication.options));
 
-        Mutation mutation = adder.build();
+        keyspace.tables.forEach(table -> addTableToSchemaMutation(table, true, builder));
+        keyspace.types.forEach(type -> addTypeToSchemaMutation(type, builder));
+        keyspace.functions.udfs().forEach(udf -> addFunctionToSchemaMutation(udf, builder));
+        keyspace.functions.udas().forEach(uda -> addAggregateToSchemaMutation(uda, builder));
 
-        keyspace.tables.forEach(table -> addTableToSchemaMutation(table, timestamp, true, mutation));
-        keyspace.types.forEach(type -> addTypeToSchemaMutation(type, timestamp, mutation));
-        keyspace.functions.udfs().forEach(udf -> addFunctionToSchemaMutation(udf, timestamp, mutation));
-        keyspace.functions.udas().forEach(uda -> addAggregateToSchemaMutation(uda, timestamp, mutation));
-
-        return mutation;
+        return builder.build();
     }
 
     /*
      * Serializing tables
      */
 
-    private static void addTableToSchemaMutation(CFMetaData table, long timestamp, boolean withColumnsAndTriggers, Mutation mutation)
+    private static void addTableToSchemaMutation(CFMetaData table, boolean withColumnsAndTriggers, Mutation.SimpleBuilder builder)
     {
         // For property that can be null (and can be changed), we insert tombstones, to make sure
         // we don't keep a property the user has removed
-        RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyColumnfamilies, timestamp, mutation)
-                                 .clustering(table.cfName);
+        Row.SimpleBuilder adder = builder.update(SystemKeyspace.LegacyColumnfamilies)
+                                         .row(table.cfName);
 
         adder.add("cf_id", table.cfId)
              .add("type", table.isSuper() ? "Super" : "Standard");
@@ -600,12 +633,14 @@ public class LegacySchemaMigratorTest
              .add("read_repair_chance", table.params.readRepairChance)
              .add("speculative_retry", table.params.speculativeRetry.toString());
 
+        Map<String, Long> dropped = new HashMap<>();
         for (Map.Entry<ByteBuffer, CFMetaData.DroppedColumn> entry : table.getDroppedColumns().entrySet())
         {
             String name = UTF8Type.instance.getString(entry.getKey());
             CFMetaData.DroppedColumn column = entry.getValue();
-            adder.addMapEntry("dropped_columns", name, column.droppedTime);
+            dropped.put(name, column.droppedTime);
         }
+        adder.add("dropped_columns", dropped);
 
         adder.add("is_dense", table.isDense());
 
@@ -614,13 +649,11 @@ public class LegacySchemaMigratorTest
         if (withColumnsAndTriggers)
         {
             for (ColumnDefinition column : table.allColumns())
-                addColumnToSchemaMutation(table, column, timestamp, mutation);
+                addColumnToSchemaMutation(table, column, builder);
 
             for (TriggerMetadata trigger : table.getTriggers())
-                addTriggerToSchemaMutation(table, trigger, timestamp, mutation);
+                addTriggerToSchemaMutation(table, trigger, builder);
         }
-
-        adder.build();
     }
 
     private static String cachingToString(CachingParams caching)
@@ -630,18 +663,18 @@ public class LegacySchemaMigratorTest
                       caching.rowsPerPartitionAsString());
     }
 
-    private static void addColumnToSchemaMutation(CFMetaData table, ColumnDefinition column, long timestamp, Mutation mutation)
+    private static void addColumnToSchemaMutation(CFMetaData table, ColumnDefinition column, Mutation.SimpleBuilder builder)
     {
         // We need to special case pk-only dense tables. See CASSANDRA-9874.
         String name = table.isDense() && column.kind == ColumnDefinition.Kind.REGULAR && column.type instanceof EmptyType
                     ? ""
                     : column.name.toString();
 
-        final RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyColumns, timestamp, mutation).clustering(table.cfName, name);
+        final Row.SimpleBuilder adder = builder.update(SystemKeyspace.LegacyColumns).row(table.cfName, name);
 
         adder.add("validator", column.type.toString())
              .add("type", serializeKind(column.kind, table.isDense()))
-             .add("component_index", column.isOnAllComponents() ? null : column.position());
+             .add("component_index", column.position());
 
         Optional<IndexMetadata> index = findIndexForColumn(table.getIndexes(), table, column);
         if (index.isPresent())
@@ -657,8 +690,6 @@ public class LegacySchemaMigratorTest
             adder.add("index_type", null);
             adder.add("index_options", null);
         }
-
-        adder.build();
     }
 
     private static Optional<IndexMetadata> findIndexForColumn(Indexes indexes,
@@ -669,7 +700,7 @@ public class LegacySchemaMigratorTest
         // index targets can be parsed by CassandraIndex.parseTarget
         // which should be true for any pre-3.0 index
         for (IndexMetadata index : indexes)
-          if (CassandraIndex.parseTarget(table, index).left.equals(column))
+          if (TargetParser.parse(table, index).left.equals(column))
                 return Optional.of(index);
 
         return Optional.empty();
@@ -687,71 +718,67 @@ public class LegacySchemaMigratorTest
         return kind.toString().toLowerCase();
     }
 
-    private static void addTriggerToSchemaMutation(CFMetaData table, TriggerMetadata trigger, long timestamp, Mutation mutation)
+    private static void addTriggerToSchemaMutation(CFMetaData table, TriggerMetadata trigger, Mutation.SimpleBuilder builder)
     {
-        new RowUpdateBuilder(SystemKeyspace.LegacyTriggers, timestamp, mutation)
-            .clustering(table.cfName, trigger.name)
-            .addMapEntry("trigger_options", "class", trigger.classOption)
-            .build();
+        builder.update(SystemKeyspace.LegacyTriggers)
+               .row(table.cfName, trigger.name)
+               .add("trigger_options", Collections.singletonMap("class", trigger.classOption));
     }
 
     /*
      * Serializing types
      */
 
-    private static void addTypeToSchemaMutation(UserType type, long timestamp, Mutation mutation)
+    private static void addTypeToSchemaMutation(UserType type, Mutation.SimpleBuilder builder)
     {
-        RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyUsertypes, timestamp, mutation)
-                                 .clustering(type.getNameAsString());
+        Row.SimpleBuilder adder = builder.update(SystemKeyspace.LegacyUsertypes)
+                                         .row(type.getNameAsString());
 
-        adder.resetCollection("field_names")
-             .resetCollection("field_types");
-
+        List<String> names = new ArrayList<>();
+        List<String> types = new ArrayList<>();
         for (int i = 0; i < type.size(); i++)
         {
-            adder.addListEntry("field_names", type.fieldName(i))
-                 .addListEntry("field_types", type.fieldType(i).toString());
+            names.add(type.fieldName(i).toString());
+            types.add(type.fieldType(i).toString());
         }
 
-        adder.build();
+        adder.add("field_names", names)
+             .add("field_types", types);
     }
 
     /*
      * Serializing functions
      */
 
-    private static void addFunctionToSchemaMutation(UDFunction function, long timestamp, Mutation mutation)
+    private static void addFunctionToSchemaMutation(UDFunction function, Mutation.SimpleBuilder builder)
     {
-        RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyFunctions, timestamp, mutation)
-                                 .clustering(function.name().name, functionSignatureWithTypes(function));
+        Row.SimpleBuilder adder = builder.update(SystemKeyspace.LegacyFunctions)
+                                         .row(function.name().name, functionSignatureWithTypes(function));
 
         adder.add("body", function.body())
              .add("language", function.language())
              .add("return_type", function.returnType().toString())
              .add("called_on_null_input", function.isCalledOnNullInput());
 
-        adder.resetCollection("argument_names")
-             .resetCollection("argument_types");
-
+        List<ByteBuffer> names = new ArrayList<>();
+        List<String> types = new ArrayList<>();
         for (int i = 0; i < function.argNames().size(); i++)
         {
-            adder.addListEntry("argument_names", function.argNames().get(i).bytes)
-                 .addListEntry("argument_types", function.argTypes().get(i).toString());
+            names.add(function.argNames().get(i).bytes);
+            types.add(function.argTypes().get(i).toString());
         }
-
-        adder.build();
+        adder.add("argument_names", names)
+             .add("argument_types", types);
     }
 
     /*
      * Serializing aggregates
      */
 
-    private static void addAggregateToSchemaMutation(UDAggregate aggregate, long timestamp, Mutation mutation)
+    private static void addAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
     {
-        RowUpdateBuilder adder = new RowUpdateBuilder(SystemKeyspace.LegacyAggregates, timestamp, mutation)
-                                 .clustering(aggregate.name().name, functionSignatureWithTypes(aggregate));
-
-        adder.resetCollection("argument_types");
+        Row.SimpleBuilder adder = builder.update(SystemKeyspace.LegacyAggregates)
+                                 .row(aggregate.name().name, functionSignatureWithTypes(aggregate));
 
         adder.add("return_type", aggregate.returnType().toString())
              .add("state_func", aggregate.stateFunction().name().name);
@@ -763,10 +790,11 @@ public class LegacySchemaMigratorTest
         if (aggregate.initialCondition() != null)
             adder.add("initcond", aggregate.initialCondition());
 
+        List<String> types = new ArrayList<>();
         for (AbstractType<?> argType : aggregate.argTypes())
-            adder.addListEntry("argument_types", argType.toString());
+            types.add(argType.toString());
 
-        adder.build();
+        adder.add("argument_types", types);
     }
 
     // We allow method overloads, so a function is not uniquely identified by its name only, but
@@ -782,4 +810,36 @@ public class LegacySchemaMigratorTest
 
         return ListType.getInstance(UTF8Type.instance, false).decompose(arguments);
     }
+
+    private static void setLegacyIndexStatus(KeyspaceMetadata keyspace)
+    {
+        keyspace.tables.forEach(LegacySchemaMigratorTest::setLegacyIndexStatus);
+    }
+
+    private static void setLegacyIndexStatus(CFMetaData table)
+    {
+        table.getIndexes().forEach((index) -> setLegacyIndexStatus(table.ksName, table.cfName, index));
+    }
+
+    private static void setLegacyIndexStatus(String keyspace, String table, IndexMetadata index)
+    {
+        SystemKeyspace.setIndexBuilt(keyspace, table + '.' + index.name);
+    }
+
+    private static void verifyIndexBuildStatus(KeyspaceMetadata keyspace)
+    {
+        keyspace.tables.forEach(LegacySchemaMigratorTest::verifyIndexBuildStatus);
+    }
+
+    private static void verifyIndexBuildStatus(CFMetaData table)
+    {
+        table.getIndexes().forEach(index -> verifyIndexBuildStatus(table.ksName, table.cfName, index));
+    }
+
+    private static void verifyIndexBuildStatus(String keyspace, String table, IndexMetadata index)
+    {
+        assertFalse(SystemKeyspace.isIndexBuilt(keyspace, table + '.' + index.name));
+        assertTrue(SystemKeyspace.isIndexBuilt(keyspace, index.name));
+    }
+
 }

@@ -27,7 +27,7 @@ import java.util.*;
 import com.google.common.base.Splitter;
 
 import org.apache.cassandra.auth.PasswordAuthenticator;
-import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -69,7 +69,8 @@ public class Client extends SimpleClient
             System.out.print(">> ");
             System.out.flush();
             String line = in.readLine();
-            if (line == null) {
+            if (line == null)
+            {
                 break;
             }
             Message.Request req = parseLine(line.trim());
@@ -238,7 +239,7 @@ public class Client extends SimpleClient
 
     public static void main(String[] args) throws Exception
     {
-        Config.setClientMode(true);
+        DatabaseDescriptor.clientInitialization();
 
         // Print usage if no argument is specified.
         if (args.length < 2 || args.length > 3)

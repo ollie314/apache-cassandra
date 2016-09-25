@@ -24,7 +24,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.tracing.TraceState;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.config.DatabaseDescriptor.*;
@@ -39,7 +38,7 @@ public class StageManager
 {
     private static final Logger logger = LoggerFactory.getLogger(StageManager.class);
 
-    private static final EnumMap<Stage, TracingAwareExecutorService> stages = new EnumMap<Stage, TracingAwareExecutorService>(Stage.class);
+    private static final EnumMap<Stage, LocalAwareExecutorService> stages = new EnumMap<Stage, LocalAwareExecutorService>(Stage.class);
 
     public static final long KEEPALIVE = 60; // seconds to keep "extra" threads alive for when idle
 
@@ -60,7 +59,7 @@ public class StageManager
         stages.put(Stage.TRACING, tracingExecutor());
     }
 
-    private static ExecuteOnlyExecutor tracingExecutor()
+    private static LocalAwareExecutorService tracingExecutor()
     {
         RejectedExecutionHandler reh = new RejectedExecutionHandler()
         {
@@ -69,13 +68,13 @@ public class StageManager
                 MessagingService.instance().incrementDroppedMessages(MessagingService.Verb._TRACE);
             }
         };
-        return new ExecuteOnlyExecutor(1,
-                                       1,
-                                       KEEPALIVE,
-                                       TimeUnit.SECONDS,
-                                       new ArrayBlockingQueue<Runnable>(1000),
-                                       new NamedThreadFactory(Stage.TRACING.getJmxName()),
-                                       reh);
+        return new TracingExecutor(1,
+                                   1,
+                                   KEEPALIVE,
+                                   TimeUnit.SECONDS,
+                                   new ArrayBlockingQueue<Runnable>(1000),
+                                   new NamedThreadFactory(Stage.TRACING.getJmxName()),
+                                   reh);
     }
 
     private static JMXEnabledThreadPoolExecutor multiThreadedStage(Stage stage, int numThreads)
@@ -88,7 +87,7 @@ public class StageManager
                                                 stage.getJmxType());
     }
 
-    private static TracingAwareExecutorService multiThreadedLowSignalStage(Stage stage, int numThreads)
+    private static LocalAwareExecutorService multiThreadedLowSignalStage(Stage stage, int numThreads)
     {
         return SharedExecutorPool.SHARED.newExecutor(numThreads, Integer.MAX_VALUE, stage.getJmxType(), stage.getJmxName());
     }
@@ -97,7 +96,7 @@ public class StageManager
      * Retrieve a stage from the StageManager
      * @param stage name of the stage to be retrieved.
      */
-    public static TracingAwareExecutorService getStage(Stage stage)
+    public static LocalAwareExecutorService getStage(Stage stage)
     {
         return stages.get(stage);
     }
@@ -114,43 +113,24 @@ public class StageManager
     }
 
     /**
-     * A TPE that disallows submit so that we don't need to worry about unwrapping exceptions on the
-     * tracing stage.  See CASSANDRA-1123 for background.
+     * The executor used for tracing.
      */
-    private static class ExecuteOnlyExecutor extends ThreadPoolExecutor implements TracingAwareExecutorService
+    private static class TracingExecutor extends ThreadPoolExecutor implements LocalAwareExecutorService
     {
-        public ExecuteOnlyExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory, RejectedExecutionHandler handler)
+        public TracingExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory, RejectedExecutionHandler handler)
         {
             super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, handler);
         }
 
-        public void execute(Runnable command, TraceState state)
+        public void execute(Runnable command, ExecutorLocals locals)
         {
-            assert state == null;
+            assert locals == null;
             super.execute(command);
         }
 
         public void maybeExecuteImmediately(Runnable command)
         {
             execute(command);
-        }
-
-        @Override
-        public Future<?> submit(Runnable task)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public <T> Future<T> submit(Runnable task, T result)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public <T> Future<T> submit(Callable<T> task)
-        {
-            throw new UnsupportedOperationException();
         }
     }
 }

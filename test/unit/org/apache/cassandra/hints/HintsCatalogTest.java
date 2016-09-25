@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.util.*;
 
+import com.google.common.collect.ImmutableMap;
 import org.junit.Test;
 
 import static junit.framework.Assert.*;
@@ -62,7 +63,7 @@ public class HintsCatalogTest
         writeDescriptor(directory, descriptor3);
         writeDescriptor(directory, descriptor4);
 
-        HintsCatalog catalog = HintsCatalog.load(directory);
+        HintsCatalog catalog = HintsCatalog.load(directory, ImmutableMap.of());
         assertEquals(2, catalog.stores().count());
 
         HintsStore store1 = catalog.get(hostId1);
@@ -76,6 +77,37 @@ public class HintsCatalogTest
         assertEquals(descriptor3, store2.poll());
         assertEquals(descriptor2, store2.poll());
         assertNull(store2.poll());
+    }
+
+    @Test
+    public void deleteHintsTest() throws IOException
+    {
+        File directory = Files.createTempDirectory(null).toFile();
+        UUID hostId1 = UUID.randomUUID();
+        UUID hostId2 = UUID.randomUUID();
+        long now = System.currentTimeMillis();
+        writeDescriptor(directory, new HintsDescriptor(hostId1, now));
+        writeDescriptor(directory, new HintsDescriptor(hostId1, now+1));
+        writeDescriptor(directory, new HintsDescriptor(hostId2, now+2));
+        writeDescriptor(directory, new HintsDescriptor(hostId2, now+3));
+
+        // load catalog containing two stores (one for each host)
+        HintsCatalog catalog = HintsCatalog.load(directory, ImmutableMap.of());
+        assertEquals(2, catalog.stores().count());
+        assertTrue(catalog.hasFiles());
+
+        // delete all hints from store 1
+        assertTrue(catalog.get(hostId1).hasFiles());
+        catalog.deleteAllHints(hostId1);
+        assertFalse(catalog.get(hostId1).hasFiles());
+        // stores are still keepts for each host, even after deleting hints
+        assertEquals(2, catalog.stores().count());
+        assertTrue(catalog.hasFiles());
+
+        // delete all hints from all stores
+        catalog.deleteAllHints();
+        assertEquals(2, catalog.stores().count());
+        assertFalse(catalog.hasFiles());
     }
 
     @SuppressWarnings("EmptyTryBlock")

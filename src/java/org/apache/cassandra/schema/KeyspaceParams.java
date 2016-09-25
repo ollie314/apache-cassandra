@@ -19,6 +19,7 @@ package org.apache.cassandra.schema;
 
 import java.util.Map;
 
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 
 /**
@@ -69,6 +70,11 @@ public final class KeyspaceParams
         return new KeyspaceParams(false, ReplicationParams.simple(replicationFactor));
     }
 
+    public static KeyspaceParams nts(Object... args)
+    {
+        return new KeyspaceParams(true, ReplicationParams.nts(args));
+    }
+
     public void validate(String name)
     {
         replication.validate(name);
@@ -97,9 +103,9 @@ public final class KeyspaceParams
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this)
-                      .add(Option.DURABLE_WRITES.toString(), durableWrites)
-                      .add(Option.REPLICATION.toString(), replication)
-                      .toString();
+        return MoreObjects.toStringHelper(this)
+                          .add(Option.DURABLE_WRITES.toString(), durableWrites)
+                          .add(Option.REPLICATION.toString(), replication)
+                          .toString();
     }
 }

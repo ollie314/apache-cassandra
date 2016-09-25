@@ -49,7 +49,6 @@ import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.Memory;
 import org.apache.cassandra.io.util.SafeMemory;
 import org.apache.cassandra.schema.CompressionParams;
@@ -241,6 +240,36 @@ public class CompressionMetadata
     }
 
     /**
+     * @param sections Collection of sections in uncompressed file. Should not contain sections that overlap each other.
+     * @return Total chunk size in bytes for given sections including checksum.
+     */
+    public long getTotalSizeForSections(Collection<Pair<Long, Long>> sections)
+    {
+        long size = 0;
+        long lastOffset = -1;
+        for (Pair<Long, Long> section : sections)
+        {
+            int startIndex = (int) (section.left / parameters.chunkLength());
+            int endIndex = (int) (section.right / parameters.chunkLength());
+            endIndex = section.right % parameters.chunkLength() == 0 ? endIndex - 1 : endIndex;
+            for (int i = startIndex; i <= endIndex; i++)
+            {
+                long offset = i * 8L;
+                long chunkOffset = chunkOffsets.getLong(offset);
+                if (chunkOffset > lastOffset)
+                {
+                    lastOffset = chunkOffset;
+                    long nextChunkOffset = offset + 8 == chunkOffsetsSize
+                                                   ? compressedFileLength
+                                                   : chunkOffsets.getLong(offset + 8);
+                    size += (nextChunkOffset - chunkOffset);
+                }
+            }
+        }
+        return size;
+    }
+
+    /**
      * @param sections Collection of sections in uncompressed file
      * @return Array of chunks which corresponds to given sections of uncompressed file, sorted by chunk offset
      */
@@ -357,11 +386,15 @@ public class CompressionMetadata
             }
 
             // flush the data to disk
-            try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(filePath))))
+            try (FileOutputStream fos = new FileOutputStream(filePath);
+                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(fos)))
             {
                 writeHeader(out, dataLength, count);
-                for (int i = 0 ; i < count ; i++)
+                for (int i = 0; i < count; i++)
                     out.writeLong(offsets.getLong(i * 8L));
+
+                out.flush();
+                fos.getFD().sync();
             }
             catch (IOException e)
             {

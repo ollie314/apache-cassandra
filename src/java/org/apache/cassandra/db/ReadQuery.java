@@ -40,14 +40,19 @@ public interface ReadQuery
             return ReadExecutionController.empty();
         }
 
-        public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException
+        public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
         {
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
         }
 
         public PartitionIterator executeInternal(ReadExecutionController controller)
         {
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
+        }
+
+        public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
+        {
+            return EmptyIterators.unfilteredPartition(executionController.metaData(), false);
         }
 
         public DataLimits limits()
@@ -59,11 +64,6 @@ public interface ReadQuery
         }
 
         public QueryPager getPager(PagingState state, int protocolVersion)
-        {
-            return QueryPager.EMPTY;
-        }
-
-        public QueryPager getLocalPager()
         {
             return QueryPager.EMPTY;
         }
@@ -99,7 +99,7 @@ public interface ReadQuery
      *
      * @return the result of the query.
      */
-    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState) throws RequestExecutionException;
+    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException;
 
     /**
      * Execute the query for internal queries (that is, it basically executes the query locally).
@@ -108,6 +108,15 @@ public interface ReadQuery
      * @return the result of the query.
      */
     public PartitionIterator executeInternal(ReadExecutionController controller);
+
+    /**
+     * Execute the query locally. This is similar to {@link ReadQuery#executeInternal(ReadExecutionController)}
+     * but it returns an unfiltered partition iterator that can be merged later on.
+     *
+     * @param controller the {@code ReadExecutionController} protecting the read.
+     * @return the result of the read query.
+     */
+    public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController);
 
     /**
      * Returns a pager for the query.

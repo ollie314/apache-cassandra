@@ -29,18 +29,24 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.db.marshal.IntegerType;
-import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
 public class CellTest
 {
+    static
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     private static final String KEYSPACE1 = "CellTest";
     private static final String CF_STANDARD1 = "Standard1";
     private static final String CF_COLLECTION = "Collection1";
@@ -58,6 +64,16 @@ public class CellTest
     {
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1, KeyspaceParams.simple(1), cfm, cfm2);
+    }
+
+    private static ColumnDefinition fakeColumn(String name, AbstractType<?> type)
+    {
+        return new ColumnDefinition("fakeKs",
+                                    "fakeTable",
+                                    ColumnIdentifier.getInterned(name, false),
+                                    type,
+                                    ColumnDefinition.NO_POSITION,
+                                    ColumnDefinition.Kind.REGULAR);
     }
 
     @Test
@@ -81,6 +97,67 @@ public class CellTest
                 Assert.assertNotSame(b, a);
             }
         }
+    }
+
+    private void assertValid(Cell cell)
+    {
+        try
+        {
+            cell.validate();
+        }
+        catch (Exception e)
+        {
+            Assert.fail("Cell should be valid but got error: " + e);
+        }
+    }
+
+    private void assertInvalid(Cell cell)
+    {
+        try
+        {
+            cell.validate();
+            Assert.fail("Cell " + cell + " should be invalid");
+        }
+        catch (MarshalException e)
+        {
+            // Note that we shouldn't get anything else than a MarshalException so let other escape and fail the test
+        }
+    }
+
+    @Test
+    public void testValidate()
+    {
+        ColumnDefinition c;
+
+        // Valid cells
+        c = fakeColumn("c", Int32Type.instance);
+        assertValid(BufferCell.live(c, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+        assertValid(BufferCell.live(c, 0, ByteBufferUtil.bytes(4)));
+
+        assertValid(BufferCell.expiring(c, 0, 4, 4, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+        assertValid(BufferCell.expiring(c, 0, 4, 4, ByteBufferUtil.bytes(4)));
+
+        assertValid(BufferCell.tombstone(c, 0, 4));
+
+        // Invalid value (we don't all empty values for smallint)
+        c = fakeColumn("c", ShortType.instance);
+        assertInvalid(BufferCell.live(c, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+        // But this should be valid even though the underlying value is an empty BB (catches bug #11618)
+        assertValid(BufferCell.tombstone(c, 0, 4));
+        // And of course, this should be valid with a proper value
+        assertValid(BufferCell.live(c, 0, ByteBufferUtil.bytes((short)4)));
+
+        // Invalid ttl
+        assertInvalid(BufferCell.expiring(c, 0, -4, 4, ByteBufferUtil.bytes(4)));
+        // Invalid local deletion times
+        assertInvalid(BufferCell.expiring(c, 0, 4, -4, ByteBufferUtil.bytes(4)));
+        assertInvalid(BufferCell.expiring(c, 0, 4, Cell.NO_DELETION_TIME, ByteBufferUtil.bytes(4)));
+
+        c = fakeColumn("c", MapType.getInstance(Int32Type.instance, Int32Type.instance, true));
+        // Valid cell path
+        assertValid(BufferCell.live(c, 0, ByteBufferUtil.bytes(4), CellPath.create(ByteBufferUtil.bytes(4))));
+        // Invalid cell path (int values should be 0 or 4 bytes)
+        assertInvalid(BufferCell.live(c, 0, ByteBufferUtil.bytes(4), CellPath.create(ByteBufferUtil.bytes((long)4))));
     }
 
     @Test
@@ -114,15 +191,15 @@ public class CellTest
         long ts1 = now1*1000000;
 
 
-        Cell r1m1 = BufferCell.live(cfm2, m, ts1, bb(1), CellPath.create(bb(1)));
-        Cell r1m2 = BufferCell.live(cfm2, m, ts1, bb(2), CellPath.create(bb(2)));
+        Cell r1m1 = BufferCell.live(m, ts1, bb(1), CellPath.create(bb(1)));
+        Cell r1m2 = BufferCell.live(m, ts1, bb(2), CellPath.create(bb(2)));
         List<Cell> cells1 = Lists.newArrayList(r1m1, r1m2);
 
         int now2 = now1 + 1;
         long ts2 = now2*1000000;
-        Cell r2m2 = BufferCell.live(cfm2, m, ts2, bb(1), CellPath.create(bb(2)));
-        Cell r2m3 = BufferCell.live(cfm2, m, ts2, bb(2), CellPath.create(bb(3)));
-        Cell r2m4 = BufferCell.live(cfm2, m, ts2, bb(3), CellPath.create(bb(4)));
+        Cell r2m2 = BufferCell.live(m, ts2, bb(1), CellPath.create(bb(2)));
+        Cell r2m3 = BufferCell.live(m, ts2, bb(2), CellPath.create(bb(3)));
+        Cell r2m4 = BufferCell.live(m, ts2, bb(3), CellPath.create(bb(4)));
         List<Cell> cells2 = Lists.newArrayList(r2m2, r2m3, r2m4);
 
         RowBuilder builder = new RowBuilder();
@@ -152,7 +229,7 @@ public class CellTest
     private Cell regular(CFMetaData cfm, String columnName, String value, long timestamp)
     {
         ColumnDefinition cdef = cfm.getColumnDefinition(ByteBufferUtil.bytes(columnName));
-        return BufferCell.live(cfm, cdef, timestamp, ByteBufferUtil.bytes(value));
+        return BufferCell.live(cdef, timestamp, ByteBufferUtil.bytes(value));
     }
 
     private Cell expiring(CFMetaData cfm, String columnName, String value, long timestamp, int localExpirationTime)

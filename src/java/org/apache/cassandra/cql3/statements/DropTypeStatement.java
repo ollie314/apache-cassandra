@@ -35,7 +35,6 @@ public class DropTypeStatement extends SchemaAlteringStatement
 
     public DropTypeStatement(UTName name, boolean ifExists)
     {
-        super();
         this.name = name;
         this.ifExists = ifExists;
     }
@@ -56,7 +55,12 @@ public class DropTypeStatement extends SchemaAlteringStatement
     {
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
         if (ksm == null)
-            throw new InvalidRequestException(String.format("Cannot drop type in unknown keyspace %s", name.getKeyspace()));
+        {
+            if (ifExists)
+                return;
+            else
+                throw new InvalidRequestException(String.format("Cannot drop type in unknown keyspace %s", name.getKeyspace()));
+        }
 
         if (!ksm.types.get(name.getUserTypeName()).isPresent())
         {
@@ -75,58 +79,22 @@ public class DropTypeStatement extends SchemaAlteringStatement
 
         for (Function function : ksm.functions)
         {
-            if (isUsedBy(function.returnType()))
+            if (function.returnType().referencesUserType(name.getStringTypeName()))
                 throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by function %s", name, function));
 
             for (AbstractType<?> argType : function.argTypes())
-                if (isUsedBy(argType))
+                if (argType.referencesUserType(name.getStringTypeName()))
                     throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by function %s", name, function));
         }
 
         for (UserType ut : ksm.types)
-            if (!ut.name.equals(name.getUserTypeName()) && isUsedBy(ut))
-                throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by user type %s", name, ut.asCQL3Type()));
+            if (!ut.name.equals(name.getUserTypeName()) && ut.referencesUserType(name.getStringTypeName()))
+                throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by user type %s", name, ut.getNameAsString()));
 
         for (CFMetaData cfm : ksm.tablesAndViews())
             for (ColumnDefinition def : cfm.allColumns())
-                if (isUsedBy(def.type))
+                if (def.type.referencesUserType(name.getStringTypeName()))
                     throw new InvalidRequestException(String.format("Cannot drop user type %s as it is still used by table %s.%s", name, cfm.ksName, cfm.cfName));
-    }
-
-    private boolean isUsedBy(AbstractType<?> toCheck) throws RequestValidationException
-    {
-        if (toCheck instanceof UserType)
-        {
-            UserType ut = (UserType)toCheck;
-            if (name.getKeyspace().equals(ut.keyspace) && name.getUserTypeName().equals(ut.name))
-                return true;
-
-            for (AbstractType<?> subtype : ut.fieldTypes())
-                if (isUsedBy(subtype))
-                    return true;
-        }
-        else if (toCheck instanceof CompositeType)
-        {
-            CompositeType ct = (CompositeType)toCheck;
-            for (AbstractType<?> subtype : ct.types)
-                if (isUsedBy(subtype))
-                    return true;
-        }
-        else if (toCheck instanceof CollectionType)
-        {
-            if (toCheck instanceof ListType)
-                return isUsedBy(((ListType)toCheck).getElementsType());
-            else if (toCheck instanceof SetType)
-                return isUsedBy(((SetType)toCheck).getElementsType());
-            else
-                return isUsedBy(((MapType)toCheck).getKeysType()) || isUsedBy(((MapType)toCheck).getValuesType());
-        }
-        return false;
-    }
-
-    public Event.SchemaChange changeEvent()
-    {
-        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
     }
 
     @Override
@@ -135,17 +103,18 @@ public class DropTypeStatement extends SchemaAlteringStatement
         return name.getKeyspace();
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
+    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(name.getKeyspace());
-        assert ksm != null;
+        if (ksm == null)
+            return null; // do not assert (otherwise IF EXISTS case fails)
 
         UserType toDrop = ksm.types.getNullable(name.getUserTypeName());
         // Can be null with ifExists
         if (toDrop == null)
-            return false;
+            return null;
 
         MigrationManager.announceTypeDrop(toDrop, isLocalOnly);
-        return true;
+        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
     }
 }

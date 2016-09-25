@@ -23,7 +23,7 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -92,50 +92,6 @@ public class TypeParser
     public static AbstractType<?> parse(CharSequence compareWith) throws SyntaxException, ConfigurationException
     {
         return parse(compareWith == null ? null : compareWith.toString());
-    }
-
-    public static String parseCqlNativeType(String str)
-    {
-        return CQL3Type.Native.valueOf(str.trim().toUpperCase(Locale.ENGLISH)).getType().toString();
-    }
-
-    public static String parseCqlCollectionOrFrozenType(String str) throws SyntaxException
-    {
-        str = str.trim().toLowerCase();
-        switch (str)
-        {
-            case "map": return "MapType";
-            case "set": return "SetType";
-            case "list": return "ListType";
-            case "frozen": return "FrozenType";
-            default: throw new SyntaxException("Invalid type name" + str);
-        }
-    }
-
-    /**
-     * Turns user facing type names into Abstract Types, 'text' -> UTF8Type
-     */
-    public static AbstractType<?> parseCqlName(String str) throws SyntaxException, ConfigurationException
-    {
-        return parse(parseCqlNameRecurse(str));
-    }
-
-    private static String parseCqlNameRecurse(String str) throws SyntaxException
-    {
-        if (str.indexOf(',') >= 0 && (!str.contains("<") || (str.indexOf(',') < str.indexOf('<'))))
-        {
-            String[] parseString = str.split(",", 2);
-            return parseCqlNameRecurse(parseString[0]) + "," + parseCqlNameRecurse(parseString[1]);
-        }
-        else if (str.contains("<"))
-        {
-            String[] parseString = str.trim().split("<", 2);
-            return parseCqlCollectionOrFrozenType(parseString[0]) + "(" + parseCqlNameRecurse(parseString[1].substring(0, parseString[1].length()-1)) + ")";
-        }
-        else
-        {
-            return parseCqlNativeType(str);
-        }
     }
 
     /**
@@ -583,17 +539,17 @@ public class TypeParser
         return sb.toString();
     }
 
-    public static String stringifyUserTypeParameters(String keysace, ByteBuffer typeName, List<ByteBuffer> columnNames, List<AbstractType<?>> columnTypes)
+    public static String stringifyUserTypeParameters(String keysace, ByteBuffer typeName, List<FieldIdentifier> fields,
+                                                     List<AbstractType<?>> columnTypes, boolean ignoreFreezing)
     {
         StringBuilder sb = new StringBuilder();
         sb.append('(').append(keysace).append(",").append(ByteBufferUtil.bytesToHex(typeName));
 
-        for (int i = 0; i < columnNames.size(); i++)
+        for (int i = 0; i < fields.size(); i++)
         {
             sb.append(',');
-            sb.append(ByteBufferUtil.bytesToHex(columnNames.get(i))).append(":");
-            // omit FrozenType(...) from fields because it is currently implicit
-            sb.append(columnTypes.get(i).toString(true));
+            sb.append(ByteBufferUtil.bytesToHex(fields.get(i).bytes)).append(":");
+            sb.append(columnTypes.get(i).toString(ignoreFreezing));
         }
         sb.append(')');
         return sb.toString();

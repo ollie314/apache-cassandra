@@ -21,7 +21,6 @@ package org.apache.cassandra.stress;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -36,7 +35,7 @@ import java.util.regex.Pattern;
 
 import com.google.common.io.ByteStreams;
 import org.apache.commons.lang3.StringUtils;
-
+import org.apache.cassandra.stress.report.StressMetrics;
 import org.apache.cassandra.stress.settings.StressSettings;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
@@ -143,16 +142,16 @@ public class StressGraph
                 if (line.startsWith("Thread count was not specified"))
                     runningMultipleThreadCounts = true;
 
-                // Detect thread count:
-                Matcher tc = threadCountMessage.matcher(line);
-                if (tc.matches())
+                if (runningMultipleThreadCounts)
                 {
-                    if (runningMultipleThreadCounts)
+                    // Detect thread count:
+                    Matcher tc = threadCountMessage.matcher(line);
+                    if (tc.matches())
                     {
                         currentThreadCount = tc.group(2);
                     }
                 }
-
+                
                 // Detect mode changes
                 if (line.equals(StressMetrics.HEAD))
                 {
@@ -202,7 +201,8 @@ public class StressGraph
                     {
                         continue;
                     }
-                    json.put(parts[0].trim(), parts[1].trim());
+                    // the graphing js expects lower case names
+                    json.put(parts[0].trim().toLowerCase(), parts[1].trim());
                 }
                 else if (mode == ReadingMode.NEXTITERATION)
                 {
@@ -228,34 +228,34 @@ public class StressGraph
         {
             throw new RuntimeException("Couldn't read from temporary stress log file");
         }
-        stats.add(json);
+        if (json.size() != 0) stats.add(json);
         return stats;
     }
 
     private JSONObject createJSONStats(JSONObject json)
     {
-        JSONArray stats;
-        if (json == null)
+        try (InputStream logStream = new FileInputStream(stressSettings.graph.temporaryLogFile))
         {
-            json = new JSONObject();
-            stats = new JSONArray();
-        }
-        else
-        {
-            stats = (JSONArray) json.get("stats");
-        }
+            JSONArray stats;
+            if (json == null)
+            {
+                json = new JSONObject();
+                stats = new JSONArray();
+            }
+            else
+            {
+                stats = (JSONArray) json.get("stats");
+            }
 
-        try
-        {
-            stats = parseLogStats(new FileInputStream(stressSettings.graph.temporaryLogFile), stats);
+            stats = parseLogStats(logStream, stats);
+
+            json.put("title", stressSettings.graph.title);
+            json.put("stats", stats);
+            return json;
         }
-        catch (FileNotFoundException e)
+        catch (IOException e)
         {
             throw new RuntimeException(e);
         }
-
-        json.put("title", stressSettings.graph.title);
-        json.put("stats", stats);
-        return json;
     }
 }

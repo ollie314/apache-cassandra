@@ -23,9 +23,10 @@ public interface SearchIterator<K, V>
 
     /**
      * Searches "forwards" (in direction of travel) in the iterator for the required key;
-     * if this or any key greater has already been returned by the iterator, null will be returned.
+     * if this or any key greater has already been returned by the iterator, the method may
+     * choose to return null, the correct or incorrect output, or fail an assertion.
      *
-     * it is permitted to search past the end of the iterator, i.e. !hasNext() => next(?) == null
+     * it is permitted to search past the end of the iterator, i.e. {@code !hasNext() => next(?) == null}
      *
      * @param key to search for
      * @return value associated with key, if present in direction of travel

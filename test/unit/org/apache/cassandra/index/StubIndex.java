@@ -22,6 +22,7 @@ import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.function.BiFunction;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.*;
@@ -30,7 +31,6 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.transactions.IndexTransaction;
@@ -51,6 +51,7 @@ public class StubIndex implements Index
     public List<Row> rowsInserted = new ArrayList<>();
     public List<Row> rowsDeleted = new ArrayList<>();
     public List<Pair<Row,Row>> rowsUpdated = new ArrayList<>();
+    public volatile boolean preJoinInvocation;
     private IndexMetadata indexMetadata;
     private ColumnFamilyStore baseCfs;
 
@@ -67,11 +68,6 @@ public class StubIndex implements Index
     {
         this.baseCfs = baseCfs;
         this.indexMetadata = metadata;
-    }
-
-    public boolean indexes(PartitionColumns columns)
-    {
-        return true;
     }
 
     public boolean shouldBuildBlocking()
@@ -100,6 +96,7 @@ public class StubIndex implements Index
     }
 
     public Indexer indexerFor(final DecoratedKey key,
+                              PartitionColumns columns,
                               int nowInSec,
                               OpOrder.Group opGroup,
                               IndexTransaction.Type transactionType)
@@ -151,11 +148,6 @@ public class StubIndex implements Index
         return indexMetadata;
     }
 
-    public String getIndexName()
-    {
-        return indexMetadata != null ? indexMetadata.name : "default_test_index_name";
-    }
-
     public void register(IndexRegistry registry){
         registry.registerIndex(this);
     }
@@ -180,6 +172,14 @@ public class StubIndex implements Index
         return null;
     }
 
+    public Callable<?> getPreJoinTask(boolean hadBootstrap)
+    {
+        return () -> {
+            preJoinInvocation = true;
+            return null;
+        };
+    }
+
     public Callable<?> getInvalidateTask()
     {
         return null;
@@ -202,35 +202,11 @@ public class StubIndex implements Index
 
     public Searcher searcherFor(final ReadCommand command)
     {
-        return orderGroup -> new InternalPartitionRangeReadCommand((PartitionRangeReadCommand)command)
-                             .queryStorageInternal(baseCfs, orderGroup);
+        return (controller) -> Util.executeLocally((PartitionRangeReadCommand)command, baseCfs, controller);
     }
 
     public BiFunction<PartitionIterator, ReadCommand, PartitionIterator> postProcessorFor(ReadCommand readCommand)
     {
         return (iter, command) -> iter;
-    }
-
-    private static final class InternalPartitionRangeReadCommand extends PartitionRangeReadCommand
-    {
-
-        private InternalPartitionRangeReadCommand(PartitionRangeReadCommand original)
-        {
-            super(original.isDigestQuery(),
-                  original.digestVersion(),
-                  original.isForThrift(),
-                  original.metadata(),
-                  original.nowInSec(),
-                  original.columnFilter(),
-                  original.rowFilter(),
-                  original.limits(),
-                  original.dataRange(),
-                  Optional.empty());
-        }
-
-        private UnfilteredPartitionIterator queryStorageInternal(ColumnFamilyStore cfs, ReadExecutionController executionController)
-        {
-            return queryStorage(cfs, executionController);
-        }
     }
 }

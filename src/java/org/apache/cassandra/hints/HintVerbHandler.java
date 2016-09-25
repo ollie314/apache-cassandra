@@ -29,6 +29,7 @@ import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
 
 /**
@@ -67,17 +68,28 @@ public final class HintVerbHandler implements IVerbHandler<HintMessage>
         }
         catch (MarshalException e)
         {
-            logger.warn("Failed to validate a hint for {} (table id {}) - skipped", hostId);
+            logger.warn("Failed to validate a hint for {} - skipped", hostId);
             reply(id, message.from);
             return;
         }
 
-        // Apply the hint if this node is the destination, store for future dispatch if this node isn't (must have gotten
-        // it from a decommissioned node that had streamed it before going out).
-        if (hostId.equals(StorageService.instance.getLocalHostUUID()))
-            hint.apply();
-        else
+        if (!hostId.equals(StorageService.instance.getLocalHostUUID()))
+        {
+            // the node is not the final destination of the hint (must have gotten it from a decommissioning node),
+            // so just store it locally, to be delivered later.
             HintsService.instance.write(hostId, hint);
+        }
+        else if (!StorageProxy.instance.appliesLocally(hint.mutation))
+        {
+            // the topology has changed, and we are no longer a replica of the mutation - since we don't know which node(s)
+            // it has been handed over to, re-address the hint to all replicas; see CASSANDRA-5902.
+            HintsService.instance.writeForAllReplicas(hint);
+        }
+        else
+        {
+            // the common path - the node is both the destination and a valid replica for the hint.
+            hint.apply();
+        }
 
         reply(id, message.from);
     }

@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.index.internal;
 
 import java.nio.ByteBuffer;
@@ -58,7 +78,7 @@ public abstract class CassandraIndexSearcher implements Index.Searcher
         ColumnFamilyStore indexCfs = index.getBackingTable().get();
         CFMetaData indexCfm = indexCfs.metadata;
         return SinglePartitionReadCommand.create(indexCfm, command.nowInSec(), indexKey, ColumnFilter.all(indexCfm), filter)
-                                         .queryMemtableAndDisk(indexCfs, executionController.indexReadOpOrderGroup());
+                                         .queryMemtableAndDisk(indexCfs, executionController.indexReadController());
     }
 
     private ClusteringIndexFilter makeIndexFilter(ReadCommand command)
@@ -112,8 +132,8 @@ public abstract class CassandraIndexSearcher implements Index.Searcher
                     DecoratedKey startKey = (DecoratedKey) range.left;
                     DecoratedKey endKey = (DecoratedKey) range.right;
 
-                    Slice.Bound start = Slice.Bound.BOTTOM;
-                    Slice.Bound end = Slice.Bound.TOP;
+                    ClusteringBound start = ClusteringBound.BOTTOM;
+                    ClusteringBound end = ClusteringBound.TOP;
 
                     /*
                      * For index queries over a range, we can't do a whole lot better than querying everything for the key range, though for
@@ -146,15 +166,15 @@ public abstract class CassandraIndexSearcher implements Index.Searcher
                 else
                 {
                     // otherwise, just start the index slice from the key we do have
-                    slice = Slice.make(makeIndexBound(((DecoratedKey)range.left).getKey(), Slice.Bound.BOTTOM),
-                                       Slice.Bound.TOP);
+                    slice = Slice.make(makeIndexBound(((DecoratedKey)range.left).getKey(), ClusteringBound.BOTTOM),
+                                       ClusteringBound.TOP);
                 }
             }
             return new ClusteringIndexSliceFilter(Slices.with(index.getIndexComparator(), slice), false);
         }
     }
 
-    private Slice.Bound makeIndexBound(ByteBuffer rowKey, Slice.Bound bound)
+    private ClusteringBound makeIndexBound(ByteBuffer rowKey, ClusteringBound bound)
     {
         return index.buildIndexClusteringPrefix(rowKey, bound, null)
                                  .buildBound(bound.isStart(), bound.isInclusive());

@@ -17,12 +17,10 @@
  */
 package org.apache.cassandra.config;
 
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +35,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.locator.LocalStrategy;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.utils.ConcurrentBiMap;
@@ -49,17 +48,6 @@ public class Schema
 
     public static final Schema instance = new Schema();
 
-    /* system keyspace names (the ones with LocalStrategy replication strategy) */
-    public static final Set<String> SYSTEM_KEYSPACE_NAMES = ImmutableSet.of(SystemKeyspace.NAME, SchemaKeyspace.NAME);
-
-    /**
-     * longest permissible KS or CF name.  Our main concern is that filename not be more than 255 characters;
-     * the filename will contain both the KS and CF names. Since non-schema-name components only take up
-     * ~64 characters, we could allow longer names than this, but on Windows, the entire path should be not greater than
-     * 255 characters, so a lower limit here helps avoid problems.  See CASSANDRA-4110.
-     */
-    public static final int NAME_LENGTH = 48;
-
     /* metadata map for faster keyspace lookup */
     private final Map<String, KeyspaceMetadata> keyspaces = new NonBlockingHashMap<>();
 
@@ -71,39 +59,16 @@ public class Schema
 
     private volatile UUID version;
 
-    // 59adb24e-f3cd-3e02-97f0-5b395827453f
-    public static final UUID emptyVersion;
-
-    static
-    {
-        try
-        {
-            emptyVersion = UUID.nameUUIDFromBytes(MessageDigest.getInstance("MD5").digest());
-        }
-        catch (NoSuchAlgorithmException e)
-        {
-            throw new AssertionError();
-        }
-    }
-
     /**
      * Initialize empty schema object and load the hardcoded system tables
      */
     public Schema()
     {
-        if (!Config.isClientMode())
+        if (DatabaseDescriptor.isDaemonInitialized() || DatabaseDescriptor.isToolInitialized())
         {
             load(SchemaKeyspace.metadata());
             load(SystemKeyspace.metadata());
         }
-    }
-
-    /**
-     * @return whether or not the keyspace is a really system one (w/ LocalStrategy, unmodifiable, hardcoded)
-     */
-    public static boolean isSystemKeyspace(String keyspaceName)
-    {
-        return SYSTEM_KEYSPACE_NAMES.contains(keyspaceName.toLowerCase());
     }
 
     /**
@@ -122,7 +87,7 @@ public class Schema
      */
     public Schema loadFromDisk(boolean updateVersion)
     {
-        load(SchemaKeyspace.readSchemaFromSystemTables());
+        load(SchemaKeyspace.fetchNonSystemKeyspaces());
         if (updateVersion)
             updateVersion();
         return this;
@@ -135,7 +100,7 @@ public class Schema
      *
      * @return self to support chaining calls
      */
-    public Schema load(Collection<KeyspaceMetadata> keyspaceDefs)
+    public Schema load(Iterable<KeyspaceMetadata> keyspaceDefs)
     {
         keyspaceDefs.forEach(this::load);
         return this;
@@ -176,7 +141,8 @@ public class Schema
      * @param ksNameAndCFName
      * @return The named CFS or null if the keyspace, base table, or index don't exist
      */
-    public ColumnFamilyStore getColumnFamilyStoreIncludingIndexes(Pair<String, String> ksNameAndCFName) {
+    public ColumnFamilyStore getColumnFamilyStoreIncludingIndexes(Pair<String, String> ksNameAndCFName)
+    {
         String ksName = ksNameAndCFName.left;
         String cfName = ksNameAndCFName.right;
         Pair<String, String> baseTable;
@@ -303,6 +269,11 @@ public class Schema
         return getCFMetaData(descriptor.ksname, descriptor.cfname);
     }
 
+    public int getNumberOfTables()
+    {
+        return cfIdMap.size();
+    }
+
     public ViewDefinition getView(String keyspaceName, String viewName)
     {
         assert keyspaceName != null;
@@ -323,12 +294,38 @@ public class Schema
         return keyspaces.get(keyspaceName);
     }
 
+    private Set<String> getNonSystemKeyspacesSet()
+    {
+        return Sets.difference(keyspaces.keySet(), SchemaConstants.SYSTEM_KEYSPACE_NAMES);
+    }
+
     /**
-     * @return collection of the non-system keyspaces
+     * @return collection of the non-system keyspaces (note that this count as system only the
+     * non replicated keyspaces, so keyspace like system_traces which are replicated are actually
+     * returned. See getUserKeyspace() below if you don't want those)
      */
     public List<String> getNonSystemKeyspaces()
     {
-        return ImmutableList.copyOf(Sets.difference(keyspaces.keySet(), SYSTEM_KEYSPACE_NAMES));
+        return ImmutableList.copyOf(getNonSystemKeyspacesSet());
+    }
+
+    /**
+     * @return a collection of keyspaces that do not use LocalStrategy for replication
+     */
+    public List<String> getNonLocalStrategyKeyspaces()
+    {
+        return keyspaces.values().stream()
+                .filter(keyspace -> keyspace.params.replication.klass != LocalStrategy.class)
+                .map(keyspace -> keyspace.name)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * @return collection of the user defined keyspaces
+     */
+    public List<String> getUserKeyspaces()
+    {
+        return ImmutableList.copyOf(Sets.difference(getNonSystemKeyspacesSet(), SchemaConstants.REPLICATED_SYSTEM_KEYSPACE_NAMES));
     }
 
     /**
@@ -352,6 +349,16 @@ public class Schema
     public Set<String> getKeyspaces()
     {
         return keyspaces.keySet();
+    }
+
+    public Keyspaces getKeyspaces(Set<String> includedKeyspaceNames)
+    {
+        Keyspaces.Builder builder = Keyspaces.builder();
+        keyspaces.values()
+                 .stream()
+                 .filter(k -> includedKeyspaceNames.contains(k.name))
+                 .forEach(builder::add);
+        return builder.build();
     }
 
     /**
@@ -559,7 +566,7 @@ public class Schema
     public void dropKeyspace(String ksName)
     {
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(ksName);
-        String snapshotName = Keyspace.getTimestampedSnapshotName(ksName);
+        String snapshotName = Keyspace.getTimestampedSnapshotNameWithPrefix(ksName, ColumnFamilyStore.SNAPSHOT_DROP_PREFIX);
 
         CompactionManager.instance.interruptCompactionFor(ksm.tablesAndViews(), true);
 
@@ -596,30 +603,26 @@ public class Schema
     {
         assert getCFMetaData(cfm.ksName, cfm.cfName) == null;
 
-        update(cfm.ksName, ks ->
-        {
-            load(cfm);
-
-            // make sure it's init-ed w/ the old definitions first,
-            // since we're going to call initCf on the new one manually
-            Keyspace.open(cfm.ksName);
-
-            return ks.withSwapped(ks.tables.with(cfm));
-        });
-
-        Keyspace.open(cfm.ksName).initCf(cfm.cfId, cfm.cfName, true);
+        // Make sure the keyspace is initialized
+        // and init the new CF before switching the KSM to the new one
+        // to avoid races as in CASSANDRA-10761
+        Keyspace.open(cfm.ksName).initCf(cfm, true);
+        // Update the keyspaces map with the updated metadata
+        update(cfm.ksName, ks -> ks.withSwapped(ks.tables.with(cfm)));
+        // Update the table ID <-> table name map (cfIdMap)
+        load(cfm);
         MigrationManager.instance.notifyCreateColumnFamily(cfm);
     }
 
-    public void updateTable(String ksName, String tableName)
+    public void updateTable(CFMetaData table)
     {
-        CFMetaData cfm = getCFMetaData(ksName, tableName);
-        assert cfm != null;
-        boolean columnsDidChange = cfm.reload();
+        CFMetaData current = getCFMetaData(table.ksName, table.cfName);
+        assert current != null;
+        boolean changeAffectsStatements = current.apply(table);
 
-        Keyspace keyspace = Keyspace.open(cfm.ksName);
-        keyspace.getColumnFamilyStore(cfm.cfName).reload();
-        MigrationManager.instance.notifyUpdateColumnFamily(cfm, columnsDidChange);
+        Keyspace keyspace = Keyspace.open(current.ksName);
+        keyspace.getColumnFamilyStore(current.cfName).reload();
+        MigrationManager.instance.notifyUpdateColumnFamily(current, changeAffectsStatements);
     }
 
     public void dropTable(String ksName, String tableName)
@@ -642,7 +645,7 @@ public class Schema
         CompactionManager.instance.interruptCompactionFor(Collections.singleton(cfm), true);
 
         if (DatabaseDescriptor.isAutoSnapshot())
-            cfs.snapshot(Keyspace.getTimestampedSnapshotName(cfs.name));
+            cfs.snapshot(Keyspace.getTimestampedSnapshotNameWithPrefix(cfs.name, ColumnFamilyStore.SNAPSHOT_DROP_PREFIX));
         Keyspace.open(ksName).dropCf(cfm.cfId);
         MigrationManager.instance.notifyDropColumnFamily(cfm);
 
@@ -653,33 +656,28 @@ public class Schema
     {
         assert getCFMetaData(view.ksName, view.viewName) == null;
 
-        update(view.ksName, ks ->
-        {
-            load(view);
+        Keyspace keyspace = Keyspace.open(view.ksName);
 
-            // make sure it's init-ed w/ the old definitions first,
-            // since we're going to call initCf on the new one manually
-            Keyspace.open(view.ksName);
+        // Make sure the keyspace is initialized and initialize the table.
+        keyspace.initCf(view.metadata, true);
+        // Update the keyspaces map with the updated metadata
+        update(view.ksName, ks -> ks.withSwapped(ks.views.with(view)));
+        // Update the table ID <-> table name map (cfIdMap)
+        load(view);
 
-            return ks.withSwapped(ks.views.with(view));
-        });
-
-        Keyspace.open(view.ksName).initCf(view.metadata.cfId, view.viewName, true);
-        Keyspace.open(view.ksName).viewManager.reload();
+        keyspace.viewManager.reload();
         MigrationManager.instance.notifyCreateView(view);
     }
 
-    public void updateView(String ksName, String viewName)
+    public void updateView(ViewDefinition view)
     {
-        Optional<ViewDefinition> optView = getKSMetaData(ksName).views.get(viewName);
-        assert optView.isPresent();
-        ViewDefinition view = optView.get();
-        boolean columnsDidChange = view.metadata.reload();
+        ViewDefinition current = getKSMetaData(view.ksName).views.get(view.viewName).get();
+        boolean changeAffectsStatements = current.metadata.apply(view.metadata);
 
-        Keyspace keyspace = Keyspace.open(view.ksName);
-        keyspace.getColumnFamilyStore(view.viewName).reload();
-        Keyspace.open(view.ksName).viewManager.update(view.viewName);
-        MigrationManager.instance.notifyUpdateView(view, columnsDidChange);
+        Keyspace keyspace = Keyspace.open(current.ksName);
+        keyspace.getColumnFamilyStore(current.viewName).reload();
+        Keyspace.open(current.ksName).viewManager.update(current.viewName);
+        MigrationManager.instance.notifyUpdateView(current, changeAffectsStatements);
     }
 
     public void dropView(String ksName, String viewName)

@@ -19,6 +19,9 @@ package org.apache.cassandra.db.rows;
 
 import java.util.*;
 import java.security.MessageDigest;
+import java.util.function.Consumer;
+
+import com.google.common.base.Predicate;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
@@ -200,9 +203,20 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      *
      * @param purger the {@code DeletionPurger} to use to decide what can be purged.
      * @param nowInSec the current time to decide what is deleted and what isn't (in the case of expired cells).
-     * @return this row but without any deletion info purged by {@code purger}.
+     * @return this row but without any deletion info purged by {@code purger}. If the purged row is empty, returns
+     * {@code null}.
      */
     public Row purge(DeletionPurger purger, int nowInSec);
+
+    /**
+     * Returns a copy of this row which only include the data queried by {@code filter}, excluding anything _fetched_ for
+     * internal reasons but not queried by the user (see {@link ColumnFilter} for details).
+     *
+     * @param filter the {@code ColumnFilter} to use when deciding what is user queried. This should be the filter
+     * that was used when querying the row on which this method is called.
+     * @return the row but with all data that wasn't queried by the user skipped.
+     */
+    public Row withOnlyQueriedData(ColumnFilter filter);
 
     /**
      * Returns a copy of this row where all counter cells have they "local" shard marked for clearing.
@@ -210,10 +224,26 @@ public interface Row extends Unfiltered, Collection<ColumnData>
     public Row markCounterLocalToBeCleared();
 
     /**
-     * returns a copy of this row where all live timestamp have been replaced by {@code newTimestamp} and every deletion timestamp
-     * by {@code newTimestamp - 1}. See {@link Commit} for why we need this.
+     * Returns a copy of this row where all live timestamp have been replaced by {@code newTimestamp} and every deletion
+     * timestamp by {@code newTimestamp - 1}.
+     *
+     * @param newTimestamp the timestamp to use for all live data in the returned row.
+     *
+     * @see Commit for why we need this.
      */
     public Row updateAllTimestamp(long newTimestamp);
+
+    /**
+     * Returns a copy of this row with the new deletion as row deletion if it is more recent
+     * than the current row deletion.
+     * <p>
+     * WARNING: this method <b>does not</b> check that nothing in the row is shadowed by the provided
+     * deletion and if that is the case, the created row will be <b>invalid</b>. It is thus up to the
+     * caller to verify that this is not the case and the only reasonable use case of this is probably
+     * when the row and the deletion comes from the same {@code UnfilteredRowIterator} since that gives
+     * use this guarantee.
+     */
+    public Row withRowDeletion(DeletionTime deletion);
 
     public int dataSize();
 
@@ -222,17 +252,30 @@ public interface Row extends Unfiltered, Collection<ColumnData>
     public String toString(CFMetaData metadata, boolean fullDetails);
 
     /**
+     * Apply a function to every column in a row
+     */
+    public void apply(Consumer<ColumnData> function, boolean reverse);
+
+    /**
+     * Apply a funtion to every column in a row until a stop condition is reached
+     */
+    public void apply(Consumer<ColumnData> function, Predicate<ColumnData> stopCondition, boolean reverse);
+
+    /**
      * A row deletion/tombstone.
      * <p>
      * A row deletion mostly consists of the time of said deletion, but there is 2 variants: shadowable
      * and regular row deletion.
      * <p>
-     * A shadowable row deletion only exists if the row timestamp ({@code primaryKeyLivenessInfo().timestamp()})
-     * is lower than the deletion timestamp. That is, if a row has a shadowable deletion with timestamp A and an update is made
-     * to that row with a timestamp B such that B > A, then the shadowable deletion is 'shadowed' by that update. A concrete
-     * consequence is that if said update has cells with timestamp lower than A, then those cells are preserved
-     * (since the deletion is removed), and this contrarily to a normal (regular) deletion where the deletion is preserved
-     * and such cells are removed.
+     * A shadowable row deletion only exists if the row has no timestamp. In other words, the deletion is only
+     * valid as long as no newer insert is done (thus setting a row timestamp; note that if the row timestamp set
+     * is lower than the deletion, it is shadowed (and thus ignored) as usual).
+     * <p>
+     * That is, if a row has a shadowable deletion with timestamp A and an update is made to that row with a
+     * timestamp B such that {@code B > A} (and that update sets the row timestamp), then the shadowable deletion is 'shadowed'
+     * by that update. A concrete consequence is that if said update has cells with timestamp lower than A, then those
+     * cells are preserved(since the deletion is removed), and this is contrary to a normal (regular) deletion where the
+     * deletion is preserved and such cells are removed.
      * <p>
      * Currently, the only use of shadowable row deletions is Materialized Views, see CASSANDRA-10261.
      */
@@ -312,6 +355,11 @@ public interface Row extends Unfiltered, Collection<ColumnData>
             return time.deletes(info);
         }
 
+        public boolean deletes(Cell cell)
+        {
+            return time.deletes(cell);
+        }
+
         public void digest(MessageDigest digest)
         {
             time.digest(digest);
@@ -361,6 +409,9 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      *      any column before {@code c} and before any call for any column after {@code c}.
      *   5) Calls to {@link #addCell} are further done in strictly increasing cell order (the one defined by
      *      {@link Cell#comparator}. That is, for a give column, cells are passed in {@code CellPath} order.
+     *   6) No shadowed data should be added. Concretely, this means that if a a row deletion is added, it doesn't
+     *      deletes the row timestamp or any cell added later, and similarly no cell added is deleted by the complex
+     *      deletion of the column this is a cell of.
      *
      * An unsorted builder will not expect those last rules however: {@link #addCell} and {@link #addComplexDeletion}
      * can be done in any order. And in particular unsorted builder allows multiple calls for the same column/cell. In
@@ -430,6 +481,105 @@ public interface Row extends Unfiltered, Collection<ColumnData>
          * Builds and return built row.
          *
          * @return the last row built by this builder.
+         */
+        public Row build();
+    }
+
+    /**
+     * Row builder interface geared towards human.
+     * <p>
+     * Where the {@link Builder} deals with building rows efficiently from internal objects ({@code Cell}, {@code
+     * LivenessInfo}, ...), the {@code SimpleBuilder} is geared towards building rows from string column name and
+     * 'native' values (string for text, ints for numbers, et...). In particular, it is meant to be convenient, not
+     * efficient, and should be used only in place where performance is not of the utmost importance (it is used to
+     * build schema mutation for instance).
+     * <p>
+     * Also note that contrarily to {@link Builder}, the {@code SimpleBuilder} API has no {@code newRow()} method: it is
+     * expected that the clustering of the row built is provided by the constructor of the builder.
+     */
+    public interface SimpleBuilder
+    {
+        /**
+         * Sets the timestamp to use for the following additions.
+         * <p>
+         * Note that the for non-compact tables, this method must be called before any column addition for this
+         * timestamp to be used for the row {@code LivenessInfo}.
+         *
+         * @param timestamp the timestamp to use for following additions. If that timestamp hasn't been set, the current
+         * time in microseconds will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder timestamp(long timestamp);
+
+        /**
+         * Sets the ttl to use for the following additions.
+         * <p>
+         * Note that the for non-compact tables, this method must be called before any column addition for this
+         * ttl to be used for the row {@code LivenessInfo}.
+         *
+         * @param ttl the ttl to use for following additions. If that ttl hasn't been set, no ttl will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder ttl(int ttl);
+
+        /**
+         * Adds a value to a given column.
+         *
+         * @param columnName the name of the column for which to add a new value.
+         * @param value the value to add, which must be of the proper type for {@code columnName}. This can be {@code
+         * null} in which case the this is equivalent to {@code delete(columnName)}.
+         * @return this builder.
+         */
+        public SimpleBuilder add(String columnName, Object value);
+
+        /**
+         * Appends new values to a given non-frozen collection column.
+         * <p>
+         * This method is similar to {@code add()} but the collection elements added through this method are "appended"
+         * to any pre-exising elements. In other words, this is like {@code add()} except that it doesn't delete the
+         * previous value of the collection. This can only be called on non-frozen collection columns.
+         * <p>
+         * Note that this method can be used in replacement of {@code add()} if you know that there can't be any
+         * pre-existing value for that column, in which case this is slightly less expensive as it avoid the collection
+         * tombstone inherent to {@code add()}.
+         *
+         * @param columnName the name of the column for which to add a new value, which must be a non-frozen collection.
+         * @param value the value to add, which must be of the proper type for {@code columnName} (in other words, it
+         * <b>must</b> be a collection).
+         * @return this builder.
+         *
+         * @throws IllegalArgumentException if columnName is not a non-frozen collection column.
+         */
+        public SimpleBuilder appendAll(String columnName, Object value);
+
+        /**
+         * Deletes the whole row.
+         * <p>
+         * If called, this is generally the only method called on the builder (outside of {@code timestamp()}.
+         *
+         * @return this builder.
+         */
+        public SimpleBuilder delete();
+
+        /**
+         * Removes the value for a given column (creating a tombstone).
+         *
+         * @param columnName the name of the column to delete.
+         * @return this builder.
+         */
+        public SimpleBuilder delete(String columnName);
+
+        /**
+         * Don't include any primary key {@code LivenessInfo} in the built row.
+         *
+         * @return this builder.
+         */
+        public SimpleBuilder noPrimaryKeyLivenessInfo();
+
+        /**
+         * Returns the built row.
+         *
+         * @return the built row.
          */
         public Row build();
     }

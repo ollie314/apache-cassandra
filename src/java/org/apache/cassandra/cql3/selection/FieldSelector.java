@@ -20,9 +20,9 @@ package org.apache.cassandra.cql3.selection;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.selection.Selection.ResultSetBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 
@@ -38,9 +38,7 @@ final class FieldSelector extends Selector
         {
             protected String getColumnName()
             {
-                return String.format("%s.%s",
-                                     factory.getColumnName(),
-                                     UTF8Type.instance.getString(type.fieldName(field)));
+                return String.format("%s.%s", factory.getColumnName(), type.fieldName(field));
             }
 
             protected AbstractType<?> getReturnType()
@@ -53,9 +51,9 @@ final class FieldSelector extends Selector
                 factory.addColumnMapping(mapping, resultsColumn);
             }
 
-            public Selector newInstance() throws InvalidRequestException
+            public Selector newInstance(QueryOptions options) throws InvalidRequestException
             {
-                return new FieldSelector(type, field, factory.newInstance());
+                return new FieldSelector(type, field, factory.newInstance(options));
             }
 
             public boolean isAggregateSelectorFactory()
@@ -63,11 +61,6 @@ final class FieldSelector extends Selector
                 return factory.isAggregateSelectorFactory();
             }
         };
-    }
-
-    public boolean isAggregate()
-    {
-        return false;
     }
 
     public void addInput(int protocolVersion, ResultSetBuilder rs) throws InvalidRequestException
@@ -97,7 +90,7 @@ final class FieldSelector extends Selector
     @Override
     public String toString()
     {
-        return String.format("%s.%s", selected, UTF8Type.instance.getString(type.fieldName(field)));
+        return String.format("%s.%s", selected, type.fieldName(field));
     }
 
     private FieldSelector(UserType type, int field, Selector selected)

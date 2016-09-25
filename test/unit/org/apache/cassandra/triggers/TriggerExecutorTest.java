@@ -19,10 +19,12 @@ package org.apache.cassandra.triggers;
 
 import java.util.*;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.marshal.UTF8Type;
@@ -40,18 +42,26 @@ import static org.junit.Assert.assertTrue;
 
 public class TriggerExecutorTest
 {
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void sameKeySameCfColumnFamilies() throws ConfigurationException, InvalidRequestException
     {
         CFMetaData metadata = makeCfMetaData("ks1", "cf1", TriggerMetadata.create("test", SameKeySameCfTrigger.class.getName()));
         PartitionUpdate mutated = TriggerExecutor.instance.execute(makeCf(metadata, "k1", "v1", null));
 
-        RowIterator rowIterator = UnfilteredRowIterators.filter(mutated.unfilteredIterator(), FBUtilities.nowInSeconds());
+        try (RowIterator rowIterator = UnfilteredRowIterators.filter(mutated.unfilteredIterator(),
+                                                                     FBUtilities.nowInSeconds()))
+        {
+            Iterator<Cell> cells = rowIterator.next().cells().iterator();
+            assertEquals(bytes("trigger"), cells.next().value());
 
-        Iterator<Cell> cells = rowIterator.next().cells().iterator();
-        assertEquals(bytes("trigger"), cells.next().value());
-
-        assertTrue(!rowIterator.hasNext());
+            assertTrue(!rowIterator.hasNext());
+        }
     }
 
     @Test(expected = InvalidRequestException.class)
@@ -272,9 +282,9 @@ public class TriggerExecutorTest
         builder.newRow(Clustering.EMPTY);
         long ts = FBUtilities.timestampMicros();
         if (columnValue1 != null)
-            builder.addCell(BufferCell.live(metadata, metadata.getColumnDefinition(bytes("c1")), ts, bytes(columnValue1)));
+            builder.addCell(BufferCell.live(metadata.getColumnDefinition(bytes("c1")), ts, bytes(columnValue1)));
         if (columnValue2 != null)
-            builder.addCell(BufferCell.live(metadata, metadata.getColumnDefinition(bytes("c2")), ts, bytes(columnValue2)));
+            builder.addCell(BufferCell.live(metadata.getColumnDefinition(bytes("c2")), ts, bytes(columnValue2)));
 
         return PartitionUpdate.singleRowUpdate(metadata, Util.dk(key), builder.build());
     }
@@ -346,14 +356,6 @@ public class TriggerExecutorTest
         {
             int cmp = m1.getKeyspaceName().compareTo(m2.getKeyspaceName());
             return cmp != 0 ? cmp : m1.key().compareTo(m2.key());
-        }
-    }
-
-    private static class CfComparator implements Comparator<Partition>
-    {
-        public int compare(Partition cf1, Partition cf2)
-        {
-            return cf1.metadata().cfName.compareTo(cf2.metadata().cfName);
         }
     }
 }

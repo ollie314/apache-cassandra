@@ -23,9 +23,14 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
+import org.apache.commons.lang3.StringUtils;
+
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+
+import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.commons.lang3.StringUtils.isEmpty;
 import static org.junit.Assert.assertEquals;
 
@@ -326,6 +331,27 @@ public class DeleteTest extends CQLTester
 
         assertEmpty(execute("select * from %s  where a=1 and b=1"));
     }
+
+    /** Test that two deleted rows for the same partition but on different sstables do not resurface */
+    @Test
+    public void testDeletedRowsDoNotResurface() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c text, primary key (a, b))");
+        execute("INSERT INTO %s (a, b, c) VALUES(1, 1, '1')");
+        execute("INSERT INTO %s (a, b, c) VALUES(1, 2, '2')");
+        execute("INSERT INTO %s (a, b, c) VALUES(1, 3, '3')");
+        flush();
+
+        execute("DELETE FROM %s where a=1 and b = 1");
+        flush();
+
+        execute("DELETE FROM %s where a=1 and b = 2");
+        flush();
+
+        assertRows(execute("SELECT * FROM %s WHERE a = ?", 1),
+                   row(1, 3, "3"));
+    }
+
     @Test
     public void testDeleteWithNoClusteringColumns() throws Throwable
     {
@@ -376,10 +402,10 @@ public class DeleteTest extends CQLTester
                                  "DELETE FROM %s WHERE partitionKey = ? AND partitionKey = ?", 0, 1);
 
             // unknown identifiers
-            assertInvalidMessage("Unknown identifier unknown",
+            assertInvalidMessage("Undefined column name unknown",
                                  "DELETE unknown FROM %s WHERE partitionKey = ?", 0);
 
-            assertInvalidMessage("Undefined name partitionkey1 in where clause ('partitionkey1 = ?')",
+            assertInvalidMessage("Undefined column name partitionkey1",
                                  "DELETE FROM %s WHERE partitionKey1 = ?", 0);
 
             // Invalid operator in the where clause
@@ -465,13 +491,13 @@ public class DeleteTest extends CQLTester
                                  "DELETE FROM %s WHERE partitionKey = ? AND clustering = ? AND clustering = ?", 0, 1, 1);
 
             // unknown identifiers
-            assertInvalidMessage("Unknown identifier value1",
+            assertInvalidMessage("Undefined column name value1",
                                  "DELETE value1 FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1);
 
-            assertInvalidMessage("Undefined name partitionkey1 in where clause ('partitionkey1 = ?')",
+            assertInvalidMessage("Undefined column name partitionkey1",
                                  "DELETE FROM %s WHERE partitionKey1 = ? AND clustering = ?", 0, 1);
 
-            assertInvalidMessage("Undefined name clustering_3 in where clause ('clustering_3 = ?')",
+            assertInvalidMessage("Undefined column name clustering_3",
                                  "DELETE FROM %s WHERE partitionKey = ? AND clustering_3 = ?", 0, 1);
 
             // Invalid operator in the where clause
@@ -482,10 +508,7 @@ public class DeleteTest extends CQLTester
                                  "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering = ?", 0, 1);
 
             // Non primary key in the where clause
-            String errorMsg = isEmpty(compactOption) ? "Non PRIMARY KEY columns found in where clause: value"
-                                                     : "Predicates on the non-primary-key column (value) of a COMPACT table are not yet supported";
-
-            assertInvalidMessage(errorMsg,
+            assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
                                  "DELETE FROM %s WHERE partitionKey = ? AND clustering = ? AND value = ?", 0, 1, 3);
         }
     }
@@ -598,13 +621,13 @@ public class DeleteTest extends CQLTester
                                  "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ? AND clustering_1 = ?", 0, 1, 1, 1);
 
             // unknown identifiers
-            assertInvalidMessage("Unknown identifier value1",
+            assertInvalidMessage("Undefined column name value1",
                                  "DELETE value1 FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            assertInvalidMessage("Undefined name partitionkey1 in where clause ('partitionkey1 = ?')",
+            assertInvalidMessage("Undefined column name partitionkey1",
                                  "DELETE FROM %s WHERE partitionKey1 = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            assertInvalidMessage("Undefined name clustering_3 in where clause ('clustering_3 = ?')",
+            assertInvalidMessage("Undefined column name clustering_3",
                                  "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_3 = ?", 0, 1, 1);
 
             // Invalid operator in the where clause
@@ -615,12 +638,42 @@ public class DeleteTest extends CQLTester
                                  "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
             // Non primary key in the where clause
-            String errorMsg = isEmpty(compactOption) ? "Non PRIMARY KEY columns found in where clause: value"
-                                                     : "Predicates on the non-primary-key column (value) of a COMPACT table are not yet supported";
-
-            assertInvalidMessage(errorMsg,
+            assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
                                  "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ? AND value = ?", 0, 1, 1, 3);
         }
+    }
+
+    @Test
+    public void testDeleteWithNonoverlappingRange() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c text, primary key (a, b))");
+
+        for (int i = 0; i < 10; i++)
+            execute("INSERT INTO %s (a, b, c) VALUES(1, ?, 'abc')", i);
+        flush();
+
+        execute("DELETE FROM %s WHERE a=1 and b <= 3");
+        flush();
+
+        // this query does not overlap the tombstone range above and caused the rows to be resurrected
+        assertEmpty(execute("SELECT * FROM %s WHERE a=1 and b <= 2"));
+    }
+
+    @Test
+    public void testDeleteWithIntermediateRangeAndOneClusteringColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c text, primary key (a, b))");
+        execute("INSERT INTO %s (a, b, c) VALUES(1, 1, '1')");
+        execute("INSERT INTO %s (a, b, c) VALUES(1, 3, '3')");
+        execute("DELETE FROM %s where a=1 and b >= 2 and b <= 3");
+        execute("INSERT INTO %s (a, b, c) VALUES(1, 2, '2')");
+        flush();
+
+        execute("DELETE FROM %s where a=1 and b >= 2 and b <= 3");
+        flush();
+
+        assertRows(execute("SELECT * FROM %s WHERE a = ?", 1),
+                   row(1, 1, "1"));
     }
 
     @Test
@@ -718,6 +771,8 @@ public class DeleteTest extends CQLTester
             // Test invalid queries
             assertInvalidMessage("Range deletions are not supported for specific columns",
                                  "DELETE value FROM %s WHERE partitionKey = ? AND clustering >= ?", 2, 1);
+            assertInvalidMessage("Range deletions are not supported for specific columns",
+                                 "DELETE value FROM %s WHERE partitionKey = ?", 2);
         }
     }
 
@@ -911,6 +966,12 @@ public class DeleteTest extends CQLTester
             // Test invalid queries
             assertInvalidMessage("Range deletions are not supported for specific columns",
                                  "DELETE value FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) >= (?, ?)", 2, 3, 1);
+            assertInvalidMessage("Range deletions are not supported for specific columns",
+                                 "DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 >= ?", 2, 3);
+            assertInvalidMessage("Range deletions are not supported for specific columns",
+                                 "DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 = ?", 2, 3);
+            assertInvalidMessage("Range deletions are not supported for specific columns",
+                                 "DELETE value FROM %s WHERE partitionKey = ?", 2);
         }
     }
 
@@ -1000,9 +1061,187 @@ public class DeleteTest extends CQLTester
                              "DELETE FROM %s WHERE values CONTAINS ?", 3);
     }
 
-    private void flush(boolean forceFlush)
+    @Test
+    public void testDeleteWithOnlyPK() throws Throwable
     {
-        if (forceFlush)
-            flush();
+        // This is a regression test for CASSANDRA-11102
+
+        createTable("CREATE TABLE %s (k int, v int, PRIMARY KEY (k, v)) WITH gc_grace_seconds=1");
+
+        execute("INSERT INTO %s(k, v) VALUES (?, ?)", 1, 2);
+
+        execute("DELETE FROM %s WHERE k = ? AND v = ?", 1, 2);
+        execute("INSERT INTO %s(k, v) VALUES (?, ?)", 2, 3);
+
+        Thread.sleep(500);
+
+        execute("DELETE FROM %s WHERE k = ? AND v = ?", 2, 3);
+        execute("INSERT INTO %s(k, v) VALUES (?, ?)", 1, 2);
+
+        Thread.sleep(500);
+
+        flush();
+
+        assertRows(execute("SELECT * FROM %s"), row(1, 2));
+
+        Thread.sleep(1000);
+        compact();
+
+        assertRows(execute("SELECT * FROM %s"), row(1, 2));
+    }
+
+    @Test
+    public void testDeleteColumnNoClustering() throws Throwable
+    {
+        // This is a regression test for CASSANDRA-11068 (and ultimately another test for CASSANDRA-11102)
+        // Creates a table without clustering, insert a row (with a column) and only remove the column.
+        // We should still have a row (with a null column value) even post-compaction.
+
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int) WITH gc_grace_seconds=0");
+
+        execute("INSERT INTO %s(k, v) VALUES (?, ?)", 0, 0);
+        execute("DELETE v FROM %s WHERE k=?", 0);
+
+        assertRows(execute("SELECT * FROM %s"), row(0, null));
+
+        flush();
+        assertRows(execute("SELECT * FROM %s"), row(0, null));
+
+        compact();
+        assertRows(execute("SELECT * FROM %s"), row(0, null));
+    }
+
+    @Test
+    public void testDeleteAndReverseQueries() throws Throwable
+    {
+        // This test insert rows in one sstable and a range tombstone covering some of those rows in another, and it
+        // validates we correctly get only the non-removed rows when doing reverse queries.
+
+        createTable("CREATE TABLE %s (k text, i int, PRIMARY KEY (k, i))");
+
+        for (int i = 0; i < 10; i++)
+            execute("INSERT INTO %s(k, i) values (?, ?)", "a", i);
+
+        flush();
+
+        execute("DELETE FROM %s WHERE k = ? AND i >= ? AND i <= ?", "a", 2, 7);
+
+        assertRows(execute("SELECT i FROM %s WHERE k = ? ORDER BY i DESC", "a"),
+            row(9), row(8), row(1), row(0)
+        );
+
+        flush();
+
+        assertRows(execute("SELECT i FROM %s WHERE k = ? ORDER BY i DESC", "a"),
+            row(9), row(8), row(1), row(0)
+        );
+    }
+
+    @Test
+    public void testDeleteWithEmptyRestrictionValue() throws Throwable
+    {
+        for (String options : new String[] { "", " WITH COMPACT STORAGE" })
+        {
+            createTable("CREATE TABLE %s (pk blob, c blob, v blob, PRIMARY KEY (pk, c))" + options);
+
+            if (StringUtils.isEmpty(options))
+            {
+                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
+                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c = textAsBlob('');");
+
+                assertEmpty(execute("SELECT * FROM %s"));
+
+                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
+                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c IN (textAsBlob(''), textAsBlob('1'));");
+
+                assertEmpty(execute("SELECT * FROM %s"));
+
+                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
+                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
+                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
+
+                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('')");
+
+                assertRows(execute("SELECT * FROM %s"),
+                           row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")));
+
+                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c >= textAsBlob('')");
+
+                assertEmpty(execute("SELECT * FROM %s"));
+            }
+            else
+            {
+                assertInvalid("Invalid empty or null value for column c",
+                              "DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c = textAsBlob('')");
+                assertInvalid("Invalid empty or null value for column c",
+                              "DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c IN (textAsBlob(''), textAsBlob('1'))");
+            }
+
+            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
+            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
+
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('')");
+
+            assertEmpty(execute("SELECT * FROM %s"));
+
+            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
+            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
+
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c <= textAsBlob('')");
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c < textAsBlob('')");
+
+            assertRows(execute("SELECT * FROM %s"),
+                       row(bytes("foo123"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("2"), bytes("2")));
+        }
+    }
+
+    @Test
+    public void testDeleteWithMultipleClusteringColumnsAndEmptyRestrictionValue() throws Throwable
+    {
+        for (String options : new String[] { "", " WITH COMPACT STORAGE" })
+        {
+            createTable("CREATE TABLE %s (pk blob, c1 blob, c2 blob, v blob, PRIMARY KEY (pk, c1, c2))" + options);
+
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("1"));
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 = textAsBlob('');");
+
+            assertEmpty(execute("SELECT * FROM %s"));
+
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("1"));
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 IN (textAsBlob(''), textAsBlob('1')) AND c2 = textAsBlob('1');");
+
+            assertEmpty(execute("SELECT * FROM %s"));
+
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("0"));
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
+
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 > textAsBlob('')");
+
+            assertRows(execute("SELECT * FROM %s"),
+                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("0")));
+
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 >= textAsBlob('')");
+
+            assertEmpty(execute("SELECT * FROM %s"));
+
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
+
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 > textAsBlob('')");
+
+            assertEmpty(execute("SELECT * FROM %s"));
+
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
+            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
+
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 <= textAsBlob('')");
+            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 < textAsBlob('')");
+
+            assertRows(execute("SELECT * FROM %s"),
+                       row(bytes("foo123"), bytes("1"), bytes("1"), bytes("1")),
+                       row(bytes("foo123"), bytes("1"), bytes("2"), bytes("3")));
+        }
     }
 }

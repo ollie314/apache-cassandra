@@ -1,31 +1,61 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.index;
 
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.junit.Test;
 
+import com.datastax.driver.core.exceptions.QueryValidationException;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.restrictions.IndexRestrictions;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.cql3.statements.ModificationStatement;
-import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Indexes;
+import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.Util.throwAssert;
 import static org.apache.cassandra.cql3.statements.IndexTarget.CUSTOM_INDEX_OPTION_NAME;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -42,6 +72,17 @@ public class CustomIndexTest extends CQLTester
         execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, 0, 0, 2);
         execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, 1, 0, 1);
         execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 0, 2, 0, 0);
+    }
+
+    @Test
+    public void testTruncateWithNonCfsCustomIndex() throws Throwable
+    {
+        // deadlocks and times out the test in the face of the synchronisation
+        // issues described in the comments on CASSANDRA-9669
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a))");
+        createIndex("CREATE CUSTOM INDEX b_index ON %s(b) USING 'org.apache.cassandra.index.StubIndex'");
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 0, 1, 2);
+        getCurrentColumnFamilyStore().truncateBlocking();
     }
 
     @Test
@@ -307,52 +348,73 @@ public class CustomIndexTest extends CQLTester
     {
         Object[] row = row(0, 0, 0, 0);
         createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b))");
+        String indexName = currentTable() + "_custom_index";
         execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", row);
 
-        assertInvalidMessage(String.format(IndexRestrictions.INDEX_NOT_FOUND, "custom_index", keyspace(), currentTable()),
-                             "SELECT * FROM %s WHERE expr(custom_index, 'foo bar baz')");
 
-        createIndex(String.format("CREATE CUSTOM INDEX custom_index ON %%s(c) USING '%s'", StubIndex.class.getName()));
+        assertInvalidMessage(String.format(IndexRestrictions.INDEX_NOT_FOUND, indexName, keyspace(), currentTable()),
+                             String.format("SELECT * FROM %%s WHERE expr(%s, 'foo bar baz')", indexName));
 
-        assertInvalidMessage(String.format(IndexRestrictions.INDEX_NOT_FOUND, "no_such_index", keyspace(), currentTable()),
-                             "SELECT * FROM %s WHERE expr(no_such_index, 'foo bar baz ')");
+        createIndex(String.format("CREATE CUSTOM INDEX %s ON %%s(c) USING '%s'", indexName, StubIndex.class.getName()));
+
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  String.format(IndexRestrictions.INDEX_NOT_FOUND, "no_such_index", keyspace(), currentTable()),
+                                  QueryValidationException.class,
+                                  "SELECT * FROM %s WHERE expr(no_such_index, 'foo bar baz ')");
 
         // simple case
-        assertRows(execute("SELECT * FROM %s WHERE expr(custom_index, 'foo bar baz')"), row);
-        assertRows(execute("SELECT * FROM %s WHERE expr(\"custom_index\", 'foo bar baz')"), row);
-        assertRows(execute("SELECT * FROM %s WHERE expr(custom_index, $$foo \" ~~~ bar Baz$$)"), row);
+        assertRows(execute(String.format("SELECT * FROM %%s WHERE expr(%s, 'foo bar baz')", indexName)), row);
+        assertRows(execute(String.format("SELECT * FROM %%s WHERE expr(\"%s\", 'foo bar baz')", indexName)), row);
+        assertRows(execute(String.format("SELECT * FROM %%s WHERE expr(%s, $$foo \" ~~~ bar Baz$$)", indexName)), row);
 
         // multiple expressions on the same index
-        assertInvalidMessage(IndexRestrictions.MULTIPLE_EXPRESSIONS,
-                             "SELECT * FROM %s WHERE expr(custom_index, 'foo') AND expr(custom_index, 'bar')");
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  IndexRestrictions.MULTIPLE_EXPRESSIONS,
+                                  QueryValidationException.class,
+                                  String.format("SELECT * FROM %%s WHERE expr(%1$s, 'foo') AND expr(%1$s, 'bar')",
+                                                indexName));
 
         // multiple expressions on different indexes
         createIndex(String.format("CREATE CUSTOM INDEX other_custom_index ON %%s(d) USING '%s'", StubIndex.class.getName()));
-        assertInvalidMessage(IndexRestrictions.MULTIPLE_EXPRESSIONS,
-                             "SELECT * FROM %s WHERE expr(custom_index, 'foo') AND expr(other_custom_index, 'bar')");
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  IndexRestrictions.MULTIPLE_EXPRESSIONS,
+                                  QueryValidationException.class,
+                                  String.format("SELECT * FROM %%s WHERE expr(%s, 'foo') AND expr(other_custom_index, 'bar')",
+                                                indexName));
 
-        assertInvalidMessage(SelectStatement.REQUIRES_ALLOW_FILTERING_MESSAGE,
-                             "SELECT * FROM %s WHERE expr(custom_index, 'foo') AND d=0");
-        assertRows(execute("SELECT * FROM %s WHERE expr(custom_index, 'foo') AND d=0 ALLOW FILTERING"), row);
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                                  QueryValidationException.class,
+                                  String.format("SELECT * FROM %%s WHERE expr(%s, 'foo') AND d=0", indexName));
+        assertRows(execute(String.format("SELECT * FROM %%s WHERE expr(%s, 'foo') AND d=0 ALLOW FILTERING", indexName)), row);
     }
 
     @Test
     public void customIndexDoesntSupportCustomExpressions() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b))");
-        createIndex(String.format("CREATE CUSTOM INDEX custom_index ON %%s(c) USING '%s'",
+        String indexName = currentTable() + "_custom_index";
+        createIndex(String.format("CREATE CUSTOM INDEX %s ON %%s(c) USING '%s'",
+                                  indexName,
                                   NoCustomExpressionsIndex.class.getName()));
-        assertInvalidMessage(String.format( IndexRestrictions.CUSTOM_EXPRESSION_NOT_SUPPORTED, "custom_index"),
-                             "SELECT * FROM %s WHERE expr(custom_index, 'foo bar baz')");
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  String.format( IndexRestrictions.CUSTOM_EXPRESSION_NOT_SUPPORTED, indexName),
+                                  QueryValidationException.class,
+                                  String.format("SELECT * FROM %%s WHERE expr(%s, 'foo bar baz')", indexName));
     }
 
     @Test
     public void customIndexRejectsExpressionSyntax() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b))");
-        createIndex(String.format("CREATE CUSTOM INDEX custom_index ON %%s(c) USING '%s'",
-                                  ExpressionRejectingIndex.class.getName()));
-        assertInvalidMessage("None shall pass", "SELECT * FROM %s WHERE expr(custom_index, 'foo bar baz')");
+        String indexName = currentTable() + "_custom_index";
+        createIndex(String.format("CREATE CUSTOM INDEX %s ON %%s(c) USING '%s'",
+                                  indexName,
+                                  AlwaysRejectIndex.class.getName()));
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  "None shall pass",
+                                  QueryValidationException.class,
+                                  String.format("SELECT * FROM %%s WHERE expr(%s, 'foo bar baz')", indexName));
     }
 
     @Test
@@ -360,34 +422,44 @@ public class CustomIndexTest extends CQLTester
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b))");
         createIndex("CREATE INDEX non_custom_index ON %s(c)");
-        assertInvalidMessage(String.format(IndexRestrictions.NON_CUSTOM_INDEX_IN_EXPRESSION, "non_custom_index"),
-                             "SELECT * FROM %s WHERE expr(non_custom_index, 'c=0')");
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  String.format(IndexRestrictions.NON_CUSTOM_INDEX_IN_EXPRESSION, "non_custom_index"),
+                                  QueryValidationException.class,
+                                  "SELECT * FROM %s WHERE expr(non_custom_index, 'c=0')");
     }
 
     @Test
     public void customExpressionsDisallowedInModifications() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b))");
-        createIndex(String.format("CREATE CUSTOM INDEX custom_index ON %%s(c) USING '%s'", StubIndex.class.getName()));
+        String indexName = currentTable() + "_custom_index";
+        createIndex(String.format("CREATE CUSTOM INDEX %s ON %%s(c) USING '%s'",
+                                  indexName, StubIndex.class.getName()));
 
-        assertInvalidMessage(ModificationStatement.CUSTOM_EXPRESSIONS_NOT_ALLOWED,
-                             "DELETE FROM %s WHERE expr(custom_index, 'foo bar baz ')");
-        assertInvalidMessage(ModificationStatement.CUSTOM_EXPRESSIONS_NOT_ALLOWED,
-                             "UPDATE %s SET d=0 WHERE expr(custom_index, 'foo bar baz ')");
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  ModificationStatement.CUSTOM_EXPRESSIONS_NOT_ALLOWED,
+                                  QueryValidationException.class,
+                                  String.format("DELETE FROM %%s WHERE expr(%s, 'foo bar baz ')", indexName));
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  ModificationStatement.CUSTOM_EXPRESSIONS_NOT_ALLOWED,
+                                  QueryValidationException.class,
+                                  String.format("UPDATE %%s SET d=0 WHERE expr(%s, 'foo bar baz ')", indexName));
     }
 
     @Test
     public void indexSelectionPrefersMostSelectiveIndex() throws Throwable
     {
         createTable("CREATE TABLE %s(a int, b int, c int, PRIMARY KEY (a))");
-        createIndex(String.format("CREATE CUSTOM INDEX more_selective ON %%s(b) USING '%s'",
+        createIndex(String.format("CREATE CUSTOM INDEX %s_more_selective ON %%s(b) USING '%s'",
+                                  currentTable(),
                                   SettableSelectivityIndex.class.getName()));
-        createIndex(String.format("CREATE CUSTOM INDEX less_selective ON %%s(c) USING '%s'",
+        createIndex(String.format("CREATE CUSTOM INDEX %s_less_selective ON %%s(c) USING '%s'",
+                                  currentTable(),
                                   SettableSelectivityIndex.class.getName()));
         SettableSelectivityIndex moreSelective =
-            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName("more_selective");
+            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName(currentTable() + "_more_selective");
         SettableSelectivityIndex lessSelective =
-            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName("less_selective");
+            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName(currentTable() + "_less_selective");
         assertEquals(0, moreSelective.searchersProvided);
         assertEquals(0, lessSelective.searchersProvided);
 
@@ -409,14 +481,16 @@ public class CustomIndexTest extends CQLTester
     public void customExpressionForcesIndexSelection() throws Throwable
     {
         createTable("CREATE TABLE %s(a int, b int, c int, PRIMARY KEY (a))");
-        createIndex(String.format("CREATE CUSTOM INDEX more_selective ON %%s(b) USING '%s'",
+        createIndex(String.format("CREATE CUSTOM INDEX %s_more_selective ON %%s(b) USING '%s'",
+                                  currentTable(),
                                   SettableSelectivityIndex.class.getName()));
-        createIndex(String.format("CREATE CUSTOM INDEX less_selective ON %%s(c) USING '%s'",
+        createIndex(String.format("CREATE CUSTOM INDEX %s_less_selective ON %%s(c) USING '%s'",
+                                  currentTable(),
                                   SettableSelectivityIndex.class.getName()));
         SettableSelectivityIndex moreSelective =
-            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName("more_selective");
+            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName(currentTable() + "_more_selective");
         SettableSelectivityIndex lessSelective =
-            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName("less_selective");
+            (SettableSelectivityIndex)getCurrentColumnFamilyStore().indexManager.getIndexByName(currentTable() + "_less_selective");
         assertEquals(0, moreSelective.searchersProvided);
         assertEquals(0, lessSelective.searchersProvided);
 
@@ -428,7 +502,7 @@ public class CustomIndexTest extends CQLTester
         assertEquals(0, lessSelective.searchersProvided);
 
         // when a custom expression is present, its target index should be preferred
-        execute("SELECT * FROM %s WHERE b=0 AND expr(less_selective, 'expression') ALLOW FILTERING");
+        execute(String.format("SELECT * FROM %%s WHERE b=0 AND expr(%s_less_selective, 'expression') ALLOW FILTERING", currentTable()));
         assertEquals(1, moreSelective.searchersProvided);
         assertEquals(1, lessSelective.searchersProvided);
     }
@@ -444,12 +518,110 @@ public class CustomIndexTest extends CQLTester
                                   UTF8ExpressionIndex.class.getName()));
 
         execute("SELECT * FROM %s WHERE expr(text_index, 'foo')");
-        assertInvalidMessage("Invalid INTEGER constant (99) for \"custom index expression\" of type text",
-                             "SELECT * FROM %s WHERE expr(text_index, 99)");
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  "Invalid INTEGER constant (99) for \"custom index expression\" of type text",
+                                  QueryValidationException.class,
+                                  "SELECT * FROM %s WHERE expr(text_index, 99)");
 
         execute("SELECT * FROM %s WHERE expr(int_index, 99)");
-        assertInvalidMessage("Invalid STRING constant (foo) for \"custom index expression\" of type int",
-                             "SELECT * FROM %s WHERE expr(int_index, 'foo')");
+        assertInvalidThrowMessage(Server.CURRENT_VERSION,
+                                  "Invalid STRING constant (foo) for \"custom index expression\" of type int",
+                                  QueryValidationException.class,
+                                  "SELECT * FROM %s WHERE expr(int_index, 'foo')");
+    }
+
+    @Test
+    public void reloadIndexMetadataOnBaseCfsReload() throws Throwable
+    {
+        // verify that whenever the base table CFMetadata is reloaded, a reload of the index
+        // metadata is performed
+        createTable("CREATE TABLE %s (k int, v1 int, PRIMARY KEY(k))");
+        createIndex(String.format("CREATE CUSTOM INDEX reload_counter ON %%s() USING '%s'",
+                                  CountMetadataReloadsIndex.class.getName()));
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        CountMetadataReloadsIndex index = (CountMetadataReloadsIndex)cfs.indexManager.getIndexByName("reload_counter");
+        assertEquals(0, index.reloads.get());
+
+        // reloading the CFS, even without any metadata changes invokes the index's metadata reload task
+        cfs.reload();
+        assertEquals(1, index.reloads.get());
+    }
+
+    @Test
+    public void notifyIndexersOfPartitionAndRowRemovalDuringCleanup() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, v int, PRIMARY KEY (k,c))");
+        createIndex(String.format("CREATE CUSTOM INDEX cleanup_index ON %%s() USING '%s'", StubIndex.class.getName()));
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StubIndex index  = (StubIndex)cfs.indexManager.getIndexByName("cleanup_index");
+
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", 0, 0, 0);
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", 0, 1, 1);
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", 0, 2, 2);
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", 3, 3, 3);
+        assertEquals(4, index.rowsInserted.size());
+        assertEquals(0, index.partitionDeletions.size());
+
+        ReadCommand cmd = Util.cmd(cfs, 0).build();
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            assertTrue(iterator.hasNext());
+            cfs.indexManager.deletePartition(iterator.next(), FBUtilities.nowInSeconds());
+        }
+
+        assertEquals(1, index.partitionDeletions.size());
+        assertEquals(3, index.rowsDeleted.size());
+        for (int i = 0; i < 3; i++)
+            assertEquals(index.rowsDeleted.get(i).clustering(), index.rowsInserted.get(i).clustering());
+    }
+
+    @Test
+    public void notifyIndexersOfExpiredRowsDuringCompaction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, PRIMARY KEY (k,c))");
+        createIndex(String.format("CREATE CUSTOM INDEX row_ttl_test_index ON %%s() USING '%s'", StubIndex.class.getName()));
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StubIndex index  = (StubIndex)cfs.indexManager.getIndexByName("row_ttl_test_index");
+
+        execute("INSERT INTO %s (k, c) VALUES (?, ?) USING TTL 1", 0, 0);
+        execute("INSERT INTO %s (k, c) VALUES (?, ?)", 0, 1);
+        execute("INSERT INTO %s (k, c) VALUES (?, ?)", 0, 2);
+        execute("INSERT INTO %s (k, c) VALUES (?, ?)", 3, 3);
+        assertEquals(4, index.rowsInserted.size());
+        // flush so that we end up with an expiring row in the first sstable
+        flush();
+
+        // let the row with the ttl expire, then force a compaction
+        TimeUnit.SECONDS.sleep(2);
+        compact();
+
+        // the index should have been notified of the expired row
+        assertEquals(1, index.rowsDeleted.size());
+        Integer deletedClustering = Int32Type.instance.compose(index.rowsDeleted.get(0).clustering().get(0));
+        assertEquals(0, deletedClustering.intValue());
+    }
+
+    @Test
+    public void validateOptions() throws Throwable
+    {
+        createTable("CREATE TABLE %s(k int, c int, v1 int, v2 int, PRIMARY KEY(k,c))");
+        createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c, v2) USING '%s' WITH OPTIONS = {'foo':'bar'}",
+                                  IndexWithValidateOptions.class.getName()));
+        assertNotNull(IndexWithValidateOptions.options);
+        assertEquals("bar", IndexWithValidateOptions.options.get("foo"));
+    }
+
+    @Test
+    public void validateOptionsWithCFMetaData() throws Throwable
+    {
+        createTable("CREATE TABLE %s(k int, c int, v1 int, v2 int, PRIMARY KEY(k,c))");
+        createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c, v2) USING '%s' WITH OPTIONS = {'foo':'bar'}",
+                                  IndexWithOverloadedValidateOptions.class.getName()));
+        CFMetaData cfm = getCurrentColumnFamilyStore().metadata;
+        assertEquals(cfm, IndexWithOverloadedValidateOptions.cfm);
+        assertNotNull(IndexWithOverloadedValidateOptions.options);
+        assertEquals("bar", IndexWithOverloadedValidateOptions.options.get("foo"));
     }
 
     private void testCreateIndex(String indexName, String... targetColumnNames) throws Throwable
@@ -493,6 +665,27 @@ public class CustomIndexTest extends CQLTester
     private static IndexTarget indexTarget(String name, IndexTarget.Type type)
     {
         return new IndexTarget(ColumnIdentifier.getInterned(name, true), type);
+    }
+
+    public static final class CountMetadataReloadsIndex extends StubIndex
+    {
+        private final AtomicInteger reloads = new AtomicInteger(0);
+
+        public CountMetadataReloadsIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        public void reset()
+        {
+            super.reset();
+            reloads.set(0);
+        }
+
+        public Callable<?> getMetadataReloadTask(IndexMetadata indexMetadata)
+        {
+            return reloads::incrementAndGet;
+        }
     }
 
     public static final class IndexIncludedInBuild extends StubIndex
@@ -587,16 +780,55 @@ public class CustomIndexTest extends CQLTester
         }
     }
 
-    public static final class ExpressionRejectingIndex extends StubIndex
+    public static final class AlwaysRejectIndex extends StubIndex
     {
-        public ExpressionRejectingIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        public AlwaysRejectIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
         {
             super(baseCfs, metadata);
         }
 
-        public Searcher searcherFor(ReadCommand command) throws InvalidRequestException
+        public void validate(ReadCommand command) throws InvalidRequestException
         {
             throw new InvalidRequestException("None shall pass");
+        }
+
+        public Searcher searcherFor(ReadCommand command)
+        {
+            throw new InvalidRequestException("None shall pass (though I'd have expected to fail faster)");
+        }
+    }
+
+    public static final class IndexWithValidateOptions extends StubIndex
+    {
+        public static Map<String, String> options;
+
+        public IndexWithValidateOptions(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        public static Map<String, String> validateOptions(Map<String, String> options)
+        {
+            IndexWithValidateOptions.options = options;
+            return new HashMap<>();
+        }
+    }
+
+    public static final class IndexWithOverloadedValidateOptions extends StubIndex
+    {
+        public static CFMetaData cfm;
+        public static Map<String, String> options;
+
+        public IndexWithOverloadedValidateOptions(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        public static Map<String, String> validateOptions(Map<String, String> options, CFMetaData cfm)
+        {
+            IndexWithOverloadedValidateOptions.options = options;
+            IndexWithOverloadedValidateOptions.cfm = cfm;
+            return new HashMap<>();
         }
     }
 }

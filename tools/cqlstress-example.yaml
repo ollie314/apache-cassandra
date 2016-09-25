@@ -59,6 +59,7 @@ table_definition: |
 #      GAUSSIAN(min..max,mean,stdev)        A gaussian/normal distribution, with explicitly defined mean and stdev
 #      UNIFORM(min..max)                    A uniform distribution over the range [min, max]
 #      FIXED(val)                           A fixed distribution, always returning the same value
+#      SEQ(min..max)                        A fixed sequence, returning values from min to max sequentially, wrapping if necessary.
 #      Aliases: extr, gauss, normal, norm, weibull
 #
 #      If preceded by ~, the distribution is inverted
@@ -93,3 +94,16 @@ queries:
    range1:
       cql: select * from typestest where name = ? and choice = ? and date >= ? LIMIT 100
       fields: multirow            # samerow or multirow (select arguments from the same row, or randomly from all rows in the partition)
+
+
+#
+# A list of bulk read queries that analytics tools may perform against the schema
+# Each query will sweep an entire token range, page by page.
+#
+token_range_queries:
+  all_columns_tr_query:
+    columns: '*'
+    page_size: 5000
+
+  value_tr_query:
+    columns: value

@@ -1,3 +1,23 @@
+/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
 package org.apache.cassandra.db;
 
 import java.io.IOException;
@@ -16,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryProcessor;
@@ -53,6 +74,8 @@ public class SinglePartitionSliceCommandTest
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
     {
+        DatabaseDescriptor.daemonInitialization();
+
         cfm = CFMetaData.Builder.create(KEYSPACE, TABLE)
                                 .addPartitionKey("k", UTF8Type.instance)
                                 .addStaticColumn("s", UTF8Type.instance)
@@ -94,9 +117,9 @@ public class SinglePartitionSliceCommandTest
 
         ColumnFilter columnFilter = ColumnFilter.selection(PartitionColumns.of(v));
         ByteBuffer zero = ByteBufferUtil.bytes(0);
-        Slices slices = Slices.with(cfm.comparator, Slice.make(Slice.Bound.inclusiveStartOf(zero), Slice.Bound.inclusiveEndOf(zero)));
+        Slices slices = Slices.with(cfm.comparator, Slice.make(ClusteringBound.inclusiveStartOf(zero), ClusteringBound.inclusiveEndOf(zero)));
         ClusteringIndexSliceFilter sliceFilter = new ClusteringIndexSliceFilter(slices, false);
-        ReadCommand cmd = new SinglePartitionSliceCommand(false, MessagingService.VERSION_30, true, cfm,
+        ReadCommand cmd = new SinglePartitionReadCommand(false, MessagingService.VERSION_30, true, cfm,
                                                           FBUtilities.nowInSeconds(),
                                                           columnFilter,
                                                           RowFilter.NONE,
@@ -110,16 +133,22 @@ public class SinglePartitionSliceCommandTest
         cmd = ReadCommand.legacyReadCommandSerializer.deserialize(in, MessagingService.VERSION_21);
 
         logger.debug("ReadCommand: {}", cmd);
-        UnfilteredPartitionIterator partitionIterator = cmd.executeLocally(ReadExecutionController.empty());
-        ReadResponse response = ReadResponse.createDataResponse(partitionIterator, cmd.columnFilter());
+        try (ReadExecutionController controller = cmd.executionController();
+             UnfilteredPartitionIterator partitionIterator = cmd.executeLocally(controller))
+        {
+            ReadResponse response = ReadResponse.createDataResponse(partitionIterator, cmd);
 
-        logger.debug("creating response: {}", response);
-        partitionIterator = response.makeIterator(cfm, null);  // <- cmd is null
-        assert partitionIterator.hasNext();
-        UnfilteredRowIterator partition = partitionIterator.next();
-
-        LegacyLayout.LegacyUnfilteredPartition rowIter = LegacyLayout.fromUnfilteredRowIterator(partition);
-        Assert.assertEquals(Collections.emptyList(), rowIter.cells);
+            logger.debug("creating response: {}", response);
+            try (UnfilteredPartitionIterator pIter = response.makeIterator(cmd))
+            {
+                assert pIter.hasNext();
+                try (UnfilteredRowIterator partition = pIter.next())
+                {
+                    LegacyLayout.LegacyUnfilteredPartition rowIter = LegacyLayout.fromUnfilteredRowIterator(cmd, partition);
+                    Assert.assertEquals(Collections.emptyList(), rowIter.cells);
+                }
+            }
+        }
     }
 
     private void checkForS(UnfilteredPartitionIterator pi)
@@ -146,13 +175,13 @@ public class SinglePartitionSliceCommandTest
 
         ColumnFilter columnFilter = ColumnFilter.selection(PartitionColumns.of(s));
         ClusteringIndexSliceFilter sliceFilter = new ClusteringIndexSliceFilter(Slices.NONE, false);
-        ReadCommand cmd = new SinglePartitionSliceCommand(false, MessagingService.VERSION_30, true, cfm,
-                                                          FBUtilities.nowInSeconds(),
-                                                          columnFilter,
-                                                          RowFilter.NONE,
-                                                          DataLimits.NONE,
-                                                          key,
-                                                          sliceFilter);
+        ReadCommand cmd = new SinglePartitionReadCommand(false, MessagingService.VERSION_30, true, cfm,
+                                                         FBUtilities.nowInSeconds(),
+                                                         columnFilter,
+                                                         RowFilter.NONE,
+                                                         DataLimits.NONE,
+                                                         key,
+                                                         sliceFilter);
 
         // check raw iterator for static cell
         try (ReadExecutionController executionController = cmd.executionController(); UnfilteredPartitionIterator pi = cmd.executeLocally(executionController))
@@ -168,14 +197,14 @@ public class SinglePartitionSliceCommandTest
         // check (de)serialized iterator for memtable static cell
         try (ReadExecutionController executionController = cmd.executionController(); UnfilteredPartitionIterator pi = cmd.executeLocally(executionController))
         {
-            response = ReadResponse.createDataResponse(pi, cmd.columnFilter());
+            response = ReadResponse.createDataResponse(pi, cmd);
         }
 
         out = new DataOutputBuffer((int) ReadResponse.serializer.serializedSize(response, MessagingService.VERSION_30));
         ReadResponse.serializer.serialize(response, out, MessagingService.VERSION_30);
         in = new DataInputBuffer(out.buffer(), true);
         dst = ReadResponse.serializer.deserialize(in, MessagingService.VERSION_30);
-        try (UnfilteredPartitionIterator pi = dst.makeIterator(cfm, cmd))
+        try (UnfilteredPartitionIterator pi = dst.makeIterator(cmd))
         {
             checkForS(pi);
         }
@@ -184,13 +213,13 @@ public class SinglePartitionSliceCommandTest
         Schema.instance.getColumnFamilyStoreInstance(cfm.cfId).forceBlockingFlush();
         try (ReadExecutionController executionController = cmd.executionController(); UnfilteredPartitionIterator pi = cmd.executeLocally(executionController))
         {
-            response = ReadResponse.createDataResponse(pi, cmd.columnFilter());
+            response = ReadResponse.createDataResponse(pi, cmd);
         }
         out = new DataOutputBuffer((int) ReadResponse.serializer.serializedSize(response, MessagingService.VERSION_30));
         ReadResponse.serializer.serialize(response, out, MessagingService.VERSION_30);
         in = new DataInputBuffer(out.buffer(), true);
         dst = ReadResponse.serializer.deserialize(in, MessagingService.VERSION_30);
-        try (UnfilteredPartitionIterator pi = dst.makeIterator(cfm, cmd))
+        try (UnfilteredPartitionIterator pi = dst.makeIterator(cmd))
         {
             checkForS(pi);
         }

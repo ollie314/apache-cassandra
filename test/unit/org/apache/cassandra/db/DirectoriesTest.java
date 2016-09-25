@@ -41,8 +41,10 @@ import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.service.DefaultFSErrorHandler;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
@@ -65,6 +67,10 @@ public class DirectoriesTest
     @BeforeClass
     public static void beforeClass() throws IOException
     {
+        DatabaseDescriptor.daemonInitialization();
+
+        FileUtils.setFSErrorHandler(new DefaultFSErrorHandler());
+
         for (String table : TABLES)
         {
             UUID tableID = CFMetaData.generateLegacyCfId(KS, table);
@@ -115,7 +121,7 @@ public class DirectoriesTest
 
     private static void createFakeSSTable(File dir, String cf, int gen, List<File> addTo) throws IOException
     {
-        Descriptor desc = new Descriptor(dir, KS, cf, gen);
+        Descriptor desc = new Descriptor(dir, KS, cf, gen, SSTableFormat.Type.BIG);
         for (Component c : new Component[]{ Component.DATA, Component.PRIMARY_INDEX, Component.FILTER })
         {
             File f = new File(desc.filenameFor(c));
@@ -150,7 +156,7 @@ public class DirectoriesTest
             Directories directories = new Directories(cfm);
             assertEquals(cfDir(cfm), directories.getDirectoryForNewSSTables());
 
-            Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1);
+            Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1, SSTableFormat.Type.BIG);
             File snapshotDir = new File(cfDir(cfm),  File.separator + Directories.SNAPSHOT_SUBDIR + File.separator + "42");
             assertEquals(snapshotDir, Directories.getSnapshotDirectory(desc, "42"));
 
@@ -184,8 +190,8 @@ public class DirectoriesTest
         {
             assertEquals(cfDir(INDEX_CFM), dir);
         }
-        Descriptor parentDesc = new Descriptor(parentDirectories.getDirectoryForNewSSTables(), KS, PARENT_CFM.cfName, 0);
-        Descriptor indexDesc = new Descriptor(indexDirectories.getDirectoryForNewSSTables(), KS, INDEX_CFM.cfName, 0);
+        Descriptor parentDesc = new Descriptor(parentDirectories.getDirectoryForNewSSTables(), KS, PARENT_CFM.cfName, 0, SSTableFormat.Type.BIG);
+        Descriptor indexDesc = new Descriptor(indexDirectories.getDirectoryForNewSSTables(), KS, INDEX_CFM.cfName, 0, SSTableFormat.Type.BIG);
 
         // snapshot dir should be created under its parent's
         File parentSnapshotDirectory = Directories.getSnapshotDirectory(parentDesc, "test");
@@ -202,9 +208,9 @@ public class DirectoriesTest
                      indexDirectories.snapshotCreationTime("test"));
 
         // check true snapshot size
-        Descriptor parentSnapshot = new Descriptor(parentSnapshotDirectory, KS, PARENT_CFM.cfName, 0);
+        Descriptor parentSnapshot = new Descriptor(parentSnapshotDirectory, KS, PARENT_CFM.cfName, 0, SSTableFormat.Type.BIG);
         createFile(parentSnapshot.filenameFor(Component.DATA), 30);
-        Descriptor indexSnapshot = new Descriptor(indexSnapshotDirectory, KS, INDEX_CFM.cfName, 0);
+        Descriptor indexSnapshot = new Descriptor(indexSnapshotDirectory, KS, INDEX_CFM.cfName, 0, SSTableFormat.Type.BIG);
         createFile(indexSnapshot.filenameFor(Component.DATA), 40);
 
         assertEquals(30, parentDirectories.trueSnapshotsSize());
@@ -243,46 +249,76 @@ public class DirectoriesTest
         for (CFMetaData cfm : CFM)
         {
             Directories directories = new Directories(cfm);
-            Directories.SSTableLister lister;
-            Set<File> listed;
-
-            // List all but no snapshot, backup
-            lister = directories.sstableLister(Directories.OnTxnErr.THROW);
-            listed = new HashSet<>(lister.listFiles());
-            for (File f : files.get(cfm.cfName))
-            {
-                if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else
-                    assert listed.contains(f) : f + " is missing";
-            }
-
-            // List all but including backup (but no snapshot)
-            lister = directories.sstableLister(Directories.OnTxnErr.THROW).includeBackups(true);
-            listed = new HashSet<>(lister.listFiles());
-            for (File f : files.get(cfm.cfName))
-            {
-                if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else
-                    assert listed.contains(f) : f + " is missing";
-            }
-
-            // Skip temporary and compacted
-            lister = directories.sstableLister(Directories.OnTxnErr.THROW).skipTemporary(true);
-            listed = new HashSet<>(lister.listFiles());
-            for (File f : files.get(cfm.cfName))
-            {
-                if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else if (f.getName().contains("tmp-"))
-                    assert !listed.contains(f) : f + " should not be listed";
-                else
-                    assert listed.contains(f) : f + " is missing";
-            }
+            checkFiles(cfm, directories);
         }
     }
 
+    private void checkFiles(CFMetaData cfm, Directories directories)
+    {
+        Directories.SSTableLister lister;
+        Set<File> listed;// List all but no snapshot, backup
+        lister = directories.sstableLister(Directories.OnTxnErr.THROW);
+        listed = new HashSet<>(lister.listFiles());
+        for (File f : files.get(cfm.cfName))
+        {
+            if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else
+                assertTrue(f + " is missing", listed.contains(f));
+        }
+
+        // List all but including backup (but no snapshot)
+        lister = directories.sstableLister(Directories.OnTxnErr.THROW).includeBackups(true);
+        listed = new HashSet<>(lister.listFiles());
+        for (File f : files.get(cfm.cfName))
+        {
+            if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else
+                assertTrue(f + " is missing", listed.contains(f));
+        }
+
+        // Skip temporary and compacted
+        lister = directories.sstableLister(Directories.OnTxnErr.THROW).skipTemporary(true);
+        listed = new HashSet<>(lister.listFiles());
+        for (File f : files.get(cfm.cfName))
+        {
+            if (f.getPath().contains(Directories.SNAPSHOT_SUBDIR) || f.getPath().contains(Directories.BACKUPS_SUBDIR))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else if (f.getName().contains("tmp-"))
+                assertFalse(f + " should not be listed", listed.contains(f));
+            else
+                assertTrue(f + " is missing", listed.contains(f));
+        }
+    }
+
+    @Test
+    public void testTemporaryFile() throws IOException
+    {
+        for (CFMetaData cfm : CFM)
+        {
+            Directories directories = new Directories(cfm);
+
+            File tempDir = directories.getTemporaryWriteableDirectoryAsFile(10);
+            tempDir.mkdir();
+            File tempFile = new File(tempDir, "tempFile");
+            tempFile.createNewFile();
+
+            assertTrue(tempDir.exists());
+            assertTrue(tempFile.exists());
+
+            //make sure temp dir/file will not affect existing sstable listing
+            checkFiles(cfm, directories);
+
+            directories.removeTemporaryDirectories();
+
+            //make sure temp dir/file deletion will not affect existing sstable listing
+            checkFiles(cfm, directories);
+
+            assertFalse(tempDir.exists());
+            assertFalse(tempFile.exists());
+        }
+    }
 
     @Test
     public void testDiskFailurePolicy_best_effort()
@@ -322,7 +358,7 @@ public class DirectoriesTest
             final String n = Long.toString(System.nanoTime());
             Callable<File> directoryGetter = new Callable<File>() {
                 public File call() throws Exception {
-                    Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1);
+                    Descriptor desc = new Descriptor(cfDir(cfm), KS, cfm.cfName, 1, SSTableFormat.Type.BIG);
                     return Directories.getSnapshotDirectory(desc, n);
                 }
             };

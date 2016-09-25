@@ -23,9 +23,9 @@ import java.util.UUID;
 
 import org.junit.Test;
 
-
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.partitions.Partition;
@@ -36,10 +36,10 @@ import org.apache.cassandra.triggers.ITrigger;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static java.lang.String.format;
-import static junit.framework.Assert.assertFalse;
-import static junit.framework.Assert.fail;
 import static junit.framework.Assert.assertEquals;
+import static junit.framework.Assert.assertFalse;
 import static junit.framework.Assert.assertTrue;
+import static junit.framework.Assert.fail;
 
 public class CreateTest extends CQLTester
 {
@@ -511,7 +511,7 @@ public class CreateTest extends CQLTester
         createTable("CREATE TABLE %s (a text, b int, c int, primary key (a, b))");
 
         assertRows(execute(format("SELECT compression FROM %s.%s WHERE keyspace_name = ? and table_name = ?;",
-                                  SchemaKeyspace.NAME,
+                                  SchemaConstants.SCHEMA_KEYSPACE_NAME,
                                   SchemaKeyspace.TABLES),
                            KEYSPACE,
                            currentTable()),
@@ -521,7 +521,7 @@ public class CreateTest extends CQLTester
                 + " WITH compression = { 'class' : 'SnappyCompressor', 'chunk_length_in_kb' : 32 };");
 
         assertRows(execute(format("SELECT compression FROM %s.%s WHERE keyspace_name = ? and table_name = ?;",
-                                  SchemaKeyspace.NAME,
+                                  SchemaConstants.SCHEMA_KEYSPACE_NAME,
                                   SchemaKeyspace.TABLES),
                            KEYSPACE,
                            currentTable()),
@@ -531,7 +531,7 @@ public class CreateTest extends CQLTester
                 + " WITH compression = { 'class' : 'SnappyCompressor', 'chunk_length_in_kb' : 32, 'enabled' : true };");
 
         assertRows(execute(format("SELECT compression FROM %s.%s WHERE keyspace_name = ? and table_name = ?;",
-                                  SchemaKeyspace.NAME,
+                                  SchemaConstants.SCHEMA_KEYSPACE_NAME,
                                   SchemaKeyspace.TABLES),
                            KEYSPACE,
                            currentTable()),
@@ -541,7 +541,7 @@ public class CreateTest extends CQLTester
                 + " WITH compression = { 'sstable_compression' : 'SnappyCompressor', 'chunk_length_kb' : 32 };");
 
         assertRows(execute(format("SELECT compression FROM %s.%s WHERE keyspace_name = ? and table_name = ?;",
-                                  SchemaKeyspace.NAME,
+                                  SchemaConstants.SCHEMA_KEYSPACE_NAME,
                                   SchemaKeyspace.TABLES),
                            KEYSPACE,
                            currentTable()),
@@ -551,7 +551,7 @@ public class CreateTest extends CQLTester
                 + " WITH compression = { 'sstable_compression' : '', 'chunk_length_kb' : 32 };");
 
         assertRows(execute(format("SELECT compression FROM %s.%s WHERE keyspace_name = ? and table_name = ?;",
-                                  SchemaKeyspace.NAME,
+                                  SchemaConstants.SCHEMA_KEYSPACE_NAME,
                                   SchemaKeyspace.TABLES),
                            KEYSPACE,
                            currentTable()),
@@ -561,7 +561,7 @@ public class CreateTest extends CQLTester
                 + " WITH compression = { 'enabled' : 'false'};");
 
         assertRows(execute(format("SELECT compression FROM %s.%s WHERE keyspace_name = ? and table_name = ?;",
-                                  SchemaKeyspace.NAME,
+                                  SchemaConstants.SCHEMA_KEYSPACE_NAME,
                                   SchemaKeyspace.TABLES),
                            KEYSPACE,
                            currentTable()),

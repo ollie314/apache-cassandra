@@ -50,15 +50,20 @@ public class OutboundTcpConnectionPool
     private InetAddress resetEndpoint;
     private ConnectionMetrics metrics;
 
-    OutboundTcpConnectionPool(InetAddress remoteEp)
+    // back-pressure state linked to this connection:
+    private final BackPressureState backPressureState;
+
+    OutboundTcpConnectionPool(InetAddress remoteEp, BackPressureState backPressureState)
     {
         id = remoteEp;
         resetEndpoint = SystemKeyspace.getPreferredIP(remoteEp);
         started = new CountDownLatch(1);
 
-        smallMessages = new OutboundTcpConnection(this);
-        largeMessages = new OutboundTcpConnection(this);
-        gossipMessages = new OutboundTcpConnection(this);
+        smallMessages = new OutboundTcpConnection(this, "Small");
+        largeMessages = new OutboundTcpConnection(this, "Large");
+        gossipMessages = new OutboundTcpConnection(this, "Gossip");
+
+        this.backPressureState = backPressureState;
     }
 
     /**
@@ -72,6 +77,11 @@ public class OutboundTcpConnectionPool
         return msg.payloadSize(smallMessages.getTargetVersion()) > LARGE_MESSAGE_THRESHOLD
                ? largeMessages
                : smallMessages;
+    }
+
+    public BackPressureState getBackPressureState()
+    {
+        return backPressureState;
     }
 
     void reset()
@@ -122,6 +132,7 @@ public class OutboundTcpConnectionPool
         return newSocket(endPoint());
     }
 
+    @SuppressWarnings("resource") // Closing the socket will close the underlying channel.
     public static Socket newSocket(InetAddress endpoint) throws IOException
     {
         // zero means 'bind on any available port.'
@@ -134,10 +145,11 @@ public class OutboundTcpConnectionPool
         }
         else
         {
-            Socket socket = SocketChannel.open(new InetSocketAddress(endpoint, DatabaseDescriptor.getStoragePort())).socket();
-            if (Config.getOutboundBindAny() && !socket.isBound())
-                socket.bind(new InetSocketAddress(FBUtilities.getLocalAddress(), 0));
-            return socket;
+            SocketChannel channel = SocketChannel.open();
+            if (!Config.getOutboundBindAny())
+                channel.bind(new InetSocketAddress(FBUtilities.getLocalAddress(), 0));
+            channel.connect(new InetSocketAddress(endpoint, DatabaseDescriptor.getStoragePort()));
+            return channel.socket();
         }
     }
 

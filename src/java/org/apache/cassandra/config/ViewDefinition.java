@@ -37,7 +37,6 @@ public class ViewDefinition
     public final UUID baseTableId;
     public final String baseTableName;
     public final boolean includeAllColumns;
-    // The order of partititon columns and clustering columns is important, so we cannot switch these two to sets
     public final CFMetaData metadata;
 
     public SelectStatement.RawStatement select;
@@ -129,8 +128,10 @@ public class ViewDefinition
     }
 
     /**
-     * Replace the column {@param from} with {@param to} in this materialized view definition's partition,
+     * Replace the column 'from' with 'to' in this materialized view definition's partition,
      * clustering, or included columns.
+     * @param from the existing column
+     * @param to the new column
      */
     public void renameColumn(ColumnIdentifier from, ColumnIdentifier to)
     {
@@ -138,8 +139,8 @@ public class ViewDefinition
 
         // convert whereClause to Relations, rename ids in Relations, then convert back to whereClause
         List<Relation> relations = whereClauseToRelations(whereClause);
-        ColumnIdentifier.Raw fromRaw = new ColumnIdentifier.Literal(from.toString(), true);
-        ColumnIdentifier.Raw toRaw = new ColumnIdentifier.Literal(to.toString(), true);
+        ColumnDefinition.Raw fromRaw = ColumnDefinition.Raw.forQuoted(from.toString());
+        ColumnDefinition.Raw toRaw = ColumnDefinition.Raw.forQuoted(to.toString());
         List<Relation> newRelations = relations.stream()
                 .map(r -> r.renameIdentifier(fromRaw, toRaw))
                 .collect(Collectors.toList());
@@ -151,22 +152,9 @@ public class ViewDefinition
 
     private static List<Relation> whereClauseToRelations(String whereClause)
     {
-        ErrorCollector errorCollector = new ErrorCollector(whereClause);
-        CharStream stream = new ANTLRStringStream(whereClause);
-        CqlLexer lexer = new CqlLexer(stream);
-        lexer.addErrorListener(errorCollector);
-
-        TokenStream tokenStream = new CommonTokenStream(lexer);
-        CqlParser parser = new CqlParser(tokenStream);
-        parser.addErrorListener(errorCollector);
-
         try
         {
-            List<Relation> relations = parser.whereClause().build().relations;
-
-            // The errorCollector has queued up any errors that the lexer and parser may have encountered
-            // along the way, if necessary, we turn the last error into exceptions here.
-            errorCollector.throwFirstSyntaxError();
+            List<Relation> relations = CQLFragmentParser.parseAnyUnhandled(CqlParser::whereClause, whereClause).build().relations;
 
             return relations;
         }

@@ -27,10 +27,10 @@ import com.google.common.collect.ImmutableMap;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.monitoring.ConstructionTime;
-import org.apache.cassandra.db.monitoring.MonitorableImpl;
+import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.io.util.FileUtils;
 
 public class MessageIn<T>
 {
@@ -75,7 +75,7 @@ public class MessageIn<T>
     {
         InetAddress from = CompactEndpointSerializationHelper.deserialize(in);
 
-        MessagingService.Verb verb = MessagingService.Verb.values()[in.readInt()];
+        MessagingService.Verb verb = MessagingService.verbValues[in.readInt()];
         int parameterCount = in.readInt();
         Map<String, byte[]> parameters;
         if (parameterCount == 0)
@@ -120,14 +120,17 @@ public class MessageIn<T>
         return new ConstructionTime();
     }
 
-    public static ConstructionTime readTimestamp(DataInputPlus input) throws IOException
+    public static ConstructionTime readTimestamp(InetAddress from, DataInputPlus input, long timestamp) throws IOException
     {
         // make sure to readInt, even if cross_node_to is not enabled
         int partial = input.readInt();
+        long crossNodeTimestamp = (timestamp & 0xFFFFFFFF00000000L) | (((partial & 0xFFFFFFFFL) << 2) >> 2);
+        if (timestamp > crossNodeTimestamp)
+        {
+            MessagingService.instance().metrics.addTimeTaken(from, timestamp - crossNodeTimestamp);
+        }
         if(DatabaseDescriptor.hasCrossNodeTimeout())
         {
-            long timestamp = System.currentTimeMillis();
-            long crossNodeTimestamp = (timestamp & 0xFFFFFFFF00000000L) | (((partial & 0xFFFFFFFFL) << 2) >> 2);
             return new ConstructionTime(crossNodeTimestamp, timestamp != crossNodeTimestamp);
         }
         else
@@ -151,9 +154,38 @@ public class MessageIn<T>
         return parameters.containsKey(MessagingService.FAILURE_RESPONSE_PARAM);
     }
 
+    public boolean containsFailureReason()
+    {
+        return parameters.containsKey(MessagingService.FAILURE_REASON_PARAM);
+    }
+
+    public RequestFailureReason getFailureReason()
+    {
+        if (containsFailureReason())
+        {
+            try (DataInputBuffer in = new DataInputBuffer(parameters.get(MessagingService.FAILURE_REASON_PARAM)))
+            {
+                return RequestFailureReason.fromCode(in.readUnsignedShort());
+            }
+            catch (IOException ex)
+            {
+                throw new RuntimeException(ex);
+            }
+        }
+        else
+        {
+            return RequestFailureReason.UNKNOWN;
+        }
+    }
+
     public long getTimeout()
     {
-        return DatabaseDescriptor.getTimeout(verb);
+        return verb.getTimeout();
+    }
+
+    public long getSlowQueryTimeout()
+    {
+        return DatabaseDescriptor.getSlowQueryTimeout();
     }
 
     public String toString()

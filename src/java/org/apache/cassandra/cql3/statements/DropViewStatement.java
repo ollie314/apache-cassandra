@@ -20,8 +20,6 @@ package org.apache.cassandra.cql3.statements;
 
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.ViewDefinition;
 import org.apache.cassandra.cql3.CFName;
 import org.apache.cassandra.db.view.View;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -53,12 +51,7 @@ public class DropViewStatement extends SchemaAlteringStatement
         // validated in findIndexedCf()
     }
 
-    public Event.SchemaChange changeEvent()
-    {
-        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
-    }
-
-    public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
+    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
         try
         {
@@ -81,12 +74,12 @@ public class DropViewStatement extends SchemaAlteringStatement
 //            }
 
             MigrationManager.announceViewDrop(keyspace(), columnFamily(), isLocalOnly);
-            return true;
+            return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
         }
         catch (ConfigurationException e)
         {
             if (ifExists)
-                return false;
+                return null;
             throw e;
         }
     }

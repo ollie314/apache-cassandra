@@ -75,9 +75,10 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     }
 
     @Override
-    public boolean references(AbstractType<?> check)
+    public boolean referencesUserType(String userTypeName)
     {
-        return super.references(check) || keys.references(check) || values.references(check);
+        return getKeysType().referencesUserType(userTypeName) ||
+               getValuesType().referencesUserType(userTypeName);
     }
 
     public AbstractType<K> getKeysType()
@@ -113,6 +114,23 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             return getInstance(this.keys, this.values, false);
         else
             return this;
+    }
+
+    @Override
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        if (!isMultiCell())
+            return this;
+
+        AbstractType<?> keyType = (keys.isFreezable() && keys.isMultiCell())
+                                ? keys.freeze()
+                                : keys.freezeNestedMulticellTypes();
+
+        AbstractType<?> valueType = (values.isFreezable() && values.isMultiCell())
+                                  ? values.freeze()
+                                  : values.freezeNestedMulticellTypes();
+
+        return getInstance(keyType, valueType, isMultiCell);
     }
 
     @Override
@@ -245,7 +263,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             if (key.startsWith("\""))
                 sb.append(key);
             else
-                sb.append('"').append(Json.JSON_STRING_ENCODER.quoteAsString(key)).append('"');
+                sb.append('"').append(Json.quoteAsJsonString(key)).append('"');
 
             sb.append(": ");
             sb.append(values.toJSONString(CollectionSerializer.readValue(buffer, protocolVersion), protocolVersion));

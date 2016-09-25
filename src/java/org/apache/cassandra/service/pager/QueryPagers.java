@@ -45,7 +45,8 @@ public class QueryPagers
                                  ClientState state,
                                  final int pageSize,
                                  int nowInSec,
-                                 boolean isForThrift) throws RequestValidationException, RequestExecutionException
+                                 boolean isForThrift,
+                                 long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
     {
         SinglePartitionReadCommand command = SinglePartitionReadCommand.create(isForThrift, metadata, nowInSec, columnFilter, RowFilter.NONE, limits, key, filter);
         final SinglePartitionPager pager = new SinglePartitionPager(command, null, Server.CURRENT_VERSION);
@@ -53,10 +54,11 @@ public class QueryPagers
         int count = 0;
         while (!pager.isExhausted())
         {
-            try (CountingPartitionIterator iter = new CountingPartitionIterator(pager.fetchPage(pageSize, consistencyLevel, state), limits, nowInSec))
+            try (PartitionIterator iter = pager.fetchPage(pageSize, consistencyLevel, state, queryStartNanoTime))
             {
-                PartitionIterators.consume(iter);
-                count += iter.counter().counted();
+                DataLimits.Counter counter = limits.newCounter(nowInSec, true);
+                PartitionIterators.consume(counter.applyTo(iter));
+                count += counter.counted();
             }
         }
         return count;

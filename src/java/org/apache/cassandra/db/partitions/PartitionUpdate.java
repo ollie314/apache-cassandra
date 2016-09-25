@@ -193,18 +193,36 @@ public class PartitionUpdate extends AbstractBTreePartition
     /**
      * Turns the given iterator into an update.
      *
+     * @param iterator the iterator to turn into updates.
+     * @param filter the column filter used when querying {@code iterator}. This is used to make
+     * sure we don't include data for which the value has been skipped while reading (as we would
+     * then be writing something incorrect).
+     *
      * Warning: this method does not close the provided iterator, it is up to
      * the caller to close it.
      */
-    public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator)
+    public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator, ColumnFilter filter)
     {
+        iterator = UnfilteredRowIterators.withOnlyQueriedData(iterator, filter);
         Holder holder = build(iterator, 16);
         MutableDeletionInfo deletionInfo = (MutableDeletionInfo) holder.deletionInfo;
         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
     }
 
-    public static PartitionUpdate fromIterator(RowIterator iterator)
+    /**
+     * Turns the given iterator into an update.
+     *
+     * @param iterator the iterator to turn into updates.
+     * @param filter the column filter used when querying {@code iterator}. This is used to make
+     * sure we don't include data for which the value has been skipped while reading (as we would
+     * then be writing something incorrect).
+     *
+     * Warning: this method does not close the provided iterator, it is up to
+     * the caller to close it.
+     */
+    public static PartitionUpdate fromIterator(RowIterator iterator, ColumnFilter filter)
     {
+        iterator = RowIterators.withOnlyQueriedData(iterator, filter);
         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
         Holder holder = build(iterator, deletionInfo, true, 16);
         return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);
@@ -256,7 +274,7 @@ public class PartitionUpdate extends AbstractBTreePartition
         try (DataOutputBuffer out = new DataOutputBuffer())
         {
             serializer.serialize(update, out, version);
-            return ByteBuffer.wrap(out.getData(), 0, out.getLength());
+            return out.asNewBuffer();
         }
         catch (IOException e)
         {
@@ -296,7 +314,7 @@ public class PartitionUpdate extends AbstractBTreePartition
 
         int nowInSecs = FBUtilities.nowInSeconds();
         List<UnfilteredRowIterator> asIterators = Lists.transform(updates, AbstractBTreePartition::unfilteredIterator);
-        return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs));
+        return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs), ColumnFilter.all(updates.get(0).metadata()));
     }
 
     /**
@@ -334,6 +352,7 @@ public class PartitionUpdate extends AbstractBTreePartition
     public int operationCount()
     {
         return rowCount()
+             + (staticRow().isEmpty() ? 0 : 1)
              + deletionInfo.rangeCount()
              + (deletionInfo.getPartitionDeletion().isLive() ? 0 : 1);
     }
@@ -419,13 +438,6 @@ public class PartitionUpdate extends AbstractBTreePartition
         return super.iterator();
     }
 
-    @Override
-    public SliceableUnfilteredRowIterator sliceableUnfilteredIterator(ColumnFilter columns, boolean reversed)
-    {
-        maybeBuild();
-        return super.sliceableUnfilteredIterator(columns, reversed);
-    }
-
     /**
      * Validates the data contained in this update.
      *
@@ -483,19 +495,23 @@ public class PartitionUpdate extends AbstractBTreePartition
         assert metadata().isCounter();
         maybeBuild();
         // We will take aliases on the rows of this update, and update them in-place. So we should be sure the
-        // update is no immutable for all intent and purposes.
+        // update is now immutable for all intent and purposes.
         canReOpen = false;
 
-        List<CounterMark> l = new ArrayList<>();
+        List<CounterMark> marks = new ArrayList<>();
+        addMarksForRow(staticRow(), marks);
         for (Row row : this)
+            addMarksForRow(row, marks);
+        return marks;
+    }
+
+    private void addMarksForRow(Row row, List<CounterMark> marks)
+    {
+        for (Cell cell : row.cells())
         {
-            for (Cell cell : row.cells())
-            {
-                if (cell.isCounterCell())
-                    l.add(new CounterMark(row, cell.column(), cell.path()));
-            }
+            if (cell.isCounterCell())
+                marks.add(new CounterMark(row, cell.column(), cell.path()));
         }
-        return l;
     }
 
     private void assertNotBuilt()
@@ -580,17 +596,193 @@ public class PartitionUpdate extends AbstractBTreePartition
         isBuilt = true;
     }
 
+    @Override
+    public String toString()
+    {
+        if (isBuilt)
+            return super.toString();
+
+        // We intentionally override AbstractBTreePartition#toString() to avoid iterating over the rows in the
+        // partition, which can result in build() being triggered and lead to errors if the PartitionUpdate is later
+        // modified.
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("[%s.%s] key=%s columns=%s",
+                                metadata.ksName,
+                                metadata.cfName,
+                                metadata.getKeyValidator().getString(partitionKey().getKey()),
+                                columns()));
+
+        sb.append("\n    deletionInfo=").append(deletionInfo);
+        sb.append(" (not built)");
+        return sb.toString();
+    }
+
+    /**
+     * Creates a new simple partition update builder.
+     *
+     * @param metadata the metadata for the table this is a partition of.
+     * @param partitionKeyValues the values for partition key columns identifying this partition. The values for each
+     * partition key column can be passed either directly as {@code ByteBuffer} or using a "native" value (int for
+     * Int32Type, string for UTF8Type, ...). It is also allowed to pass a single {@code DecoratedKey} value directly.
+     * @return a newly created builder.
+     */
+    public static SimpleBuilder simpleBuilder(CFMetaData metadata, Object... partitionKeyValues)
+    {
+        return new SimpleBuilders.PartitionUpdateBuilder(metadata, partitionKeyValues);
+    }
+
+    /**
+     * Interface for building partition updates geared towards human.
+     * <p>
+     * This should generally not be used when performance matters too much, but provides a more convenient interface to
+     * build an update than using the class constructor when performance is not of the utmost importance.
+     */
+    public interface SimpleBuilder
+    {
+        /**
+         * The metadata of the table this is a builder on.
+         */
+        public CFMetaData metadata();
+
+        /**
+         * Sets the timestamp to use for the following additions to this builder or any derived (row) builder.
+         *
+         * @param timestamp the timestamp to use for following additions. If that timestamp hasn't been set, the current
+         * time in microseconds will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder timestamp(long timestamp);
+
+        /**
+         * Sets the ttl to use for the following additions to this builder or any derived (row) builder.
+         *
+         * @param ttl the ttl to use for following additions. If that ttl hasn't been set, no ttl will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder ttl(int ttl);
+
+        /**
+         * Sets the current time to use for the following additions to this builder or any derived (row) builder.
+         *
+         * @param nowInSec the current time to use for following additions. If the current time hasn't been set, the current
+         * time in seconds will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder nowInSec(int nowInSec);
+
+        /**
+         * Adds the row identifier by the provided clustering and return a builder for that row.
+         *
+         * @param clusteringValues the value for the clustering columns of the row to add to this build. There may be no
+         * values if either the table has no clustering column, or if you want to edit the static row. Note that as a
+         * shortcut it is also allowed to pass a {@code Clustering} object directly, in which case that should be the
+         * only argument.
+         * @return a builder for the row identified by {@code clusteringValues}.
+         */
+        public Row.SimpleBuilder row(Object... clusteringValues);
+
+        /**
+         * Deletes the partition identified by this builder (using a partition level deletion).
+         *
+         * @return this builder.
+         */
+        public SimpleBuilder delete();
+
+        /**
+         * Adds a new range tombstone to this update, returning a builder for that range.
+         *
+         * @return the range tombstone builder for the newly added range.
+         */
+        public RangeTombstoneBuilder addRangeTombstone();
+
+        /**
+         * Build the update represented by this builder.
+         *
+         * @return the built update.
+         */
+        public PartitionUpdate build();
+
+        /**
+         * As shortcut for {@code new Mutation(build())}.
+         *
+         * @return the built update, wrapped in a {@code Mutation}.
+         */
+        public Mutation buildAsMutation();
+
+        /**
+         * Interface to build range tombstone.
+         *
+         * By default, if no other methods are called, the represented range is inclusive of both start and end and
+         * includes everything (its start is {@code BOTTOM} and it's end is {@code TOP}).
+         */
+        public interface RangeTombstoneBuilder
+        {
+            /**
+             * Sets the start for the built range using the provided values.
+             *
+             * @param values the value for the start of the range. They act like the {@code clusteringValues} argument
+             * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+             * clustering, it can only be a prefix.
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder start(Object... values);
+
+            /**
+             * Sets the end for the built range using the provided values.
+             *
+             * @param values the value for the end of the range. They act like the {@code clusteringValues} argument
+             * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+             * clustering, it can only be a prefix.
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder end(Object... values);
+
+            /**
+             * Sets the start of this range as inclusive.
+             * <p>
+             * This is the default and don't need to be called, but can for explicitness.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder inclStart();
+
+            /**
+             * Sets the start of this range as exclusive.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder exclStart();
+
+            /**
+             * Sets the end of this range as inclusive.
+             * <p>
+             * This is the default and don't need to be called, but can for explicitness.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder inclEnd();
+
+            /**
+             * Sets the end of this range as exclusive.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder exclEnd();
+        }
+    }
+
     public static class PartitionUpdateSerializer
     {
         public void serialize(PartitionUpdate update, DataOutputPlus out, int version) throws IOException
         {
-            try (UnfilteredRowIterator iter = update.sliceableUnfilteredIterator())
+            try (UnfilteredRowIterator iter = update.unfilteredIterator())
             {
                 assert !iter.isReverseOrder();
 
                 if (version < MessagingService.VERSION_30)
                 {
-                    LegacyLayout.serializeAsLegacyPartition(iter, out, version);
+                    LegacyLayout.serializeAsLegacyPartition(null, iter, out, version);
                 }
                 else
                 {
@@ -667,16 +859,16 @@ public class PartitionUpdate extends AbstractBTreePartition
             try (UnfilteredRowIterator iterator = LegacyLayout.deserializeLegacyPartition(in, version, flag, key))
             {
                 assert iterator != null; // This is only used in mutation, and mutation have never allowed "null" column families
-                return PartitionUpdate.fromIterator(iterator);
+                return PartitionUpdate.fromIterator(iterator, ColumnFilter.all(iterator.metadata()));
             }
         }
 
         public long serializedSize(PartitionUpdate update, int version)
         {
-            try (UnfilteredRowIterator iter = update.sliceableUnfilteredIterator())
+            try (UnfilteredRowIterator iter = update.unfilteredIterator())
             {
                 if (version < MessagingService.VERSION_30)
-                    return LegacyLayout.serializedSizeAsLegacyPartition(iter, version);
+                    return LegacyLayout.serializedSizeAsLegacyPartition(null, iter, version);
 
                 return CFMetaData.serializer.serializedSize(update.metadata(), version)
                      + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, null, version, update.rowCount());

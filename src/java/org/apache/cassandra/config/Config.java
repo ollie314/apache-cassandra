@@ -17,13 +17,20 @@
  */
 package org.apache.cassandra.config;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.base.Joiner;
 import com.google.common.collect.Sets;
 
-import org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
-import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A class that contains configuration properties for the cassandra node it runs within.
@@ -32,22 +39,26 @@ import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
  */
 public class Config
 {
+    private static final Logger logger = LoggerFactory.getLogger(Config.class);
+
     /*
      * Prefix for Java properties for internal Cassandra configuration options
      */
     public static final String PROPERTY_PREFIX = "cassandra.";
-
 
     public String cluster_name = "Test Cluster";
     public String authenticator;
     public String authorizer;
     public String role_manager;
     public volatile int permissions_validity_in_ms = 2000;
-    public int permissions_cache_max_entries = 1000;
+    public volatile int permissions_cache_max_entries = 1000;
     public volatile int permissions_update_interval_in_ms = -1;
     public volatile int roles_validity_in_ms = 2000;
-    public int roles_cache_max_entries = 1000;
+    public volatile int roles_cache_max_entries = 1000;
     public volatile int roles_update_interval_in_ms = -1;
+    public volatile int credentials_validity_in_ms = 2000;
+    public volatile int credentials_cache_max_entries = 1000;
+    public volatile int credentials_update_interval_in_ms = -1;
 
     /* Hashing strategy Random or OPHF */
     public String partitioner;
@@ -84,9 +95,17 @@ public class Config
 
     public volatile Long truncate_request_timeout_in_ms = 60000L;
 
-    public Integer streaming_socket_timeout_in_ms = 3600000;
+    /**
+     * @deprecated use {@link this#streaming_keep_alive_period_in_secs} instead
+     */
+    @Deprecated
+    public Integer streaming_socket_timeout_in_ms = 86400000; //24 hours
+
+    public Integer streaming_keep_alive_period_in_secs = 300; //5 minutes
 
     public boolean cross_node_timeout = false;
+
+    public volatile long slow_query_log_timeout_in_ms = 500L;
 
     public volatile Double phi_convict_threshold = 8.0;
 
@@ -109,6 +128,7 @@ public class Config
     public String listen_interface;
     public Boolean listen_interface_prefer_ipv6 = false;
     public String broadcast_address;
+    public Boolean listen_on_broadcast_address = false;
     public String internode_authenticator;
 
     /* intentionally left set to true, despite being set to false in stock 2.2 cassandra.yaml
@@ -139,6 +159,12 @@ public class Config
 
     @Deprecated
     public Integer thrift_max_message_length_in_mb = 16;
+    /**
+     * Max size of values in SSTables, in MegaBytes.
+     * Default is the same as the native protocol frame limit: 256Mb.
+     * See AbstractType for how it is used.
+     */
+    public Integer max_value_size_in_mb = 256;
 
     public Integer thrift_framed_transport_size_in_mb = 15;
     public Boolean snapshot_before_compaction = false;
@@ -146,16 +172,23 @@ public class Config
 
     /* if the size of columns or super-columns are more than this, indexing will kick in */
     public Integer column_index_size_in_kb = 64;
+    public Integer column_index_cache_size_in_kb = 2;
     public volatile int batch_size_warn_threshold_in_kb = 5;
     public volatile int batch_size_fail_threshold_in_kb = 50;
+    public Integer unlogged_batch_across_partitions_warn_threshold = 10;
     public Integer concurrent_compactors;
     public volatile Integer compaction_throughput_mb_per_sec = 16;
     public volatile Integer compaction_large_partition_warning_threshold_mb = 100;
+    public Integer min_free_space_per_drive_in_mb = 50;
 
+    /**
+     * @deprecated retry support removed on CASSANDRA-10992
+     */
+    @Deprecated
     public Integer max_streaming_retries = 3;
 
     public volatile Integer stream_throughput_outbound_megabits_per_sec = 200;
-    public volatile Integer inter_dc_stream_throughput_outbound_megabits_per_sec = 0;
+    public volatile Integer inter_dc_stream_throughput_outbound_megabits_per_sec = 200;
 
     public String[] data_file_directories = new String[0];
 
@@ -174,23 +207,29 @@ public class Config
 
     public Integer max_mutation_size_in_kb;
 
+    // Change-data-capture logs
+    public Boolean cdc_enabled = false;
+    public String cdc_raw_directory;
+    public Integer cdc_total_space_in_mb;
+    public Integer cdc_free_space_check_interval_ms = 250;
+
     @Deprecated
     public int commitlog_periodic_queue_size = -1;
 
     public String endpoint_snitch;
     public Boolean dynamic_snitch = true;
-    public Integer dynamic_snitch_update_interval_in_ms = 100;
-    public Integer dynamic_snitch_reset_interval_in_ms = 600000;
-    public Double dynamic_snitch_badness_threshold = 0.1;
+    public volatile Integer dynamic_snitch_update_interval_in_ms = 100;
+    public volatile Integer dynamic_snitch_reset_interval_in_ms = 600000;
+    public volatile Double dynamic_snitch_badness_threshold = 0.1;
 
     public String request_scheduler;
     public RequestSchedulerId request_scheduler_id;
     public RequestSchedulerOptions request_scheduler_options;
 
-    public ServerEncryptionOptions server_encryption_options = new ServerEncryptionOptions();
-    public ClientEncryptionOptions client_encryption_options = new ClientEncryptionOptions();
+    public EncryptionOptions.ServerEncryptionOptions server_encryption_options = new EncryptionOptions.ServerEncryptionOptions();
+    public EncryptionOptions.ClientEncryptionOptions client_encryption_options = new EncryptionOptions.ClientEncryptionOptions();
     // this encOptions is for backward compatibility (a warning is logged by DatabaseDescriptor)
-    public ServerEncryptionOptions encryption_options;
+    public EncryptionOptions.ServerEncryptionOptions encryption_options;
 
     public InternodeCompression internode_compression = InternodeCompression.none;
 
@@ -202,6 +241,7 @@ public class Config
     public int max_hints_delivery_threads = 2;
     public int hints_flush_period_in_ms = 10000;
     public int max_hints_file_size_in_mb = 128;
+    public ParameterizedClass hints_compression;
     public int sstable_preemptive_open_interval_in_mb = 50;
 
     public volatile boolean incremental_backups = false;
@@ -221,12 +261,9 @@ public class Config
     public volatile int counter_cache_save_period = 7200;
     public volatile int counter_cache_keys_to_save = Integer.MAX_VALUE;
 
-    @Deprecated
-    public String memory_allocator;
-
     private static boolean isClientMode = false;
 
-    public Integer file_cache_size_in_mb = 512;
+    public Integer file_cache_size_in_mb;
 
     public boolean buffer_pool_use_heap_if_exhausted = true;
 
@@ -248,6 +285,7 @@ public class Config
     public volatile Long index_summary_capacity_in_mb;
     public volatile int index_summary_resize_interval_in_minutes = 60;
 
+    public int gc_log_threshold_in_ms = 200;
     public int gc_warn_threshold_in_ms = 0;
 
     // TTL for different types of trace events.
@@ -271,6 +309,17 @@ public class Config
     public int otc_coalescing_window_us = otc_coalescing_window_us_default;
 
     public int windows_timer_interval = 0;
+
+    /**
+     * Size of the CQL prepared statements cache in MB.
+     * Defaults to 1/256th of the heap size or 10MB, whichever is greater.
+     */
+    public Long prepared_statements_cache_size_mb = null;
+    /**
+     * Size of the Thrift prepared statements cache in MB.
+     * Defaults to 1/256th of the heap size or 10MB, whichever is greater.
+     */
+    public Long thrift_prepared_statements_cache_size_mb = null;
 
     public boolean enable_user_defined_functions = false;
     public boolean enable_scripted_user_defined_functions = false;
@@ -305,6 +354,9 @@ public class Config
      */
     public UserFunctionTimeoutPolicy user_function_timeout_policy = UserFunctionTimeoutPolicy.die;
 
+    public volatile boolean back_pressure_enabled = false;
+    public volatile ParameterizedClass back_pressure_strategy;
+
     public static boolean getOutboundBindAny()
     {
         return outboundBindAny;
@@ -315,11 +367,22 @@ public class Config
         outboundBindAny = value;
     }
 
+    /**
+     * @deprecated migrate to {@link DatabaseDescriptor#isClientInitialized()}
+     */
+    @Deprecated
     public static boolean isClientMode()
     {
         return isClientMode;
     }
 
+    /**
+     * Client mode means that the process is a pure client, that uses C* code base but does
+     * not read or write local C* database files.
+     *
+     * @deprecated migrate to {@link DatabaseDescriptor#clientInitialization(boolean)}
+     */
+    @Deprecated
     public static void setClientMode(boolean clientMode)
     {
         isClientMode = clientMode;
@@ -384,5 +447,42 @@ public class Config
     {
         ssd,
         spinning
+    }
+
+    private static final List<String> SENSITIVE_KEYS = new ArrayList<String>() {{
+        add("client_encryption_options");
+        add("server_encryption_options");
+    }};
+
+    public static void log(Config config)
+    {
+        Map<String, String> configMap = new TreeMap<>();
+        for (Field field : Config.class.getFields())
+        {
+            // ignore the constants
+            if (Modifier.isFinal(field.getModifiers()))
+                continue;
+
+            String name = field.getName();
+            if (SENSITIVE_KEYS.contains(name))
+            {
+                configMap.put(name, "<REDACTED>");
+                continue;
+            }
+
+            String value;
+            try
+            {
+                // Field.get() can throw NPE if the value of the field is null
+                value = field.get(config).toString();
+            }
+            catch (NullPointerException | IllegalAccessException npe)
+            {
+                value = "null";
+            }
+            configMap.put(name, value);
+        }
+
+        logger.info("Node configuration:[{}]", Joiner.on("; ").join(configMap.entrySet()));
     }
 }

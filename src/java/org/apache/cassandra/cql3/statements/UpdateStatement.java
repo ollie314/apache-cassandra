@@ -113,7 +113,7 @@ public class UpdateStatement extends ModificationStatement
 
     public static class ParsedInsert extends ModificationStatement.Parsed
     {
-        private final List<ColumnIdentifier.Raw> columnNames;
+        private final List<ColumnDefinition.Raw> columnNames;
         private final List<Term.Raw> columnValues;
 
         /**
@@ -127,7 +127,7 @@ public class UpdateStatement extends ModificationStatement
          */
         public ParsedInsert(CFName name,
                             Attributes.Raw attrs,
-                            List<ColumnIdentifier.Raw> columnNames,
+                            List<ColumnDefinition.Raw> columnNames,
                             List<Term.Raw> columnValues,
                             boolean ifNotExists)
         {
@@ -170,13 +170,13 @@ public class UpdateStatement extends ModificationStatement
                 }
                 else
                 {
-                    Operation operation = new Operation.SetValue(value).prepare(keyspace(), def);
+                    Operation operation = new Operation.SetValue(value).prepare(cfm, def);
                     operation.collectMarkerSpecification(boundNames);
                     operations.add(operation);
                 }
             }
 
-            boolean applyOnlyToStaticColumns = appliesOnlyToStaticColumns(operations, conditions) && !hasClusteringColumnsSet;
+            boolean applyOnlyToStaticColumns = !hasClusteringColumnsSet && appliesOnlyToStaticColumns(operations, conditions);
 
             StatementRestrictions restrictions = new StatementRestrictions(type,
                                                                            cfm,
@@ -203,11 +203,13 @@ public class UpdateStatement extends ModificationStatement
     public static class ParsedInsertJson extends ModificationStatement.Parsed
     {
         private final Json.Raw jsonValue;
+        private final boolean defaultUnset;
 
-        public ParsedInsertJson(CFName name, Attributes.Raw attrs, Json.Raw jsonValue, boolean ifNotExists)
+        public ParsedInsertJson(CFName name, Attributes.Raw attrs, Json.Raw jsonValue, boolean defaultUnset, boolean ifNotExists)
         {
             super(name, StatementType.INSERT, attrs, null, ifNotExists, false);
             this.jsonValue = jsonValue;
+            this.defaultUnset = defaultUnset;
         }
 
         @Override
@@ -230,22 +232,20 @@ public class UpdateStatement extends ModificationStatement
                 if (def.isClusteringColumn())
                     hasClusteringColumnsSet = true;
 
-                Term.Raw raw = prepared.getRawTermForColumn(def);
+                Term.Raw raw = prepared.getRawTermForColumn(def, defaultUnset);
                 if (def.isPrimaryKeyColumn())
                 {
-                    whereClause.add(new SingleColumnRelation(new ColumnIdentifier.ColumnIdentifierValue(def.name),
-                                                             Operator.EQ,
-                                                             raw));
+                    whereClause.add(new SingleColumnRelation(ColumnDefinition.Raw.forColumn(def), Operator.EQ, raw));
                 }
                 else
                 {
-                    Operation operation = new Operation.SetValue(raw).prepare(keyspace(), def);
+                    Operation operation = new Operation.SetValue(raw).prepare(cfm, def);
                     operation.collectMarkerSpecification(boundNames);
                     operations.add(operation);
                 }
             }
 
-            boolean applyOnlyToStaticColumns = appliesOnlyToStaticColumns(operations, conditions) && !hasClusteringColumnsSet;
+            boolean applyOnlyToStaticColumns = !hasClusteringColumnsSet && appliesOnlyToStaticColumns(operations, conditions);
 
             StatementRestrictions restrictions = new StatementRestrictions(type,
                                                                            cfm,
@@ -269,7 +269,7 @@ public class UpdateStatement extends ModificationStatement
     public static class ParsedUpdate extends ModificationStatement.Parsed
     {
         // Provided for an UPDATE
-        private final List<Pair<ColumnIdentifier.Raw, Operation.RawUpdate>> updates;
+        private final List<Pair<ColumnDefinition.Raw, Operation.RawUpdate>> updates;
         private final WhereClause whereClause;
 
         /**
@@ -284,9 +284,9 @@ public class UpdateStatement extends ModificationStatement
          * */
         public ParsedUpdate(CFName name,
                             Attributes.Raw attrs,
-                            List<Pair<ColumnIdentifier.Raw, Operation.RawUpdate>> updates,
+                            List<Pair<ColumnDefinition.Raw, Operation.RawUpdate>> updates,
                             WhereClause whereClause,
-                            List<Pair<ColumnIdentifier.Raw, ColumnCondition.Raw>> conditions,
+                            List<Pair<ColumnDefinition.Raw, ColumnCondition.Raw>> conditions,
                             boolean ifExists)
         {
             super(name, StatementType.UPDATE, attrs, conditions, false, ifExists);
@@ -302,13 +302,13 @@ public class UpdateStatement extends ModificationStatement
         {
             Operations operations = new Operations(type);
 
-            for (Pair<ColumnIdentifier.Raw, Operation.RawUpdate> entry : updates)
+            for (Pair<ColumnDefinition.Raw, Operation.RawUpdate> entry : updates)
             {
                 ColumnDefinition def = getColumnDefinition(cfm, entry.left);
 
                 checkFalse(def.isPrimaryKeyColumn(), "PRIMARY KEY part %s found in SET part", def.name);
 
-                Operation operation = entry.right.prepare(keyspace(), def);
+                Operation operation = entry.right.prepare(cfm, def);
                 operation.collectMarkerSpecification(boundNames);
                 operations.add(operation);
             }

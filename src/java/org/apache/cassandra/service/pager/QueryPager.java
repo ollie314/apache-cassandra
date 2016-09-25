@@ -19,8 +19,9 @@ package org.apache.cassandra.service.pager;
 
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.EmptyIterators;
 import org.apache.cassandra.db.partitions.PartitionIterator;
-import org.apache.cassandra.db.partitions.PartitionIterators;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
@@ -53,14 +54,14 @@ public interface QueryPager
             return ReadExecutionController.empty();
         }
 
-        public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState) throws RequestValidationException, RequestExecutionException
+        public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
         {
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
         }
 
         public PartitionIterator fetchPageInternal(int pageSize, ReadExecutionController executionController) throws RequestValidationException, RequestExecutionException
         {
-            return PartitionIterators.EMPTY;
+            return EmptyIterators.partition();
         }
 
         public boolean isExhausted()
@@ -77,6 +78,11 @@ public interface QueryPager
         {
             return null;
         }
+
+        public QueryPager withUpdatedLimit(DataLimits newLimits)
+        {
+            throw new UnsupportedOperationException();
+        }
     };
 
     /**
@@ -88,7 +94,7 @@ public interface QueryPager
      * {@code consistency} is a serial consistency.
      * @return the page of result.
      */
-    public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState) throws RequestValidationException, RequestExecutionException;
+    public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException;
 
     /**
      * Starts a new read operation.
@@ -134,4 +140,12 @@ public interface QueryPager
      * beginning. If the pager is exhausted, the result is undefined.
      */
     public PagingState state();
+
+    /**
+     * Creates a new <code>QueryPager</code> that use the new limits.
+     *
+     * @param newLimits the new limits
+     * @return a new <code>QueryPager</code> that use the new limits
+     */
+    public QueryPager withUpdatedLimit(DataLimits newLimits);
 }
