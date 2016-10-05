@@ -1,7 +1,13 @@
 4.0
+ * Update bundled cqlsh python driver to 3.7.0 (CASSANDRA-12736)
  * Reject invalid replication settings when creating or altering a keyspace (CASSANDRA-12681)
 
+
 3.10
+ * Add pre- and post-shutdown hooks to Storage Service (CASSANDRA-12461)
+ * Add hint delivery metrics (CASSANDRA-12693)
+ * Remove IndexInfo cache from FileIndexInfoRetriever (CASSANDRA-12731)
+ * ColumnIndex does not reuse buffer (CASSANDRA-12502)
  * cdc column addition still breaks schema migration tasks (CASSANDRA-12697)
  * Upgrade metrics-reporter dependencies (CASSANDRA-12089)
  * Tune compaction thread count via nodetool (CASSANDRA-12248)
@@ -39,7 +45,7 @@
  * Make decommission operation resumable (CASSANDRA-12008)
  * Add support to one-way targeted repair (CASSANDRA-9876)
  * Remove clientutil jar (CASSANDRA-11635)
- * Fix compaction throughput throttle (CASSANDRA-12366)
+ * Fix compaction throughput throttle (CASSANDRA-12366, CASSANDRA-12717)
  * Delay releasing Memtable memory on flush until PostFlush has finished running (CASSANDRA-12358)
  * Cassandra stress should dump all setting on startup (CASSANDRA-11914)
  * Make it possible to compact a given token range (CASSANDRA-10643)
@@ -73,6 +79,8 @@
  * Remove compaction Severity from DynamicEndpointSnitch (CASSANDRA-11738)
  * Restore resumable hints delivery (CASSANDRA-11960)
 Merged from 3.0:
+ * Make stress use client mode to avoid checking commit log size on startup (CASSANDRA-12478)
+ * Fix exceptions with new vnode allocation (CASSANDRA-12715)
  * Unify drain and shutdown processes (CASSANDRA-12509)
  * Fix NPE in ComponentOfSlice.isEQ() (CASSANDRA-12706)
  * Fix failure in LogTransactionTest (CASSANDRA-12632)
