@@ -20,9 +20,9 @@
  */
 package org.apache.cassandra.db.transform;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.PartitionColumns;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.rows.*;
 
 import static org.apache.cassandra.utils.Throwables.merge;
@@ -50,7 +50,7 @@ implements BaseRowIterator<R>
         partitionKey = copyFrom.partitionKey();
     }
 
-    public CFMetaData metadata()
+    public TableMetadata metadata()
     {
         return input.metadata();
     }
@@ -60,7 +60,7 @@ implements BaseRowIterator<R>
         return input.isReverseOrder();
     }
 
-    public PartitionColumns columns()
+    public RegularAndStaticColumns columns()
     {
         return input.columns();
     }
@@ -130,7 +130,7 @@ implements BaseRowIterator<R>
             Transformation[] fs = stack;
             int len = length;
 
-            while (!stop.isSignalled && input.hasNext())
+            while (!stop.isSignalled && !stopChild.isSignalled && input.hasNext())
             {
                 Unfiltered next = input.next();
 
@@ -156,7 +156,7 @@ implements BaseRowIterator<R>
                 }
             }
 
-            if (stop.isSignalled || !hasMoreContents())
+            if (stop.isSignalled || stopChild.isSignalled || !hasMoreContents())
                 return false;
         }
         return true;

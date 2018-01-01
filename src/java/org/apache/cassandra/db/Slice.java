@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -160,7 +159,7 @@ public class Slice
     public static boolean isEmpty(ClusteringComparator comparator, ClusteringBound start, ClusteringBound end)
     {
         assert start.isStart() && end.isEnd();
-        return comparator.compare(end, start) < 0;
+        return comparator.compare(end, start) <= 0;
     }
 
     /**
@@ -258,11 +257,6 @@ public class Slice
                 break;
         }
         return true;
-    }
-
-    public String toString(CFMetaData metadata)
-    {
-        return toString(metadata.comparator);
     }
 
     public String toString(ClusteringComparator comparator)

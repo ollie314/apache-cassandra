@@ -201,12 +201,14 @@ public class BTree
 
     public static <V> Iterator<V> iterator(Object[] btree, Dir dir)
     {
-        return new BTreeSearchIterator<>(btree, null, dir);
+        return isLeaf(btree) ? new LeafBTreeSearchIterator<>(btree, null, dir)
+                             : new FullBTreeSearchIterator<>(btree, null, dir);
     }
 
     public static <V> Iterator<V> iterator(Object[] btree, int lb, int ub, Dir dir)
     {
-        return new BTreeSearchIterator<>(btree, null, dir, lb, ub);
+        return isLeaf(btree) ? new LeafBTreeSearchIterator<>(btree, null, dir, lb, ub)
+                             : new FullBTreeSearchIterator<>(btree, null, dir, lb, ub);
     }
 
     public static <V> Iterable<V> iterable(Object[] btree)
@@ -234,7 +236,8 @@ public class BTree
      */
     public static <K, V> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, Dir dir)
     {
-        return new BTreeSearchIterator<>(btree, comparator, dir);
+        return isLeaf(btree) ? new LeafBTreeSearchIterator<>(btree, comparator, dir)
+                             : new FullBTreeSearchIterator<>(btree, comparator, dir);
     }
 
     /**
@@ -248,6 +251,20 @@ public class BTree
     public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, K start, K end, Dir dir)
     {
         return slice(btree, comparator, start, true, end, false, dir);
+    }
+
+    /**
+     * @param btree      the tree to iterate over
+     * @param comparator the comparator that defines the ordering over the items in the tree
+     * @param startIndex      the start index of the range to return, inclusive
+     * @param endIndex        the end index of the range to return, inclusive
+     * @param dir   if false, the iterator will start at the last item and move backwards
+     * @return           an Iterator over the defined sub-range of the tree
+     */
+    public static <K, V extends K> BTreeSearchIterator<K, V> slice(Object[] btree, Comparator<? super K> comparator, int startIndex, int endIndex, Dir dir)
+    {
+        return isLeaf(btree) ? new LeafBTreeSearchIterator<>(btree, comparator, dir, startIndex, endIndex)
+                             : new FullBTreeSearchIterator<>(btree, comparator, dir, startIndex, endIndex);
     }
 
     /**
@@ -270,7 +287,8 @@ public class BTree
                                       end == null ? Integer.MAX_VALUE
                                                   : endInclusive ? floorIndex(btree, comparator, end)
                                                                  : lowerIndex(btree, comparator, end));
-        return new BTreeSearchIterator<>(btree, comparator, dir, inclusiveLowerBound, inclusiveUpperBound);
+        return isLeaf(btree) ? new LeafBTreeSearchIterator<>(btree, comparator, dir, inclusiveLowerBound, inclusiveUpperBound)
+                             : new FullBTreeSearchIterator<>(btree, comparator, dir, inclusiveLowerBound, inclusiveUpperBound);
     }
 
     /**
@@ -825,6 +843,26 @@ public class BTree
             this.values = new Object[16];
         }
 
+        private Builder(Builder<V> builder)
+        {
+            this.comparator = builder.comparator;
+            this.values = Arrays.copyOf(builder.values, builder.values.length);
+            this.count = builder.count;
+            this.detected = builder.detected;
+            this.auto = builder.auto;
+            this.quickResolver = builder.quickResolver;
+            this.recycleHandle = null;
+        }
+
+        /**
+         * Creates a copy of this {@code Builder}.
+         * @return a copy of this {@code Builder}.
+         */
+        public Builder<V> copy()
+        {
+            return new Builder<>(this);
+        }
+
         public Builder<V> setQuickResolver(QuickResolver<V> quickResolver)
         {
             this.quickResolver = quickResolver;
@@ -846,7 +884,7 @@ public class BTree
         private void cleanup()
         {
             quickResolver = null;
-            Arrays.fill(values, 0, count, null);
+            Arrays.fill(values, null);
             count = 0;
             detected = true;
             auto = true;

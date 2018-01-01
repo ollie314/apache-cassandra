@@ -28,11 +28,14 @@ import org.apache.commons.lang3.StringUtils;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
 
 import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.commons.lang3.StringUtils.isEmpty;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class DeleteTest extends CQLTester
 {
@@ -40,14 +43,88 @@ public class DeleteTest extends CQLTester
     @Test
     public void testRangeDeletion() throws Throwable
     {
-        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b, c))");
+        testRangeDeletion(true, true);
+        testRangeDeletion(false, true);
+        testRangeDeletion(true, false);
+        testRangeDeletion(false, false);
+    }
 
+    private void testRangeDeletion(boolean flushData, boolean flushTombstone) throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b, c))");
         execute("INSERT INTO %s (a, b, c, d) VALUES (?, ?, ?, ?)", 1, 1, 1, 1);
-        flush();
+        flush(flushData);
         execute("DELETE FROM %s WHERE a=? AND b=?", 1, 1);
-        flush();
+        flush(flushTombstone);
         assertEmpty(execute("SELECT * FROM %s WHERE a=? AND b=? AND c=?", 1, 1, 1));
     }
+
+    @Test
+    public void testDeleteRange() throws Throwable
+    {
+        testDeleteRange(true, true);
+        testDeleteRange(false, true);
+        testDeleteRange(true, false);
+        testDeleteRange(false, false);
+    }
+
+    private void testDeleteRange(boolean flushData, boolean flushTombstone) throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 1, 1, 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, 1, 2);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, 2, 3);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, 3, 4);
+        flush(flushData);
+
+        execute("DELETE FROM %s WHERE a = ? AND b >= ?", 2, 2);
+        flush(flushTombstone);
+
+        assertRowsIgnoringOrder(execute("SELECT * FROM %s"),
+                                row(1, 1, 1),
+                                row(2, 1, 2));
+
+        assertRows(execute("SELECT * FROM %s WHERE a = ? AND b = ?", 2, 1),
+                   row(2, 1, 2));
+        assertEmpty(execute("SELECT * FROM %s WHERE a = ? AND b = ?", 2, 2));
+        assertEmpty(execute("SELECT * FROM %s WHERE a = ? AND b = ?", 2, 3));
+    }
+
+    @Test
+    public void testCrossMemSSTableMultiColumn() throws Throwable
+    {
+        testCrossMemSSTableMultiColumn(true, true);
+        testCrossMemSSTableMultiColumn(false, true);
+        testCrossMemSSTableMultiColumn(true, false);
+        testCrossMemSSTableMultiColumn(false, false);
+    }
+
+    private void testCrossMemSSTableMultiColumn(boolean flushData, boolean flushTombstone) throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 1, 1, 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, 1, 2);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, 2, 2);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", 2, 3, 3);
+        flush(flushData);
+
+        execute("DELETE FROM %s WHERE a = ? AND (b) = (?)", 2, 2);
+        execute("DELETE FROM %s WHERE a = ? AND (b) = (?)", 2, 3);
+
+        flush(flushTombstone);
+
+        assertRowsIgnoringOrder(execute("SELECT * FROM %s"),
+                                row(1, 1, 1),
+                                row(2, 1, 2));
+
+        assertRows(execute("SELECT * FROM %s WHERE a = ? AND b = ?", 2, 1),
+                   row(2, 1, 2));
+        assertEmpty(execute("SELECT * FROM %s WHERE a = ? AND b = ?", 2, 2));
+        assertEmpty(execute("SELECT * FROM %s WHERE a = ? AND b = ?", 2, 3));
+    }
+
 
     /**
      * Test simple deletion and in particular check for #4193 bug
@@ -57,20 +134,6 @@ public class DeleteTest extends CQLTester
     public void testDeletion() throws Throwable
     {
         createTable("CREATE TABLE %s (username varchar, id int, name varchar, stuff varchar, PRIMARY KEY(username, id))");
-
-        execute("INSERT INTO %s (username, id, name, stuff) VALUES (?, ?, ?, ?)", "abc", 2, "rst", "some value");
-        execute("INSERT INTO %s (username, id, name, stuff) VALUES (?, ?, ?, ?)", "abc", 4, "xyz", "some other value");
-
-        assertRows(execute("SELECT * FROM %s"),
-                   row("abc", 2, "rst", "some value"),
-                   row("abc", 4, "xyz", "some other value"));
-
-        execute("DELETE FROM %s WHERE username='abc' AND id=2");
-
-        assertRows(execute("SELECT * FROM %s"),
-                   row("abc", 4, "xyz", "some other value"));
-
-        createTable("CREATE TABLE %s (username varchar, id int, name varchar, stuff varchar, PRIMARY KEY(username, id, name)) WITH COMPACT STORAGE");
 
         execute("INSERT INTO %s (username, id, name, stuff) VALUES (?, ?, ?, ?)", "abc", 2, "rst", "some value");
         execute("INSERT INTO %s (username, id, name, stuff) VALUES (?, ?, ?, ?)", "abc", 4, "xyz", "some other value");
@@ -361,64 +424,54 @@ public class DeleteTest extends CQLTester
 
     private void testDeleteWithNoClusteringColumns(boolean forceFlush) throws Throwable
     {
-        for (String compactOption : new String[] {"", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (partitionKey int PRIMARY KEY," +
-                                      "value int)" + compactOption);
+        createTable("CREATE TABLE %s (partitionKey int PRIMARY KEY," +
+                    "value int)");
 
-            execute("INSERT INTO %s (partitionKey, value) VALUES (0, 0)");
-            execute("INSERT INTO %s (partitionKey, value) VALUES (1, 1)");
-            execute("INSERT INTO %s (partitionKey, value) VALUES (2, 2)");
-            execute("INSERT INTO %s (partitionKey, value) VALUES (3, 3)");
-            flush(forceFlush);
+        execute("INSERT INTO %s (partitionKey, value) VALUES (0, 0)");
+        execute("INSERT INTO %s (partitionKey, value) VALUES (1, 1)");
+        execute("INSERT INTO %s (partitionKey, value) VALUES (2, 2)");
+        execute("INSERT INTO %s (partitionKey, value) VALUES (3, 3)");
+        flush(forceFlush);
 
-            execute("DELETE value FROM %s WHERE partitionKey = ?", 0);
-            flush(forceFlush);
+        execute("DELETE value FROM %s WHERE partitionKey = ?", 0);
+        flush(forceFlush);
 
-            if (isEmpty(compactOption))
-            {
-                assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                           row(0, null));
-            }
-            else
-            {
-                assertEmpty(execute("SELECT * FROM %s WHERE partitionKey = ?", 0));
-            }
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, null));
 
-            execute("DELETE FROM %s WHERE partitionKey IN (?, ?)", 0, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s"),
-                       row(2, 2),
-                       row(3, 3));
+        execute("DELETE FROM %s WHERE partitionKey IN (?, ?)", 0, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s"),
+                   row(2, 2),
+                   row(3, 3));
 
-            // test invalid queries
+        // test invalid queries
 
-            // token function
-            assertInvalidMessage("The token function cannot be used in WHERE clauses for DELETE statements",
-                                 "DELETE FROM %s WHERE token(partitionKey) = token(?)", 0);
+        // token function
+        assertInvalidMessage("The token function cannot be used in WHERE clauses for DELETE statements",
+                             "DELETE FROM %s WHERE token(partitionKey) = token(?)", 0);
 
-            // multiple time same primary key element in WHERE clause
-            assertInvalidMessage("partitionkey cannot be restricted by more than one relation if it includes an Equal",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND partitionKey = ?", 0, 1);
+        // multiple time same primary key element in WHERE clause
+        assertInvalidMessage("partitionkey cannot be restricted by more than one relation if it includes an Equal",
+                             "DELETE FROM %s WHERE partitionKey = ? AND partitionKey = ?", 0, 1);
 
-            // unknown identifiers
-            assertInvalidMessage("Undefined column name unknown",
-                                 "DELETE unknown FROM %s WHERE partitionKey = ?", 0);
+        // unknown identifiers
+        assertInvalidMessage("Undefined column name unknown",
+                             "DELETE unknown FROM %s WHERE partitionKey = ?", 0);
 
-            assertInvalidMessage("Undefined column name partitionkey1",
-                                 "DELETE FROM %s WHERE partitionKey1 = ?", 0);
+        assertInvalidMessage("Undefined column name partitionkey1",
+                             "DELETE FROM %s WHERE partitionKey1 = ?", 0);
 
-            // Invalid operator in the where clause
-            assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
-                                 "DELETE FROM %s WHERE partitionKey > ? ", 0);
+        // Invalid operator in the where clause
+        assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
+                             "DELETE FROM %s WHERE partitionKey > ? ", 0);
 
-            assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
-                                 "DELETE FROM %s WHERE partitionKey CONTAINS ?", 0);
+        assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
+                             "DELETE FROM %s WHERE partitionKey CONTAINS ?", 0);
 
-            // Non primary key in the where clause
-            assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND value = ?", 0, 1);
-        }
+        // Non primary key in the where clause
+        assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
+                             "DELETE FROM %s WHERE partitionKey = ? AND value = ?", 0, 1);
     }
 
     @Test
@@ -430,87 +483,77 @@ public class DeleteTest extends CQLTester
 
     private void testDeleteWithOneClusteringColumns(boolean forceFlush) throws Throwable
     {
-        for (String compactOption : new String[] {"", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (partitionKey int," +
-                                      "clustering int," +
-                                      "value int," +
-                                      " PRIMARY KEY (partitionKey, clustering))" + compactOption);
+        createTable("CREATE TABLE %s (partitionKey int," +
+                    "clustering int," +
+                    "value int," +
+                    " PRIMARY KEY (partitionKey, clustering))");
 
-            execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 0, 0)");
-            execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 1, 1)");
-            execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 2, 2)");
-            execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 3, 3)");
-            execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 4, 4)");
-            execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 5, 5)");
-            execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (1, 0, 6)");
-            flush(forceFlush);
+        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 0, 0)");
+        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 1, 1)");
+        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 2, 2)");
+        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 3, 3)");
+        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 4, 4)");
+        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (0, 5, 5)");
+        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (1, 0, 6)");
+        flush(forceFlush);
 
-            execute("DELETE value FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1);
-            flush(forceFlush);
-            if (isEmpty(compactOption))
-            {
-                assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1),
-                           row(0, 1, null));
-            }
-            else
-            {
-                assertEmpty(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1));
-            }
+        execute("DELETE value FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1),
+                   row(0, 1, null));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) = (?)", 0, 1);
-            flush(forceFlush);
-            assertEmpty(execute("SELECT value FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1);
+        flush(forceFlush);
+        assertEmpty(execute("SELECT value FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1));
 
-            execute("DELETE FROM %s WHERE partitionKey IN (?, ?) AND clustering = ?", 0, 1, 0);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
-                       row(0, 2, 2),
-                       row(0, 3, 3),
-                       row(0, 4, 4),
-                       row(0, 5, 5));
+        execute("DELETE FROM %s WHERE partitionKey IN (?, ?) AND clustering = ?", 0, 1, 0);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
+                   row(0, 2, 2),
+                   row(0, 3, 3),
+                   row(0, 4, 4),
+                   row(0, 5, 5));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) IN ((?), (?))", 0, 4, 5);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
-                       row(0, 2, 2),
-                       row(0, 3, 3));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) IN ((?), (?))", 0, 4, 5);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
+                   row(0, 2, 2),
+                   row(0, 3, 3));
 
-            // test invalid queries
+        // test invalid queries
 
-            // missing primary key element
-            assertInvalidMessage("Some partition key parts are missing: partitionkey",
-                                 "DELETE FROM %s WHERE clustering = ?", 1);
+        // missing primary key element
+        assertInvalidMessage("Some partition key parts are missing: partitionkey",
+                             "DELETE FROM %s WHERE clustering = ?", 1);
 
-            // token function
-            assertInvalidMessage("The token function cannot be used in WHERE clauses for DELETE statements",
-                                 "DELETE FROM %s WHERE token(partitionKey) = token(?) AND clustering = ? ", 0, 1);
+        // token function
+        assertInvalidMessage("The token function cannot be used in WHERE clauses for DELETE statements",
+                             "DELETE FROM %s WHERE token(partitionKey) = token(?) AND clustering = ? ", 0, 1);
 
-            // multiple time same primary key element in WHERE clause
-            assertInvalidMessage("clustering cannot be restricted by more than one relation if it includes an Equal",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND clustering = ? AND clustering = ?", 0, 1, 1);
+        // multiple time same primary key element in WHERE clause
+        assertInvalidMessage("clustering cannot be restricted by more than one relation if it includes an Equal",
+                             "DELETE FROM %s WHERE partitionKey = ? AND clustering = ? AND clustering = ?", 0, 1, 1);
 
-            // unknown identifiers
-            assertInvalidMessage("Undefined column name value1",
-                                 "DELETE value1 FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1);
+        // unknown identifiers
+        assertInvalidMessage("Undefined column name value1",
+                             "DELETE value1 FROM %s WHERE partitionKey = ? AND clustering = ?", 0, 1);
 
-            assertInvalidMessage("Undefined column name partitionkey1",
-                                 "DELETE FROM %s WHERE partitionKey1 = ? AND clustering = ?", 0, 1);
+        assertInvalidMessage("Undefined column name partitionkey1",
+                             "DELETE FROM %s WHERE partitionKey1 = ? AND clustering = ?", 0, 1);
 
-            assertInvalidMessage("Undefined column name clustering_3",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND clustering_3 = ?", 0, 1);
+        assertInvalidMessage("Undefined column name clustering_3",
+                             "DELETE FROM %s WHERE partitionKey = ? AND clustering_3 = ?", 0, 1);
 
-            // Invalid operator in the where clause
-            assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
-                                 "DELETE FROM %s WHERE partitionKey > ? AND clustering = ?", 0, 1);
+        // Invalid operator in the where clause
+        assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
+                             "DELETE FROM %s WHERE partitionKey > ? AND clustering = ?", 0, 1);
 
-            assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
-                                 "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering = ?", 0, 1);
+        assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
+                             "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering = ?", 0, 1);
 
-            // Non primary key in the where clause
-            assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND clustering = ? AND value = ?", 0, 1, 3);
-        }
+        // Non primary key in the where clause
+        assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
+                             "DELETE FROM %s WHERE partitionKey = ? AND clustering = ? AND value = ?", 0, 1, 3);
     }
 
     @Test
@@ -522,125 +565,96 @@ public class DeleteTest extends CQLTester
 
     private void testDeleteWithTwoClusteringColumns(boolean forceFlush) throws Throwable
     {
-        for (String compactOption : new String[] { "", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (partitionKey int," +
-                                      "clustering_1 int," +
-                                      "clustering_2 int," +
-                                      "value int," +
-                                      " PRIMARY KEY (partitionKey, clustering_1, clustering_2))" + compactOption);
+        createTable("CREATE TABLE %s (partitionKey int," +
+                    "clustering_1 int," +
+                    "clustering_2 int," +
+                    "value int," +
+                    " PRIMARY KEY (partitionKey, clustering_1, clustering_2))");
 
-            execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 0, 0)");
-            execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 1, 1)");
-            execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 2, 2)");
-            execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 3, 3)");
-            execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 1, 1, 4)");
-            execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 1, 2, 5)");
-            execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (1, 0, 0, 6)");
-            flush(forceFlush);
+        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 0, 0)");
+        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 1, 1)");
+        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 2, 2)");
+        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 0, 3, 3)");
+        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 1, 1, 4)");
+        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (0, 1, 2, 5)");
+        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (1, 0, 0, 6)");
+        flush(forceFlush);
 
-            execute("DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
-            flush(forceFlush);
+        execute("DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
+        flush(forceFlush);
 
-            if (isEmpty(compactOption))
-            {
-                assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?",
-                                   0, 1, 1),
-                           row(0, 1, 1, null));
-            }
-            else
-            {
-                assertEmpty(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?",
-                                   0, 1, 1));
-            }
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?",
+                           0, 1, 1),
+                   row(0, 1, 1, null));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) = (?, ?)", 0, 1, 1);
-            flush(forceFlush);
-            assertEmpty(execute("SELECT value FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?",
-                                0, 1, 1));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) = (?, ?)", 0, 1, 1);
+        flush(forceFlush);
+        assertEmpty(execute("SELECT value FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?",
+                            0, 1, 1));
 
-            execute("DELETE FROM %s WHERE partitionKey IN (?, ?) AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 0, 0);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
-                       row(0, 0, 1, 1),
-                       row(0, 0, 2, 2),
-                       row(0, 0, 3, 3),
-                       row(0, 1, 2, 5));
+        execute("DELETE FROM %s WHERE partitionKey IN (?, ?) AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 0, 0);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
+                   row(0, 0, 1, 1),
+                   row(0, 0, 2, 2),
+                   row(0, 0, 3, 3),
+                   row(0, 1, 2, 5));
 
-            Object[][] rows;
-            if (isEmpty(compactOption))
-            {
-                rows = new Object[][]{row(0, 0, 1, 1),
-                                      row(0, 0, 2, null),
-                                      row(0, 0, 3, null),
-                                      row(0, 1, 2, 5)};
-            }
-            else
-            {
-                rows = new Object[][]{row(0, 0, 1, 1), row(0, 1, 2, 5)};
-            }
+        execute("DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 IN (?, ?)", 0, 0, 2, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1), row(0, 0, 1, 1),
+                   row(0, 0, 2, null),
+                   row(0, 0, 3, null),
+                   row(0, 1, 2, 5));
 
-            execute("DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 IN (?, ?)", 0, 0, 2, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1), rows);
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) IN ((?, ?), (?, ?))", 0, 0, 2, 1, 2);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
+                   row(0, 0, 1, 1),
+                   row(0, 0, 3, null));
 
-            if (isEmpty(compactOption))
-            {
-                rows = new Object[][]{row(0, 0, 1, 1),
-                                      row(0, 0, 3, null)};
-            }
-            else
-            {
-                rows = new Object[][]{row(0, 0, 1, 1)};
-            }
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1) IN ((?), (?)) AND clustering_2 = ?", 0, 0, 2, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
+                   row(0, 0, 1, 1));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) IN ((?, ?), (?, ?))", 0, 0, 2, 1, 2);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1), rows);
+        // test invalid queries
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1) IN ((?), (?)) AND clustering_2 = ?", 0, 0, 2, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey IN (?, ?)", 0, 1),
-                       row(0, 0, 1, 1));
+        // missing primary key element
+        assertInvalidMessage("Some partition key parts are missing: partitionkey",
+                             "DELETE FROM %s WHERE clustering_1 = ? AND clustering_2 = ?", 1, 1);
 
-            // test invalid queries
+        assertInvalidMessage("PRIMARY KEY column \"clustering_2\" cannot be restricted as preceding column \"clustering_1\" is not restricted",
+                             "DELETE FROM %s WHERE partitionKey = ? AND clustering_2 = ?", 0, 1);
 
-            // missing primary key element
-            assertInvalidMessage("Some partition key parts are missing: partitionkey",
-                                 "DELETE FROM %s WHERE clustering_1 = ? AND clustering_2 = ?", 1, 1);
+        // token function
+        assertInvalidMessage("The token function cannot be used in WHERE clauses for DELETE statements",
+                             "DELETE FROM %s WHERE token(partitionKey) = token(?) AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            assertInvalidMessage("PRIMARY KEY column \"clustering_2\" cannot be restricted as preceding column \"clustering_1\" is not restricted",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND clustering_2 = ?", 0, 1);
+        // multiple time same primary key element in WHERE clause
+        assertInvalidMessage("clustering_1 cannot be restricted by more than one relation if it includes an Equal",
+                             "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ? AND clustering_1 = ?", 0, 1, 1, 1);
 
-            // token function
-            assertInvalidMessage("The token function cannot be used in WHERE clauses for DELETE statements",
-                                 "DELETE FROM %s WHERE token(partitionKey) = token(?) AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
+        // unknown identifiers
+        assertInvalidMessage("Undefined column name value1",
+                             "DELETE value1 FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            // multiple time same primary key element in WHERE clause
-            assertInvalidMessage("clustering_1 cannot be restricted by more than one relation if it includes an Equal",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ? AND clustering_1 = ?", 0, 1, 1, 1);
+        assertInvalidMessage("Undefined column name partitionkey1",
+                             "DELETE FROM %s WHERE partitionKey1 = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            // unknown identifiers
-            assertInvalidMessage("Undefined column name value1",
-                                 "DELETE value1 FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
+        assertInvalidMessage("Undefined column name clustering_3",
+                             "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_3 = ?", 0, 1, 1);
 
-            assertInvalidMessage("Undefined column name partitionkey1",
-                                 "DELETE FROM %s WHERE partitionKey1 = ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
+        // Invalid operator in the where clause
+        assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
+                             "DELETE FROM %s WHERE partitionKey > ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            assertInvalidMessage("Undefined column name clustering_3",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_3 = ?", 0, 1, 1);
+        assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
+                             "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            // Invalid operator in the where clause
-            assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
-                                 "DELETE FROM %s WHERE partitionKey > ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
-
-            assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
-                                 "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
-
-            // Non primary key in the where clause
-            assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
-                                 "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ? AND value = ?", 0, 1, 1, 3);
-        }
+        // Non primary key in the where clause
+        assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
+                             "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 = ? AND value = ?", 0, 1, 1, 3);
     }
 
     @Test
@@ -685,95 +699,92 @@ public class DeleteTest extends CQLTester
 
     private void testDeleteWithRangeAndOneClusteringColumn(boolean forceFlush) throws Throwable
     {
-        for (String compactOption : new String[] { "", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (partitionKey int," +
-                                          "clustering int," +
-                                          "value int," +
-                                          " PRIMARY KEY (partitionKey, clustering))" + compactOption);
+        createTable("CREATE TABLE %s (partitionKey int," +
+                    "clustering int," +
+                    "value int," +
+                    " PRIMARY KEY (partitionKey, clustering))");
 
-            int value = 0;
-            for (int partitionKey = 0; partitionKey < 5; partitionKey++)
-                for (int clustering1 = 0; clustering1 < 5; clustering1++)
-                        execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (?, ?, ?)",
-                                partitionKey, clustering1, value++);
+        int value = 0;
+        for (int partitionKey = 0; partitionKey < 5; partitionKey++)
+            for (int clustering1 = 0; clustering1 < 5; clustering1++)
+                execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (?, ?, ?)",
+                        partitionKey, clustering1, value++);
 
-            flush(forceFlush);
+        flush(forceFlush);
 
-            // test delete partition
-            execute("DELETE FROM %s WHERE partitionKey = ?", 1);
-            flush(forceFlush);
-            assertEmpty(execute("SELECT * FROM %s WHERE partitionKey = ?", 1));
+        // test delete partition
+        execute("DELETE FROM %s WHERE partitionKey = ?", 1);
+        flush(forceFlush);
+        assertEmpty(execute("SELECT * FROM %s WHERE partitionKey = ?", 1));
 
-            // test slices on the first clustering column
+        // test slices on the first clustering column
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering >= ?", 0, 4);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                       row(0, 0, 0),
-                       row(0, 1, 1),
-                       row(0, 2, 2),
-                       row(0, 3, 3));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering >= ?", 0, 4);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, 0, 0),
+                   row(0, 1, 1),
+                   row(0, 2, 2),
+                   row(0, 3, 3));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering > ?", 0, 2);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                       row(0, 0, 0),
-                       row(0, 1, 1),
-                       row(0, 2, 2));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering > ?", 0, 2);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, 0, 0),
+                   row(0, 1, 1),
+                   row(0, 2, 2));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering <= ?", 0, 0);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                       row(0, 1, 1),
-                       row(0, 2, 2));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering <= ?", 0, 0);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, 1, 1),
+                   row(0, 2, 2));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering < ?", 0, 2);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                       row(0, 2, 2));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering < ?", 0, 2);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, 2, 2));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering >= ? AND clustering < ?", 2, 0, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 13),
-                       row(2, 4, 14));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering >= ? AND clustering < ?", 2, 0, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 13),
+                   row(2, 4, 14));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering > ? AND clustering <= ?", 2, 3, 5);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 13));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering > ? AND clustering <= ?", 2, 3, 5);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 13));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering < ? AND clustering > ?", 2, 3, 5);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 13));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering < ? AND clustering > ?", 2, 3, 5);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 13));
 
-            // test multi-column slices
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) > (?)", 3, 2);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 3),
-                       row(3, 0, 15),
-                       row(3, 1, 16),
-                       row(3, 2, 17));
+        // test multi-column slices
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) > (?)", 3, 2);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 3),
+                   row(3, 0, 15),
+                   row(3, 1, 16),
+                   row(3, 2, 17));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) < (?)", 3, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 3),
-                       row(3, 1, 16),
-                       row(3, 2, 17));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) < (?)", 3, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 3),
+                   row(3, 1, 16),
+                   row(3, 2, 17));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) >= (?) AND (clustering) <= (?)", 3, 0, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 3),
-                       row(3, 2, 17));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering) >= (?) AND (clustering) <= (?)", 3, 0, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 3),
+                   row(3, 2, 17));
 
-            // Test invalid queries
-            assertInvalidMessage("Range deletions are not supported for specific columns",
-                                 "DELETE value FROM %s WHERE partitionKey = ? AND clustering >= ?", 2, 1);
-            assertInvalidMessage("Range deletions are not supported for specific columns",
-                                 "DELETE value FROM %s WHERE partitionKey = ?", 2);
-        }
+        // Test invalid queries
+        assertInvalidMessage("Range deletions are not supported for specific columns",
+                             "DELETE value FROM %s WHERE partitionKey = ? AND clustering >= ?", 2, 1);
+        assertInvalidMessage("Range deletions are not supported for specific columns",
+                             "DELETE value FROM %s WHERE partitionKey = ?", 2);
     }
 
     @Test
@@ -785,194 +796,193 @@ public class DeleteTest extends CQLTester
 
     private void testDeleteWithRangeAndTwoClusteringColumns(boolean forceFlush) throws Throwable
     {
-        for (String compactOption : new String[] { "", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (partitionKey int," +
+        createTable("CREATE TABLE %s (partitionKey int," +
                     "clustering_1 int," +
                     "clustering_2 int," +
                     "value int," +
-                    " PRIMARY KEY (partitionKey, clustering_1, clustering_2))" + compactOption);
+                    " PRIMARY KEY (partitionKey, clustering_1, clustering_2))");
 
-            int value = 0;
-            for (int partitionKey = 0; partitionKey < 5; partitionKey++)
-                for (int clustering1 = 0; clustering1 < 5; clustering1++)
-                    for (int clustering2 = 0; clustering2 < 5; clustering2++) {
-                        execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (?, ?, ?, ?)",
-                                partitionKey, clustering1, clustering2, value++);}
-            flush(forceFlush);
+        int value = 0;
+        for (int partitionKey = 0; partitionKey < 5; partitionKey++)
+            for (int clustering1 = 0; clustering1 < 5; clustering1++)
+                for (int clustering2 = 0; clustering2 < 5; clustering2++)
+                {
+                    execute("INSERT INTO %s (partitionKey, clustering_1, clustering_2, value) VALUES (?, ?, ?, ?)",
+                            partitionKey, clustering1, clustering2, value++);
+                }
+        flush(forceFlush);
 
-            // test unspecified second clustering column
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ?", 0, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 2),
-                       row(0, 0, 0, 0),
-                       row(0, 0, 1, 1),
-                       row(0, 0, 2, 2),
-                       row(0, 0, 3, 3),
-                       row(0, 0, 4, 4));
+        // test unspecified second clustering column
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ?", 0, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 2),
+                   row(0, 0, 0, 0),
+                   row(0, 0, 1, 1),
+                   row(0, 0, 2, 2),
+                   row(0, 0, 3, 3),
+                   row(0, 0, 4, 4));
 
-            // test delete partition
-            execute("DELETE FROM %s WHERE partitionKey = ?", 1);
-            flush(forceFlush);
-            assertEmpty(execute("SELECT * FROM %s WHERE partitionKey = ?", 1));
+        // test delete partition
+        execute("DELETE FROM %s WHERE partitionKey = ?", 1);
+        flush(forceFlush);
+        assertEmpty(execute("SELECT * FROM %s WHERE partitionKey = ?", 1));
 
-            // test slices on the second clustering column
+        // test slices on the second clustering column
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 < ?", 0, 0, 2);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 2),
-                       row(0, 0, 2, 2),
-                       row(0, 0, 3, 3),
-                       row(0, 0, 4, 4));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 < ?", 0, 0, 2);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 2),
+                   row(0, 0, 2, 2),
+                   row(0, 0, 3, 3),
+                   row(0, 0, 4, 4));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 <= ?", 0, 0, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 2),
-                       row(0, 0, 4, 4));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND clustering_2 <= ?", 0, 0, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 2),
+                   row(0, 0, 4, 4));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 > ? ", 0, 2, 2);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 2),
-                       row(0, 2, 0, 10),
-                       row(0, 2, 1, 11),
-                       row(0, 2, 2, 12));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 > ? ", 0, 2, 2);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 2),
+                   row(0, 2, 0, 10),
+                   row(0, 2, 1, 11),
+                   row(0, 2, 2, 12));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 >= ? ", 0, 2, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 2),
-                       row(0, 2, 0, 10));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 >= ? ", 0, 2, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 2),
+                   row(0, 2, 0, 10));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 > ? AND clustering_2 < ? ",
-                    0, 3, 1, 4);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 3),
-                       row(0, 3, 0, 15),
-                       row(0, 3, 1, 16),
-                       row(0, 3, 4, 19));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 > ? AND clustering_2 < ? ",
+                0, 3, 1, 4);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 3),
+                   row(0, 3, 0, 15),
+                   row(0, 3, 1, 16),
+                   row(0, 3, 4, 19));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 > ? AND clustering_2 < ? ",
-                    0, 3, 4, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 3),
-                       row(0, 3, 0, 15),
-                       row(0, 3, 1, 16),
-                       row(0, 3, 4, 19));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 > ? AND clustering_2 < ? ",
+                0, 3, 4, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 3),
+                   row(0, 3, 0, 15),
+                   row(0, 3, 1, 16),
+                   row(0, 3, 4, 19));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 >= ? AND clustering_2 <= ? ",
-                    0, 3, 1, 4);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 3),
-                       row(0, 3, 0, 15));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 = ? AND clustering_2 >= ? AND clustering_2 <= ? ",
+                0, 3, 1, 4);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND  clustering_1 = ?", 0, 3),
+                   row(0, 3, 0, 15));
 
-            // test slices on the first clustering column
+        // test slices on the first clustering column
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 >= ?", 0, 4);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                       row(0, 0, 4, 4),
-                       row(0, 2, 0, 10),
-                       row(0, 3, 0, 15));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 >= ?", 0, 4);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, 0, 4, 4),
+                   row(0, 2, 0, 10),
+                   row(0, 3, 0, 15));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 > ?", 0, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                       row(0, 0, 4, 4),
-                       row(0, 2, 0, 10),
-                       row(0, 3, 0, 15));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND  clustering_1 > ?", 0, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, 0, 4, 4),
+                   row(0, 2, 0, 10),
+                   row(0, 3, 0, 15));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
-                       row(0, 3, 0, 15));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 < ?", 0, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 0),
+                   row(0, 3, 0, 15));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 >= ? AND clustering_1 < ?", 2, 0, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 0, 65),
-                       row(2, 3, 1, 66),
-                       row(2, 3, 2, 67),
-                       row(2, 3, 3, 68),
-                       row(2, 3, 4, 69),
-                       row(2, 4, 0, 70),
-                       row(2, 4, 1, 71),
-                       row(2, 4, 2, 72),
-                       row(2, 4, 3, 73),
-                       row(2, 4, 4, 74));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 >= ? AND clustering_1 < ?", 2, 0, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 0, 65),
+                   row(2, 3, 1, 66),
+                   row(2, 3, 2, 67),
+                   row(2, 3, 3, 68),
+                   row(2, 3, 4, 69),
+                   row(2, 4, 0, 70),
+                   row(2, 4, 1, 71),
+                   row(2, 4, 2, 72),
+                   row(2, 4, 3, 73),
+                   row(2, 4, 4, 74));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 > ? AND clustering_1 <= ?", 2, 3, 5);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 0, 65),
-                       row(2, 3, 1, 66),
-                       row(2, 3, 2, 67),
-                       row(2, 3, 3, 68),
-                       row(2, 3, 4, 69));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 > ? AND clustering_1 <= ?", 2, 3, 5);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 0, 65),
+                   row(2, 3, 1, 66),
+                   row(2, 3, 2, 67),
+                   row(2, 3, 3, 68),
+                   row(2, 3, 4, 69));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 < ? AND clustering_1 > ?", 2, 3, 5);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 0, 65),
-                       row(2, 3, 1, 66),
-                       row(2, 3, 2, 67),
-                       row(2, 3, 3, 68),
-                       row(2, 3, 4, 69));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 < ? AND clustering_1 > ?", 2, 3, 5);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 0, 65),
+                   row(2, 3, 1, 66),
+                   row(2, 3, 2, 67),
+                   row(2, 3, 3, 68),
+                   row(2, 3, 4, 69));
 
-            // test multi-column slices
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) > (?, ?)", 2, 3, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 0, 65),
-                       row(2, 3, 1, 66),
-                       row(2, 3, 2, 67),
-                       row(2, 3, 3, 68));
+        // test multi-column slices
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) > (?, ?)", 2, 3, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 0, 65),
+                   row(2, 3, 1, 66),
+                   row(2, 3, 2, 67),
+                   row(2, 3, 3, 68));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) < (?, ?)", 2, 3, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 1, 66),
-                       row(2, 3, 2, 67),
-                       row(2, 3, 3, 68));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) < (?, ?)", 2, 3, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 1, 66),
+                   row(2, 3, 2, 67),
+                   row(2, 3, 3, 68));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) >= (?, ?) AND (clustering_1) <= (?)", 2, 3, 2, 4);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
-                       row(2, 3, 1, 66));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) >= (?, ?) AND (clustering_1) <= (?)", 2, 3, 2, 4);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ?", 2),
+                   row(2, 3, 1, 66));
 
-            // Test with a mix of single column and multi-column restrictions
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND (clustering_2) < (?)", 3, 0, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 = ?", 3, 0),
-                       row(3, 0, 3, 78),
-                       row(3, 0, 4, 79));
+        // Test with a mix of single column and multi-column restrictions
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND (clustering_2) < (?)", 3, 0, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 = ?", 3, 0),
+                   row(3, 0, 3, 78),
+                   row(3, 0, 4, 79));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?) AND (clustering_2) >= (?)", 3, 0, 1, 3);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?)", 3, 0, 1),
-                       row(3, 1, 0, 80),
-                       row(3, 1, 1, 81),
-                       row(3, 1, 2, 82));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?) AND (clustering_2) >= (?)", 3, 0, 1, 3);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?)", 3, 0, 1),
+                   row(3, 1, 0, 80),
+                   row(3, 1, 1, 81),
+                   row(3, 1, 2, 82));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1) IN ((?), (?)) AND clustering_2 < ?", 3, 0, 1, 1);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?)", 3, 0, 1),
-                       row(3, 1, 1, 81),
-                       row(3, 1, 2, 82));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1) IN ((?), (?)) AND clustering_2 < ?", 3, 0, 1, 1);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?)", 3, 0, 1),
+                   row(3, 1, 1, 81),
+                   row(3, 1, 2, 82));
 
-            execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1) = (?) AND clustering_2 >= ?", 3, 1, 2);
-            flush(forceFlush);
-            assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?)", 3, 0, 1),
-                       row(3, 1, 1, 81));
+        execute("DELETE FROM %s WHERE partitionKey = ? AND (clustering_1) = (?) AND clustering_2 >= ?", 3, 1, 2);
+        flush(forceFlush);
+        assertRows(execute("SELECT * FROM %s WHERE partitionKey = ? AND clustering_1 IN (?, ?)", 3, 0, 1),
+                   row(3, 1, 1, 81));
 
-            // Test invalid queries
-            assertInvalidMessage("Range deletions are not supported for specific columns",
-                                 "DELETE value FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) >= (?, ?)", 2, 3, 1);
-            assertInvalidMessage("Range deletions are not supported for specific columns",
-                                 "DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 >= ?", 2, 3);
-            assertInvalidMessage("Range deletions are not supported for specific columns",
-                                 "DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 = ?", 2, 3);
-            assertInvalidMessage("Range deletions are not supported for specific columns",
-                                 "DELETE value FROM %s WHERE partitionKey = ?", 2);
-        }
+        // Test invalid queries
+        assertInvalidMessage("Range deletions are not supported for specific columns",
+                             "DELETE value FROM %s WHERE partitionKey = ? AND (clustering_1, clustering_2) >= (?, ?)", 2, 3, 1);
+        assertInvalidMessage("Range deletions are not supported for specific columns",
+                             "DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 >= ?", 2, 3);
+        assertInvalidMessage("Range deletions are not supported for specific columns",
+                             "DELETE value FROM %s WHERE partitionKey = ? AND clustering_1 = ?", 2, 3);
+        assertInvalidMessage("Range deletions are not supported for specific columns",
+                             "DELETE value FROM %s WHERE partitionKey = ?", 2);
     }
 
     @Test
@@ -1140,108 +1150,288 @@ public class DeleteTest extends CQLTester
     @Test
     public void testDeleteWithEmptyRestrictionValue() throws Throwable
     {
-        for (String options : new String[] { "", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (pk blob, c blob, v blob, PRIMARY KEY (pk, c))" + options);
+        createTable("CREATE TABLE %s (pk blob, c blob, v blob, PRIMARY KEY (pk, c))");
 
-            if (StringUtils.isEmpty(options))
-            {
-                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
-                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c = textAsBlob('');");
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c = textAsBlob('');");
 
-                assertEmpty(execute("SELECT * FROM %s"));
+        assertEmpty(execute("SELECT * FROM %s"));
 
-                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
-                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c IN (textAsBlob(''), textAsBlob('1'));");
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c IN (textAsBlob(''), textAsBlob('1'));");
 
-                assertEmpty(execute("SELECT * FROM %s"));
+        assertEmpty(execute("SELECT * FROM %s"));
 
-                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
-                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
-                execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
 
-                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('')");
 
-                assertRows(execute("SELECT * FROM %s"),
-                           row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")));
+        assertRows(execute("SELECT * FROM %s"),
+                   row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1")));
 
-                execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c >= textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c >= textAsBlob('')");
 
-                assertEmpty(execute("SELECT * FROM %s"));
-            }
-            else
-            {
-                assertInvalid("Invalid empty or null value for column c",
-                              "DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c = textAsBlob('')");
-                assertInvalid("Invalid empty or null value for column c",
-                              "DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c IN (textAsBlob(''), textAsBlob('1'))");
-            }
+        assertEmpty(execute("SELECT * FROM %s"));
 
-            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
-            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
 
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c > textAsBlob('')");
 
-            assertEmpty(execute("SELECT * FROM %s"));
+        assertEmpty(execute("SELECT * FROM %s"));
 
-            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
-            execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"));
+        execute("INSERT INTO %s (pk, c, v) VALUES (?, ?, ?)", bytes("foo123"), bytes("2"), bytes("2"));
 
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c <= textAsBlob('')");
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c < textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c <= textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c < textAsBlob('')");
 
-            assertRows(execute("SELECT * FROM %s"),
-                       row(bytes("foo123"), bytes("1"), bytes("1")),
-                       row(bytes("foo123"), bytes("2"), bytes("2")));
-        }
+        assertRows(execute("SELECT * FROM %s"),
+                   row(bytes("foo123"), bytes("1"), bytes("1")),
+                   row(bytes("foo123"), bytes("2"), bytes("2")));
     }
 
     @Test
     public void testDeleteWithMultipleClusteringColumnsAndEmptyRestrictionValue() throws Throwable
     {
-        for (String options : new String[] { "", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (pk blob, c1 blob, c2 blob, v blob, PRIMARY KEY (pk, c1, c2))" + options);
+        createTable("CREATE TABLE %s (pk blob, c1 blob, c2 blob, v blob, PRIMARY KEY (pk, c1, c2))");
 
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("1"));
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 = textAsBlob('');");
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("1"));
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 = textAsBlob('');");
 
-            assertEmpty(execute("SELECT * FROM %s"));
+        assertEmpty(execute("SELECT * FROM %s"));
 
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("1"));
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 IN (textAsBlob(''), textAsBlob('1')) AND c2 = textAsBlob('1');");
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("1"));
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 IN (textAsBlob(''), textAsBlob('1')) AND c2 = textAsBlob('1');");
 
-            assertEmpty(execute("SELECT * FROM %s"));
+        assertEmpty(execute("SELECT * FROM %s"));
 
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("0"));
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("0"));
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
 
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 > textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 > textAsBlob('')");
 
-            assertRows(execute("SELECT * FROM %s"),
-                       row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("0")));
+        assertRows(execute("SELECT * FROM %s"),
+                   row(bytes("foo123"), EMPTY_BYTE_BUFFER, bytes("1"), bytes("0")));
 
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 >= textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 >= textAsBlob('')");
 
-            assertEmpty(execute("SELECT * FROM %s"));
+        assertEmpty(execute("SELECT * FROM %s"));
 
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
 
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 > textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 > textAsBlob('')");
 
-            assertEmpty(execute("SELECT * FROM %s"));
+        assertEmpty(execute("SELECT * FROM %s"));
 
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
-            execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("1"), bytes("1"));
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (?, ?, ?, ?)", bytes("foo123"), bytes("1"), bytes("2"), bytes("3"));
 
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 <= textAsBlob('')");
-            execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 < textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 <= textAsBlob('')");
+        execute("DELETE FROM %s WHERE pk = textAsBlob('foo123') AND c1 < textAsBlob('')");
 
-            assertRows(execute("SELECT * FROM %s"),
-                       row(bytes("foo123"), bytes("1"), bytes("1"), bytes("1")),
-                       row(bytes("foo123"), bytes("1"), bytes("2"), bytes("3")));
-        }
+        assertRows(execute("SELECT * FROM %s"),
+                   row(bytes("foo123"), bytes("1"), bytes("1"), bytes("1")),
+                   row(bytes("foo123"), bytes("1"), bytes("2"), bytes("3")));
+    }
+
+    /**
+     * Test for CASSANDRA-12829
+     */
+    @Test
+    public void testDeleteWithEmptyInRestriction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a,b))");
+        execute("INSERT INTO %s (a,b,c) VALUES (?,?,?)", 1, 1, 1);
+        execute("INSERT INTO %s (a,b,c) VALUES (?,?,?)", 1, 2, 2);
+        execute("INSERT INTO %s (a,b,c) VALUES (?,?,?)", 1, 3, 3);
+
+        execute("DELETE FROM %s WHERE a IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b = 1;");
+        execute("DELETE FROM %s WHERE a = 1 AND b IN ();");
+        assertRows(execute("SELECT * FROM %s"),
+                   row(1, 1, 1),
+                   row(1, 2, 2),
+                   row(1, 3, 3));
+
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, s int static, PRIMARY KEY ((a,b), c))");
+        execute("INSERT INTO %s (a,b,c,d,s) VALUES (?,?,?,?,?)", 1, 1, 1, 1, 1);
+        execute("INSERT INTO %s (a,b,c,d,s) VALUES (?,?,?,?,?)", 1, 1, 2, 2, 1);
+        execute("INSERT INTO %s (a,b,c,d,s) VALUES (?,?,?,?,?)", 1, 1, 3, 3, 1);
+
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b IN () AND c IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b = 1 AND c IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c = 1;");
+        assertRows(execute("SELECT * FROM %s"),
+                   row(1, 1, 1, 1, 1),
+                   row(1, 1, 2, 1, 2),
+                   row(1, 1, 3, 1, 3));
+
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, e int, PRIMARY KEY ((a,b), c, d))");
+        execute("INSERT INTO %s (a,b,c,d,e) VALUES (?,?,?,?,?)", 1, 1, 1, 1, 1);
+        execute("INSERT INTO %s (a,b,c,d,e) VALUES (?,?,?,?,?)", 1, 1, 1, 2, 2);
+        execute("INSERT INTO %s (a,b,c,d,e) VALUES (?,?,?,?,?)", 1, 1, 1, 3, 3);
+        execute("INSERT INTO %s (a,b,c,d,e) VALUES (?,?,?,?,?)", 1, 1, 1, 4, 4);
+
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c = 1 AND d IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c IN () AND d IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b IN () AND c IN () AND d IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c IN () AND d IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c IN () AND d = 1;");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c = 1 AND d = 1;");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c = 1 AND d IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b = 1");
+        assertRows(execute("SELECT * FROM %s"),
+                   row(1, 1, 1, 1, 1),
+                   row(1, 1, 1, 2, 2),
+                   row(1, 1, 1, 3, 3),
+                   row(1, 1, 1, 4, 4));
+    }
+
+    /**
+     * Test for CASSANDRA-13152
+     */
+    @Test
+    public void testThatDeletesWithEmptyInRestrictionDoNotCreateMutations() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a,b))");
+
+        execute("DELETE FROM %s WHERE a IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b = 1;");
+        execute("DELETE FROM %s WHERE a = 1 AND b IN ();");
+
+        assertTrue("The memtable should be empty but is not", isMemtableEmpty());
+
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, s int static, PRIMARY KEY ((a,b), c))");
+
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b IN () AND c IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b = 1 AND c IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c = 1;");
+
+        assertTrue("The memtable should be empty but is not", isMemtableEmpty());
+
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, e int, PRIMARY KEY ((a,b), c, d))");
+
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c = 1 AND d IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b = 1 AND c IN () AND d IN ();");
+        execute("DELETE FROM %s WHERE a = 1 AND b IN () AND c IN () AND d IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c IN () AND d IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c IN () AND d = 1;");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c = 1 AND d = 1;");
+        execute("DELETE FROM %s WHERE a IN () AND b IN () AND c = 1 AND d IN ();");
+        execute("DELETE FROM %s WHERE a IN () AND b = 1");
+
+        assertTrue("The memtable should be empty but is not", isMemtableEmpty());
+    }
+
+    @Test
+    public void testQueryingOnRangeTombstoneBoundForward() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k text, i int, PRIMARY KEY (k, i))");
+
+        execute("INSERT INTO %s (k, i) VALUES (?, ?)", "a", 0);
+
+        execute("DELETE FROM %s WHERE k = ? AND i > ? AND i <= ?", "a", 0, 1);
+        execute("DELETE FROM %s WHERE k = ? AND i > ?", "a", 1);
+
+        flush();
+
+        assertEmpty(execute("SELECT i FROM %s WHERE k = ? AND i = ?", "a", 1));
+    }
+
+    @Test
+    public void testQueryingOnRangeTombstoneBoundReverse() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k text, i int, PRIMARY KEY (k, i))");
+
+        execute("INSERT INTO %s (k, i) VALUES (?, ?)", "a", 0);
+
+        execute("DELETE FROM %s WHERE k = ? AND i > ? AND i <= ?", "a", 0, 1);
+        execute("DELETE FROM %s WHERE k = ? AND i > ?", "a", 1);
+
+        flush();
+
+        assertRows(execute("SELECT i FROM %s WHERE k = ? AND i <= ? ORDER BY i DESC", "a", 1), row(0));
+    }
+
+    @Test
+    public void testReverseQueryWithRangeTombstoneOnMultipleBlocks() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k text, i int, v text, PRIMARY KEY (k, i))");
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 1200; i++)
+            sb.append('a');
+        String longText = sb.toString();
+
+        for (int i = 0; i < 10; i++)
+            execute("INSERT INTO %s(k, i, v) VALUES (?, ?, ?) USING TIMESTAMP 3", "a", i*2, longText);
+
+        execute("DELETE FROM %s USING TIMESTAMP 1 WHERE k = ? AND i >= ? AND i <= ?", "a", 12, 16);
+
+        flush();
+
+        execute("INSERT INTO %s(k, i, v) VALUES (?, ?, ?) USING TIMESTAMP 0", "a", 3, longText);
+        execute("INSERT INTO %s(k, i, v) VALUES (?, ?, ?) USING TIMESTAMP 3", "a", 11, longText);
+        execute("INSERT INTO %s(k, i, v) VALUES (?, ?, ?) USING TIMESTAMP 0", "a", 15, longText);
+        execute("INSERT INTO %s(k, i, v) VALUES (?, ?, ?) USING TIMESTAMP 0", "a", 17, longText);
+
+        flush();
+
+        assertRows(execute("SELECT i FROM %s WHERE k = ? ORDER BY i DESC", "a"),
+                   row(18),
+                   row(17),
+                   row(16),
+                   row(14),
+                   row(12),
+                   row(11),
+                   row(10),
+                   row(8),
+                   row(6),
+                   row(4),
+                   row(3),
+                   row(2),
+                   row(0));
+    }
+
+    /**
+     * Test for CASSANDRA-13305
+     */
+    @Test
+    public void testWithEmptyRange() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k text, a int, b int, PRIMARY KEY (k, a, b))");
+
+        // Both of the following should be doing nothing, but before #13305 this inserted broken ranges. We do it twice
+        // and the follow-up delete mainly as a way to show the bug as the combination of this will trigger an assertion
+        // in RangeTombstoneList pre-#13305 showing that something wrong happened.
+        execute("DELETE FROM %s WHERE k = ? AND a >= ? AND a < ?", "a", 1, 1);
+        execute("DELETE FROM %s WHERE k = ? AND a >= ? AND a < ?", "a", 1, 1);
+
+        execute("DELETE FROM %s WHERE k = ? AND a >= ? AND a < ?", "a", 0, 2);
+    }
+
+
+    /**
+     * Checks if the memtable is empty or not
+     * @return {@code true} if the memtable is empty, {@code false} otherwise.
+     */
+    private boolean isMemtableEmpty()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(currentTable());
+        return cfs.metric.allMemtablesLiveDataSize.getValue() == 0;
     }
 }

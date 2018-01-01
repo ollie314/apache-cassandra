@@ -15,6 +15,7 @@
 .. limitations under the License.
 
 .. highlight:: none
+..  _testing:
 
 Testing
 *******
@@ -59,11 +60,11 @@ Test that consume a significant amount of time during execution can be found in 
 DTests
 ======
 
-One way of doing integration or system testing at larger scale is by using `dtest <https://github.com/riptano/cassandra-dtest>`_, which stands for “Cassandra Distributed Tests”. The idea is to automatically setup Cassandra clusters using various configurations and simulate certain use cases you want to test. This is done using Python scripts and ``ccmlib`` from the `ccm <https://github.com/pcmanus/ccm>`_ project. Dtests will setup clusters using this library just as you do running ad-hoc ``ccm`` commands on your local machine. Afterwards dtests will use the `Python driver <http://datastax.github.io/python-driver/installation.html>`_ to interact with the nodes, manipulate the file system, analyze logs or mess with individual nodes.
+One way of doing integration or system testing at larger scale is by using `dtest <https://github.com/apache/cassandra-dtest>`_, which stands for “Cassandra Distributed Tests”. The idea is to automatically setup Cassandra clusters using various configurations and simulate certain use cases you want to test. This is done using Python scripts and ``ccmlib`` from the `ccm <https://github.com/pcmanus/ccm>`_ project. Dtests will setup clusters using this library just as you do running ad-hoc ``ccm`` commands on your local machine. Afterwards dtests will use the `Python driver <http://datastax.github.io/python-driver/installation.html>`_ to interact with the nodes, manipulate the file system, analyze logs or mess with individual nodes.
 
-Using dtests helps us to prevent regression bugs by continually executing tests on the `CI server <http://cassci.datastax.com/>`_ against new patches. For frequent contributors, this Jenkins is set up to build branches from their GitHub repositories. It is likely that your reviewer will use this Jenkins instance to run tests for your patch. Read more on the motivation behind the CI server `here <http://www.datastax.com/dev/blog/cassandra-testing-improvements-for-developer-convenience-and-confidence>`_.
+Using dtests helps us to prevent regression bugs by continually executing tests on the `CI server <https://builds.apache.org/>`_ against new patches. Committers will be able to set up build branches there and your reviewer may use the CI environment to run tests for your patch. Read more on the motivation behind continuous integration `here <http://www.datastax.com/dev/blog/cassandra-testing-improvements-for-developer-convenience-and-confidence>`_.
 
-The best way to learn how to write dtests is probably by reading the introduction "`How to Write a Dtest <http://www.datastax.com/dev/blog/how-to-write-a-dtest>`_" and by looking at existing, recently updated tests in the project. New tests must follow certain `style conventions <https://github.com/riptano/cassandra-dtest/blob/master/CONTRIBUTING.md>`_ that are being checked before accepting contributions. In contrast to Cassandra, dtest issues and pull-requests are managed on github, therefor you should make sure to link any created dtests in your Cassandra ticket and also refer to the ticket number in your dtest PR.
+The best way to learn how to write dtests is probably by reading the introduction "`How to Write a Dtest <http://www.datastax.com/dev/blog/how-to-write-a-dtest>`_" and by looking at existing, recently updated tests in the project. New tests must follow certain `style conventions <https://github.com/apache/cassandra-dtest/blob/master/CONTRIBUTING.md>`_ that are being checked before accepting contributions. In contrast to Cassandra, dtest issues and pull-requests are managed on github, therefor you should make sure to link any created dtests in your Cassandra ticket and also refer to the ticket number in your dtest PR.
 
 Creating a good dtest can be tough, but it should not prevent you from submitting patches! Please ask in the corresponding JIRA ticket how to write a good dtest for the patch. In most cases a reviewer or committer will able to support you, and in some cases they may offer to write a dtest for you.
 
@@ -75,12 +76,15 @@ Performance tests for Cassandra are a special breed of tests that are not part o
 Cassandra Stress Tool
 ---------------------
 
-TODO: `CASSANDRA-12365 <https://issues.apache.org/jira/browse/CASSANDRA-12365>`_
+See :ref:`cassandra_stress`
 
 cstar_perf
 ----------
 
 Another tool available on github is `cstar_perf <https://github.com/datastax/cstar_perf>`_ that can be used for intensive performance testing in large clusters or locally. Please refer to the project page on how to set it up and how to use it.
 
+CircleCI
+--------
+Cassandra ships with a default `CircleCI <https://circleci.com>`_ configuration, to enable running tests on your branches, you need to go the CircleCI website, click "Login" and log in with your github account. Then you need to give CircleCI permission to watch your repositories. Once you have done that, you can optionally configure CircleCI to run tests in parallel - click "Projects", then your github account and then click the settings for the project. If you leave the parallelism at 1 for Cassandra, only ``ant eclipse-warnings`` and ``ant test`` will be run. If you up the parallelism to 4, it also runs ``ant long-test``, ``ant test-compression`` and ``ant stress-test``
 
 

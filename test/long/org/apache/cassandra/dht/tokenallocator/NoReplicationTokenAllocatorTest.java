@@ -20,7 +20,6 @@ package org.apache.cassandra.dht.tokenallocator;
 
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.NavigableMap;
 import java.util.PriorityQueue;
 import java.util.Random;
@@ -55,6 +54,7 @@ public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
         for (int perUnitCount = 1; perUnitCount <= MAX_VNODE_COUNT; perUnitCount *= 4)
         {
             testNewCluster(perUnitCount, fixedTokenCount, new NoReplicationStrategy(), partitioner);
+            testNewCluster(perUnitCount, fixedTokenCount, new ZeroReplicationStrategy(), partitioner);
         }
     }
 
@@ -87,6 +87,7 @@ public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
         for (int perUnitCount = 1; perUnitCount <= MAX_VNODE_COUNT; perUnitCount *= 4)
         {
             testExistingCluster(perUnitCount, fixedTokenCount, new NoReplicationStrategy(), partitioner);
+            testExistingCluster(perUnitCount, fixedTokenCount, new ZeroReplicationStrategy(), partitioner);
         }
     }
 
@@ -246,4 +247,11 @@ public class NoReplicationTokenAllocatorTest extends TokenAllocatorTestBase
         }
     }
 
+    static class ZeroReplicationStrategy extends NoReplicationStrategy
+    {
+        public int replicas()
+        {
+            return 0;
+        }
+    }
 }

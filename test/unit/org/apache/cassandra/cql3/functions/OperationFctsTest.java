@@ -19,12 +19,15 @@ package org.apache.cassandra.cql3.functions;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.Date;
 
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.exceptions.OperationExecutionException;
+import org.apache.cassandra.serializers.SimpleDateSerializer;
+import org.apache.cassandra.serializers.TimestampSerializer;
 
 public class OperationFctsTest extends CQLTester
 {
@@ -289,17 +292,17 @@ public class OperationFctsTest extends CQLTester
                    row(2, (byte) 2, (short) 2, "test"));
 
         // tinyint, smallint and int could be used there so we need to disambiguate
-        assertInvalidMessage("Ambiguous '+' operation: use type casts to disambiguate",
+        assertInvalidMessage("Ambiguous '+' operation with args ? and 1: use type casts to disambiguate",
                              "SELECT * FROM %s WHERE pk = ? + 1 AND c1 = 2", 1);
 
-        assertInvalidMessage("Ambiguous '+' operation: use type casts to disambiguate",
+        assertInvalidMessage("Ambiguous '+' operation with args ? and 1: use type casts to disambiguate",
                              "SELECT * FROM %s WHERE pk = 2 AND c1 = 2 AND c2 = 1 * (? + 1)", 1);
 
         assertRows(execute("SELECT 1 + 1, v FROM %s WHERE pk = 2 AND c1 = 2"),
                    row(2, "test"));
 
         // As the output type is unknown the ? type cannot be determined
-        assertInvalidMessage("Ambiguous '+' operation: use type casts to disambiguate",
+        assertInvalidMessage("Ambiguous '+' operation with args 1 and ?: use type casts to disambiguate",
                              "SELECT 1 + ?, v FROM %s WHERE pk = 2 AND c1 = 2", 1);
 
         // As the prefered type for the constants is int, the returned type will be int
@@ -307,7 +310,7 @@ public class OperationFctsTest extends CQLTester
                    row(150, "test"));
 
         // As the output type is unknown the ? type cannot be determined
-        assertInvalidMessage("Ambiguous '+' operation: use type casts to disambiguate",
+        assertInvalidMessage("Ambiguous '+' operation with args ? and 50: use type casts to disambiguate",
                              "SELECT ? + 50, v FROM %s WHERE pk = 2 AND c1 = 2", 100);
 
         createTable("CREATE TABLE %s (a tinyint, b smallint, c int, d bigint, e float, f double, g varint, h decimal, PRIMARY KEY(a, b))"
@@ -669,7 +672,7 @@ public class OperationFctsTest extends CQLTester
     public void testWithNanAndInfinity() throws Throwable
     {
         createTable("CREATE TABLE %s (a int PRIMARY KEY, b double, c decimal)");
-        assertInvalidMessage("Ambiguous '+' operation: use type casts to disambiguate",
+        assertInvalidMessage("Ambiguous '+' operation with args ? and 1: use type casts to disambiguate",
                              "INSERT INTO %S (a, b, c) VALUES (? + 1, ?, ?)", 0, Double.NaN, BigDecimal.valueOf(1));
 
         execute("INSERT INTO %S (a, b, c) VALUES ((int) ? + 1, -?, ?)", 0, Double.NaN, BigDecimal.valueOf(1));
@@ -740,5 +743,100 @@ public class OperationFctsTest extends CQLTester
                    row(2, (byte) 2,(short) 2));
         assertRows(execute("SELECT a + (int) ?, b + (tinyint) ?, c + (smallint) ? FROM %s", Integer.MAX_VALUE, Byte.MAX_VALUE, Short.MAX_VALUE),
                    row(Integer.MIN_VALUE, Byte.MIN_VALUE, Short.MIN_VALUE));
+    }
+
+    @Test
+    public void testOperationsWithDuration() throws Throwable
+    {
+        // Test with timestamp type.
+        createTable("CREATE TABLE %s (pk int, time timestamp, v int, primary key (pk, time))");
+
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-27 16:10:00 UTC', 1)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-27 16:12:00 UTC', 2)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-27 16:14:00 UTC', 3)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-27 16:15:00 UTC', 4)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-27 16:21:00 UTC', 5)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-27 16:22:00 UTC', 6)");
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = 1 AND time > ? - 5m", toTimestamp("2016-09-27 16:20:00 UTC")),
+                   row(1, toTimestamp("2016-09-27 16:21:00 UTC"), 5),
+                   row(1, toTimestamp("2016-09-27 16:22:00 UTC"), 6));
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = 1 AND time >= ? - 10m", toTimestamp("2016-09-27 16:25:00 UTC")),
+                   row(1, toTimestamp("2016-09-27 16:15:00 UTC"), 4),
+                   row(1, toTimestamp("2016-09-27 16:21:00 UTC"), 5),
+                   row(1, toTimestamp("2016-09-27 16:22:00 UTC"), 6));
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = 1 AND time >= ? + 5m", toTimestamp("2016-09-27 16:15:00 UTC")),
+                   row(1, toTimestamp("2016-09-27 16:21:00 UTC"), 5),
+                   row(1, toTimestamp("2016-09-27 16:22:00 UTC"), 6));
+
+        assertRows(execute("SELECT time - 10m FROM %s WHERE pk = 1"),
+                   row(toTimestamp("2016-09-27 16:00:00 UTC")),
+                   row(toTimestamp("2016-09-27 16:02:00 UTC")),
+                   row(toTimestamp("2016-09-27 16:04:00 UTC")),
+                   row(toTimestamp("2016-09-27 16:05:00 UTC")),
+                   row(toTimestamp("2016-09-27 16:11:00 UTC")),
+                   row(toTimestamp("2016-09-27 16:12:00 UTC")));
+
+        assertInvalidMessage("the '%' operation is not supported between time and 10m",
+                             "SELECT time %% 10m FROM %s WHERE pk = 1");
+        assertInvalidMessage("the '*' operation is not supported between time and 10m",
+                             "SELECT time * 10m FROM %s WHERE pk = 1");
+        assertInvalidMessage("the '/' operation is not supported between time and 10m",
+                             "SELECT time / 10m FROM %s WHERE pk = 1");
+        assertInvalidMessage("the operation 'timestamp - duration' failed: The duration must have a millisecond precision. Was: 10us",
+                             "SELECT * FROM %s WHERE pk = 1 AND time > ? - 10us", toTimestamp("2016-09-27 16:15:00 UTC"));
+
+        // Test with date type.
+        createTable("CREATE TABLE %s (pk int, time date, v int, primary key (pk, time))");
+
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-27', 1)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-28', 2)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-29', 3)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-09-30', 4)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-10-01', 5)");
+        execute("INSERT INTO %s (pk, time, v) VALUES (1, '2016-10-04', 6)");
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = 1 AND time > ? - 5d", toDate("2016-10-04")),
+                   row(1, toDate("2016-09-30"), 4),
+                   row(1, toDate("2016-10-01"), 5),
+                   row(1, toDate("2016-10-04"), 6));
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = 1 AND time > ? - 6d", toDate("2016-10-04")),
+                   row(1, toDate("2016-09-29"), 3),
+                   row(1, toDate("2016-09-30"), 4),
+                   row(1, toDate("2016-10-01"), 5),
+                   row(1, toDate("2016-10-04"), 6));
+
+        assertRows(execute("SELECT * FROM %s WHERE pk = 1 AND time >= ? + 1d",  toDate("2016-10-01")),
+                   row(1, toDate("2016-10-04"), 6));
+
+        assertRows(execute("SELECT time - 2d FROM %s WHERE pk = 1"),
+                   row(toDate("2016-09-25")),
+                   row(toDate("2016-09-26")),
+                   row(toDate("2016-09-27")),
+                   row(toDate("2016-09-28")),
+                   row(toDate("2016-09-29")),
+                   row(toDate("2016-10-02")));
+
+        assertInvalidMessage("the '%' operation is not supported between time and 10m",
+                             "SELECT time %% 10m FROM %s WHERE pk = 1");
+        assertInvalidMessage("the '*' operation is not supported between time and 10m",
+                             "SELECT time * 10m FROM %s WHERE pk = 1");
+        assertInvalidMessage("the '/' operation is not supported between time and 10m",
+                             "SELECT time / 10m FROM %s WHERE pk = 1");
+        assertInvalidMessage("the operation 'date - duration' failed: The duration must have a day precision. Was: 10m",
+                             "SELECT * FROM %s WHERE pk = 1 AND time > ? - 10m", toDate("2016-10-04"));
+    }
+
+    private Date toTimestamp(String timestampAsString)
+    {
+        return new Date(TimestampSerializer.dateStringToTimestamp(timestampAsString));
+    }
+
+    private int toDate(String dateAsString)
+    {
+        return SimpleDateSerializer.dateStringToDays(dateAsString);
     }
 }

@@ -19,17 +19,18 @@
 package org.apache.cassandra.cql3.selection;
 
 import java.util.*;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.text.StrBuilder;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.functions.*;
 import org.apache.cassandra.cql3.selection.Selector.Factory;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.Pair;
 
 import static org.apache.cassandra.cql3.selection.SelectorFactories.createFactoriesAndCollectColumnDefinitions;
@@ -37,7 +38,7 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.invalidReq
 
 public interface Selectable extends AssignmentTestable
 {
-    public Selector.Factory newSelectorFactory(CFMetaData cfm, AbstractType<?> expectedType, List<ColumnDefinition> defs, VariableSpecifications boundNames);
+    public Selector.Factory newSelectorFactory(TableMetadata table, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames);
 
     /**
      * The type of the {@code Selectable} if it can be infered.
@@ -51,6 +52,39 @@ public interface Selectable extends AssignmentTestable
      */
     public AbstractType<?> getExactTypeIfKnown(String keyspace);
 
+    /**
+     * Checks if this {@code Selectable} select columns matching the specified predicate.
+     * @return {@code true} if this {@code Selectable} select columns matching the specified predicate,
+     * {@code false} otherwise.
+     */
+    public boolean selectColumns(Predicate<ColumnMetadata> predicate);
+
+    /**
+     * Checks if the specified Selectables select columns matching the specified predicate.
+     * @param selectables the selectables to check.
+     * @return {@code true} if the specified Selectables select columns matching the specified predicate,
+      {@code false} otherwise.
+     */
+    public static boolean selectColumns(List<Selectable> selectables, Predicate<ColumnMetadata> predicate)
+    {
+        for (Selectable selectable : selectables)
+        {
+            if (selectable.selectColumns(predicate))
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * Checks if any processing is performed on the selected columns, {@code false} otherwise.
+     * @return {@code true} if any processing is performed on the selected columns, {@code false} otherwise.
+     */
+    public default boolean processesSelection()
+    {
+        // ColumnMetadata is the only case that returns false and override this
+        return true;
+    }
+
     // Term.Raw overrides this since some literals can be WEAKLY_ASSIGNABLE
     default public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
     {
@@ -58,7 +92,7 @@ public interface Selectable extends AssignmentTestable
         return type == null ? TestResult.NOT_ASSIGNABLE : type.testAssignment(keyspace, receiver);
     }
 
-    default int addAndGetIndex(ColumnDefinition def, List<ColumnDefinition> l)
+    default int addAndGetIndex(ColumnMetadata def, List<ColumnMetadata> l)
     {
         int idx = l.indexOf(def);
         if (idx < 0)
@@ -69,18 +103,20 @@ public interface Selectable extends AssignmentTestable
         return idx;
     }
 
+    default ColumnSpecification specForElementOrSlice(Selectable selected, ColumnSpecification receiver, String selectionType)
+    {
+        switch (((CollectionType)receiver.type).kind)
+        {
+            case LIST: throw new InvalidRequestException(String.format("%s selection is only allowed on sets and maps, but %s is a list", selectionType, selected));
+            case SET: return Sets.valueSpecOf(receiver);
+            case MAP: return Maps.keySpecOf(receiver);
+            default: throw new AssertionError();
+        }
+    }
+
     public static abstract class Raw
     {
-        public abstract Selectable prepare(CFMetaData cfm);
-
-        /**
-         * Returns true if any processing is performed on the selected column.
-         **/
-        public boolean processesSelection()
-        {
-            // ColumnIdentifier is the only case that returns false and override this
-            return true;
-        }
+        public abstract Selectable prepare(TableMetadata table);
     }
 
     public static class WithTerm implements Selectable
@@ -111,7 +147,7 @@ public interface Selectable extends AssignmentTestable
             return rawTerm.testAssignment(keyspace, receiver);
         }
 
-        public Selector.Factory newSelectorFactory(CFMetaData cfm, AbstractType<?> expectedType, List<ColumnDefinition> defs, VariableSpecifications boundNames) throws InvalidRequestException
+        public Selector.Factory newSelectorFactory(TableMetadata table, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames) throws InvalidRequestException
         {
             /*
              * expectedType will be null if we have no constraint on what the type should be. For instance, if this term is a bind marker:
@@ -133,7 +169,7 @@ public interface Selectable extends AssignmentTestable
              * Lastly, note that if the term is a terminal literal, we don't have to check it's compatibility with 'expectedType' as any incompatibility
              * would have been found at preparation time.
              */
-            AbstractType<?> type = getExactTypeIfKnown(cfm.ksName);
+            AbstractType<?> type = getExactTypeIfKnown(table.keyspace);
             if (type == null)
             {
                 type = expectedType;
@@ -145,7 +181,7 @@ public interface Selectable extends AssignmentTestable
             // selection will have this name. Which isn't terribly helpful, but it's unclear how to provide
             // something a lot more helpful and in practice user can bind those markers by position or, even better,
             // use bind markers.
-            Term term = rawTerm.prepare(cfm.ksName, new ColumnSpecification(cfm.ksName, cfm.cfName, bindMarkerNameInSelection, type));
+            Term term = rawTerm.prepare(table.keyspace, new ColumnSpecification(table.keyspace, table.name, bindMarkerNameInSelection, type));
             term.collectMarkerSpecification(boundNames);
             return TermSelector.newFactory(rawTerm.getText(), term, type);
         }
@@ -154,6 +190,12 @@ public interface Selectable extends AssignmentTestable
         public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
             return rawTerm.getExactTypeIfKnown(keyspace);
+        }
+
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return false;
         }
 
         @Override
@@ -171,7 +213,7 @@ public interface Selectable extends AssignmentTestable
                 this.term = term;
             }
 
-            public Selectable prepare(CFMetaData cfm)
+            public Selectable prepare(TableMetadata table)
             {
                 return new WithTerm(term);
             }
@@ -180,10 +222,10 @@ public interface Selectable extends AssignmentTestable
 
     public static class WritetimeOrTTL implements Selectable
     {
-        public final ColumnDefinition column;
+        public final ColumnMetadata column;
         public final boolean isWritetime;
 
-        public WritetimeOrTTL(ColumnDefinition column, boolean isWritetime)
+        public WritetimeOrTTL(ColumnMetadata column, boolean isWritetime)
         {
             this.column = column;
             this.isWritetime = isWritetime;
@@ -195,9 +237,9 @@ public interface Selectable extends AssignmentTestable
             return (isWritetime ? "writetime" : "ttl") + "(" + column.name + ")";
         }
 
-        public Selector.Factory newSelectorFactory(CFMetaData cfm,
+        public Selector.Factory newSelectorFactory(TableMetadata table,
                                                    AbstractType<?> expectedType,
-                                                   List<ColumnDefinition> defs,
+                                                   List<ColumnMetadata> defs,
                                                    VariableSpecifications boundNames)
         {
             if (column.isPrimaryKeyColumn())
@@ -217,20 +259,26 @@ public interface Selectable extends AssignmentTestable
             return isWritetime ? LongType.instance : Int32Type.instance;
         }
 
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return predicate.test(column);
+        }
+
         public static class Raw extends Selectable.Raw
         {
-            private final ColumnDefinition.Raw id;
+            private final ColumnMetadata.Raw id;
             private final boolean isWritetime;
 
-            public Raw(ColumnDefinition.Raw id, boolean isWritetime)
+            public Raw(ColumnMetadata.Raw id, boolean isWritetime)
             {
                 this.id = id;
                 this.isWritetime = isWritetime;
             }
 
-            public WritetimeOrTTL prepare(CFMetaData cfm)
+            public WritetimeOrTTL prepare(TableMetadata table)
             {
-                return new WritetimeOrTTL(id.prepare(cfm), isWritetime);
+                return new WritetimeOrTTL(id.prepare(table), isWritetime);
             }
         }
     }
@@ -252,10 +300,16 @@ public interface Selectable extends AssignmentTestable
             return function.columnName(args.stream().map(Object::toString).collect(Collectors.toList()));
         }
 
-        public Selector.Factory newSelectorFactory(CFMetaData cfm, AbstractType<?> expectedType, List<ColumnDefinition> defs, VariableSpecifications boundNames)
+        public Selector.Factory newSelectorFactory(TableMetadata table, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames)
         {
-            SelectorFactories factories = SelectorFactories.createFactoriesAndCollectColumnDefinitions(args, function.argTypes(), cfm, defs, boundNames);
+            SelectorFactories factories = SelectorFactories.createFactoriesAndCollectColumnDefinitions(args, function.argTypes(), table, defs, boundNames);
             return AbstractFunctionSelector.newFactory(function, factories);
+        }
+
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return Selectable.selectColumns(args, predicate);
         }
 
         public AbstractType<?> getExactTypeIfKnown(String keyspace)
@@ -292,11 +346,11 @@ public interface Selectable extends AssignmentTestable
                                Collections.singletonList(arg));
             }
 
-            public Selectable prepare(CFMetaData cfm)
+            public Selectable prepare(TableMetadata table)
             {
                 List<Selectable> preparedArgs = new ArrayList<>(args.size());
                 for (Selectable.Raw arg : args)
-                    preparedArgs.add(arg.prepare(cfm));
+                    preparedArgs.add(arg.prepare(table));
 
                 FunctionName name = functionName;
                 // We need to circumvent the normal function lookup process for toJson() because instances of the function
@@ -319,7 +373,7 @@ public interface Selectable extends AssignmentTestable
                     preparedArgs = Collections.emptyList();
                 }
 
-                Function fun = FunctionResolver.get(cfm.ksName, name, preparedArgs, cfm.ksName, cfm.cfName, null);
+                Function fun = FunctionResolver.get(table.keyspace, name, preparedArgs, table.keyspace, table.name, null);
 
                 if (fun == null)
                     throw new InvalidRequestException(String.format("Unknown function '%s'", functionName));
@@ -351,9 +405,9 @@ public interface Selectable extends AssignmentTestable
                                    .toString();
         }
 
-        public Selector.Factory newSelectorFactory(CFMetaData cfm, AbstractType<?> expectedType, List<ColumnDefinition> defs, VariableSpecifications boundNames)
+        public Selector.Factory newSelectorFactory(TableMetadata table, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames)
         {
-            SelectorFactories factories = SelectorFactories.createFactoriesAndCollectColumnDefinitions(args, null, cfm, defs, boundNames);
+            SelectorFactories factories = SelectorFactories.createFactoriesAndCollectColumnDefinitions(args, null, table, defs, boundNames);
             Function fun = ToJsonFct.getInstance(factories.getReturnTypes());
             return AbstractFunctionSelector.newFactory(fun, factories);
         }
@@ -361,6 +415,12 @@ public interface Selectable extends AssignmentTestable
         public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
             return UTF8Type.instance;
+        }
+
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return Selectable.selectColumns(args, predicate);
         }
     }
 
@@ -381,10 +441,10 @@ public interface Selectable extends AssignmentTestable
             return String.format("cast(%s as %s)", arg, type.toString().toLowerCase());
         }
 
-        public Selector.Factory newSelectorFactory(CFMetaData cfm, AbstractType<?> expectedType, List<ColumnDefinition> defs, VariableSpecifications boundNames)
+        public Selector.Factory newSelectorFactory(TableMetadata table, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames)
         {
             List<Selectable> args = Collections.singletonList(arg);
-            SelectorFactories factories = SelectorFactories.createFactoriesAndCollectColumnDefinitions(args, null, cfm, defs, boundNames);
+            SelectorFactories factories = SelectorFactories.createFactoriesAndCollectColumnDefinitions(args, null, table, defs, boundNames);
 
             Selector.Factory factory = factories.get(0);
 
@@ -393,7 +453,7 @@ public interface Selectable extends AssignmentTestable
                 return factory;
 
             FunctionName name = FunctionName.nativeFunction(CastFcts.getFunctionName(type));
-            Function fun = FunctionResolver.get(cfm.ksName, name, args, cfm.ksName, cfm.cfName, null);
+            Function fun = FunctionResolver.get(table.keyspace, name, args, table.keyspace, table.name, null);
 
             if (fun == null)
             {
@@ -409,6 +469,12 @@ public interface Selectable extends AssignmentTestable
             return type.getType();
         }
 
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return arg.selectColumns(predicate);
+        }
+
         public static class Raw extends Selectable.Raw
         {
             private final CQL3Type type;
@@ -420,13 +486,16 @@ public interface Selectable extends AssignmentTestable
                 this.type = type;
             }
 
-            public WithCast prepare(CFMetaData cfm)
+            public WithCast prepare(TableMetadata table)
             {
-                return new WithCast(arg.prepare(cfm), type);
+                return new WithCast(arg.prepare(table), type);
             }
         }
     }
 
+    /**
+     * Represents the selection of the field of a UDT (eg. t.f).
+     */
     public static class WithFieldSelection implements Selectable
     {
         public final Selectable selected;
@@ -444,7 +513,7 @@ public interface Selectable extends AssignmentTestable
             return String.format("%s.%s", selected, field);
         }
 
-        public Selector.Factory newSelectorFactory(CFMetaData cfm, AbstractType<?> expectedType, List<ColumnDefinition> defs, VariableSpecifications boundNames)
+        public Selector.Factory newSelectorFactory(TableMetadata table, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames)
         {
             AbstractType<?> expectedUdtType = null;
 
@@ -452,11 +521,11 @@ public interface Selectable extends AssignmentTestable
             if (selected instanceof BetweenParenthesesOrWithTuple)
             {
                 BetweenParenthesesOrWithTuple betweenParentheses = (BetweenParenthesesOrWithTuple) selected;
-                expectedUdtType = betweenParentheses.selectables.get(0).getExactTypeIfKnown(cfm.ksName);
+                expectedUdtType = betweenParentheses.selectables.get(0).getExactTypeIfKnown(table.keyspace);
             }
 
-            Selector.Factory factory = selected.newSelectorFactory(cfm, expectedUdtType, defs, boundNames);
-            AbstractType<?> type = factory.getColumnSpecification(cfm).type;
+            Selector.Factory factory = selected.newSelectorFactory(table, expectedUdtType, defs, boundNames);
+            AbstractType<?> type = factory.getReturnType();
             if (!type.isUDT())
             {
                 throw new InvalidRequestException(
@@ -490,6 +559,12 @@ public interface Selectable extends AssignmentTestable
             return ut.fieldType(fieldIndex);
         }
 
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return selected.selectColumns(predicate);
+        }
+
         public static class Raw extends Selectable.Raw
         {
             private final Selectable.Raw selected;
@@ -501,9 +576,9 @@ public interface Selectable extends AssignmentTestable
                 this.field = field;
             }
 
-            public WithFieldSelection prepare(CFMetaData cfm)
+            public WithFieldSelection prepare(TableMetadata table)
             {
-                return new WithFieldSelection(selected.prepare(cfm), field);
+                return new WithFieldSelection(selected.prepare(table), field);
             }
         }
     }
@@ -535,12 +610,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
-        public Factory newSelectorFactory(CFMetaData cfm,
+        public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
-                                          List<ColumnDefinition> defs,
+                                          List<ColumnMetadata> defs,
                                           VariableSpecifications boundNames)
         {
-            AbstractType<?> type = getExactTypeIfKnown(cfm.ksName);
+            AbstractType<?> type = getExactTypeIfKnown(cfm.keyspace);
             if (type == null)
             {
                 type = expectedType;
@@ -555,9 +630,9 @@ public interface Selectable extends AssignmentTestable
             return newTupleSelectorFactory(cfm, (TupleType) type, defs, boundNames);
         }
 
-        private Factory newBetweenParenthesesSelectorFactory(CFMetaData cfm,
+        private Factory newBetweenParenthesesSelectorFactory(TableMetadata cfm,
                                                              AbstractType<?> expectedType,
-                                                             List<ColumnDefinition> defs,
+                                                             List<ColumnMetadata> defs,
                                                              VariableSpecifications boundNames)
         {
             Selectable selectable = selectables.get(0);
@@ -577,9 +652,9 @@ public interface Selectable extends AssignmentTestable
             };
         }
 
-        private Factory newTupleSelectorFactory(CFMetaData cfm,
+        private Factory newTupleSelectorFactory(TableMetadata cfm,
                                                 TupleType tupleType,
-                                                List<ColumnDefinition> defs,
+                                                List<ColumnMetadata> defs,
                                                 VariableSpecifications boundNames)
         {
             SelectorFactories factories = createFactoriesAndCollectColumnDefinitions(selectables,
@@ -603,6 +678,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return Selectable.selectColumns(selectables, predicate);
+        }
+
+        @Override
         public String toString()
         {
             return Tuples.tupleToString(selectables);
@@ -617,7 +698,7 @@ public interface Selectable extends AssignmentTestable
                 this.raws = raws;
             }
 
-            public Selectable prepare(CFMetaData cfm)
+            public Selectable prepare(TableMetadata cfm)
             {
                 return new BetweenParenthesesOrWithTuple(raws.stream().map(p -> p.prepare(cfm)).collect(Collectors.toList()));
             }
@@ -646,12 +727,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
-        public Factory newSelectorFactory(CFMetaData cfm,
+        public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
-                                          List<ColumnDefinition> defs,
+                                          List<ColumnMetadata> defs,
                                           VariableSpecifications boundNames)
         {
-            AbstractType<?> type = getExactTypeIfKnown(cfm.ksName);
+            AbstractType<?> type = getExactTypeIfKnown(cfm.keyspace);
             if (type == null)
             {
                 type = expectedType;
@@ -681,6 +762,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return Selectable.selectColumns(selectables, predicate);
+        }
+
+        @Override
         public String toString()
         {
             return Lists.listToString(selectables);
@@ -695,7 +782,7 @@ public interface Selectable extends AssignmentTestable
                 this.raws = raws;
             }
 
-            public Selectable prepare(CFMetaData cfm)
+            public Selectable prepare(TableMetadata cfm)
             {
                 return new WithList(raws.stream().map(p -> p.prepare(cfm)).collect(Collectors.toList()));
             }
@@ -724,12 +811,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
-        public Factory newSelectorFactory(CFMetaData cfm,
+        public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
-                                          List<ColumnDefinition> defs,
+                                          List<ColumnMetadata> defs,
                                           VariableSpecifications boundNames)
         {
-            AbstractType<?> type = getExactTypeIfKnown(cfm.ksName);
+            AbstractType<?> type = getExactTypeIfKnown(cfm.keyspace);
             if (type == null)
             {
                 type = expectedType;
@@ -767,6 +854,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return Selectable.selectColumns(selectables, predicate);
+        }
+
+        @Override
         public String toString()
         {
             return Sets.setToString(selectables);
@@ -781,7 +874,7 @@ public interface Selectable extends AssignmentTestable
                 this.raws = raws;
             }
 
-            public Selectable prepare(CFMetaData cfm)
+            public Selectable prepare(TableMetadata cfm)
             {
                 return new WithSet(raws.stream().map(p -> p.prepare(cfm)).collect(Collectors.toList()));
             }
@@ -791,7 +884,7 @@ public interface Selectable extends AssignmentTestable
     /**
      * {@code Selectable} for literal Maps or UDTs.
      * <p>The parser cannot differentiate between a Map or a UDT in the selection cause because a
-     * {@code ColumnDefinition} is equivalent to a {@code FieldIdentifier} from a syntax point of view.
+     * {@code ColumnMetadata} is equivalent to a {@code FieldIdentifier} from a syntax point of view.
      * By consequence, we are forced to wait until the type is known to be able to differentiate them.</p>
      */
     public static class WithMapOrUdt implements Selectable
@@ -800,14 +893,14 @@ public interface Selectable extends AssignmentTestable
          * The column family metadata. We need to store them to be able to build the proper data once the type has been
          * identified.
          */
-        private final CFMetaData cfm;
+        private final TableMetadata cfm;
 
         /**
          * The Map or UDT raw elements.
          */
         private final List<Pair<Selectable.Raw, Selectable.Raw>> raws;
 
-        public WithMapOrUdt(CFMetaData cfm, List<Pair<Selectable.Raw, Selectable.Raw>> raws)
+        public WithMapOrUdt(TableMetadata cfm, List<Pair<Selectable.Raw, Selectable.Raw>> raws)
         {
             this.cfm = cfm;
             this.raws = raws;
@@ -821,12 +914,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
-        public Factory newSelectorFactory(CFMetaData cfm,
+        public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
-                                          List<ColumnDefinition> defs,
+                                          List<ColumnMetadata> defs,
                                           VariableSpecifications boundNames)
         {
-            AbstractType<?> type = getExactTypeIfKnown(cfm.ksName);
+            AbstractType<?> type = getExactTypeIfKnown(cfm.keyspace);
             if (type == null)
             {
                 type = expectedType;
@@ -841,8 +934,8 @@ public interface Selectable extends AssignmentTestable
             return newMapSelectorFactory(cfm, defs, boundNames, type);
         }
 
-        private Factory newMapSelectorFactory(CFMetaData cfm,
-                                              List<ColumnDefinition> defs,
+        private Factory newMapSelectorFactory(TableMetadata cfm,
+                                              List<ColumnMetadata> defs,
                                               VariableSpecifications boundNames,
                                               AbstractType<?> type)
         {
@@ -857,9 +950,9 @@ public interface Selectable extends AssignmentTestable
                                                                   .collect(Collectors.toList()));
         }
 
-        private Factory newUdtSelectorFactory(CFMetaData cfm,
+        private Factory newUdtSelectorFactory(TableMetadata cfm,
                                               AbstractType<?> expectedType,
-                                              List<ColumnDefinition> defs,
+                                              List<ColumnMetadata> defs,
                                               VariableSpecifications boundNames)
         {
             UserType ut = (UserType) expectedType;
@@ -896,6 +989,20 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            for (Pair<Selectable.Raw, Selectable.Raw> raw : raws)
+            {
+                if (!(raw.left instanceof RawIdentifier) && raw.left.prepare(cfm).selectColumns(predicate))
+                    return true;
+
+                if (!raw.right.prepare(cfm).selectColumns(predicate))
+                    return true;
+            }
+            return false;
+        }
+
+        @Override
         public String toString()
         {
             return raws.stream()
@@ -905,7 +1012,7 @@ public interface Selectable extends AssignmentTestable
                        .collect(Collectors.joining(", ", "{", "}"));
         }
 
-        private List<Pair<Selectable, Selectable>> getMapEntries(CFMetaData cfm)
+        private List<Pair<Selectable, Selectable>> getMapEntries(TableMetadata cfm)
         {
             return raws.stream()
                        .map(p -> Pair.create(p.left.prepare(cfm), p.right.prepare(cfm)))
@@ -946,7 +1053,7 @@ public interface Selectable extends AssignmentTestable
                 this.raws = raws;
             }
 
-            public Selectable prepare(CFMetaData cfm)
+            public Selectable prepare(TableMetadata cfm)
             {
                 return new WithMapOrUdt(cfm, raws);
             }
@@ -993,14 +1100,14 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
-        public Factory newSelectorFactory(CFMetaData cfm,
+        public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
-                                          List<ColumnDefinition> defs,
+                                          List<ColumnMetadata> defs,
                                           VariableSpecifications boundNames)
         {
-            final ColumnSpecification receiver = new ColumnSpecification(cfm.ksName, cfm.cfName, new ColumnIdentifier(toString(), true), type);
+            final ColumnSpecification receiver = new ColumnSpecification(cfm.keyspace, cfm.name, new ColumnIdentifier(toString(), true), type);
 
-            if (!selectable.testAssignment(cfm.ksName, receiver).isAssignable())
+            if (!selectable.testAssignment(cfm.keyspace, receiver).isAssignable())
                 throw new InvalidRequestException(String.format("Cannot assign value %s to %s of type %s", this, receiver.name, receiver.type.asCQL3Type()));
 
             final Factory factory = selectable.newSelectorFactory(cfm, type, defs, boundNames);
@@ -1031,6 +1138,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return selectable.selectColumns(predicate);
+        }
+
+        @Override
         public String toString()
         {
             return String.format("(%s)%s", typeName, selectable);
@@ -1048,10 +1161,10 @@ public interface Selectable extends AssignmentTestable
                 this.raw = raw;
             }
 
-            public Selectable prepare(CFMetaData cfm)
+            public Selectable prepare(TableMetadata cfm)
             {
                 Selectable selectable = raw.prepare(cfm);
-                AbstractType<?> type = this.typeRaw.prepare(cfm.ksName).getType();
+                AbstractType<?> type = this.typeRaw.prepare(cfm.keyspace).getType();
                 if (type.isFreezable())
                     type = type.freeze();
                 return new WithTypeHint(typeRaw.toString(), type, selectable);
@@ -1062,7 +1175,7 @@ public interface Selectable extends AssignmentTestable
     /**
      * In the selection clause, the parser cannot differentiate between Maps and UDTs as a column identifier and field
      * identifier have the same syntax. By consequence, we need to wait until the type is known to create the proper
-     * Object: {@code ColumnDefinition} or {@code FieldIdentifier}.
+     * Object: {@code ColumnMetadata} or {@code FieldIdentifier}.
      */
     public static final class RawIdentifier extends Selectable.Raw
     {
@@ -1093,10 +1206,10 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
-        public Selectable prepare(CFMetaData cfm)
+        public Selectable prepare(TableMetadata cfm)
         {
-            ColumnDefinition.Raw raw = quoted ? ColumnDefinition.Raw.forQuoted(text)
-                                              : ColumnDefinition.Raw.forUnquoted(text);
+            ColumnMetadata.Raw raw = quoted ? ColumnMetadata.Raw.forQuoted(text)
+                                            : ColumnMetadata.Raw.forUnquoted(text);
             return raw.prepare(cfm);
         }
 
@@ -1110,6 +1223,162 @@ public interface Selectable extends AssignmentTestable
         public String toString()
         {
             return text;
+        }
+    }
+
+    /**
+     * Represents the selection of an element of a collection (eg. c[x]).
+     */
+    public static class WithElementSelection implements Selectable
+    {
+        public final Selectable selected;
+        // Note that we can't yet prepare the Term.Raw yet as we need the ColumnSpecificiation corresponding to Selectable, which
+        // we'll only know in newSelectorFactory due to functions (which needs the defs passed to newSelectorFactory to resolve which
+        // function is called). Note that this doesn't really matter performance wise since the factories are still created during
+        // preparation of the corresponding SelectStatement.
+        public final Term.Raw element;
+
+        private WithElementSelection(Selectable selected, Term.Raw element)
+        {
+            assert element != null;
+            this.selected = selected;
+            this.element = element;
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.format("%s[%s]", selected, element);
+        }
+
+        public Selector.Factory newSelectorFactory(TableMetadata cfm, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames)
+        {
+            Selector.Factory factory = selected.newSelectorFactory(cfm, null, defs, boundNames);
+            ColumnSpecification receiver = factory.getColumnSpecification(cfm);
+
+            if (!(receiver.type instanceof CollectionType))
+                throw new InvalidRequestException(String.format("Invalid element selection: %s is of type %s is not a collection", selected, receiver.type.asCQL3Type()));
+
+            ColumnSpecification boundSpec = specForElementOrSlice(selected, receiver, "Element");
+
+            Term elt = element.prepare(cfm.keyspace, boundSpec);
+            elt.collectMarkerSpecification(boundNames);
+            return ElementsSelector.newElementFactory(toString(), factory, (CollectionType)receiver.type, elt);
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            AbstractType<?> selectedType = selected.getExactTypeIfKnown(keyspace);
+            if (selectedType == null || !(selectedType instanceof CollectionType))
+                return null;
+
+            return ElementsSelector.valueType((CollectionType) selectedType);
+        }
+
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return selected.selectColumns(predicate);
+        }
+
+        public static class Raw extends Selectable.Raw
+        {
+            private final Selectable.Raw selected;
+            private final Term.Raw element;
+
+            public Raw(Selectable.Raw selected, Term.Raw element)
+            {
+                this.selected = selected;
+                this.element = element;
+            }
+
+            public WithElementSelection prepare(TableMetadata cfm)
+            {
+                return new WithElementSelection(selected.prepare(cfm), element);
+            }
+        }
+    }
+
+    /**
+     * Represents the selection of a slice of a collection (eg. c[x..y]).
+     */
+    public static class WithSliceSelection implements Selectable
+    {
+        public final Selectable selected;
+        // Note that we can't yet prepare the Term.Raw yet as we need the ColumnSpecificiation corresponding to Selectable, which
+        // we'll only know in newSelectorFactory due to functions (which needs the defs passed to newSelectorFactory to resolve which
+        // function is called). Note that this doesn't really matter performance wise since the factories are still created during
+        // preparation of the corresponding SelectStatement.
+        // Both from and to can be null if they haven't been provided
+        public final Term.Raw from;
+        public final Term.Raw to;
+
+        private WithSliceSelection(Selectable selected, Term.Raw from, Term.Raw to)
+        {
+            this.selected = selected;
+            this.from = from;
+            this.to = to;
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.format("%s[%s..%s]", selected, from == null ? "" : from, to == null ? "" : to);
+        }
+
+        public Selector.Factory newSelectorFactory(TableMetadata cfm, AbstractType<?> expectedType, List<ColumnMetadata> defs, VariableSpecifications boundNames)
+        {
+            // Note that a slice gives you the same type as the collection you applied it to, so we can pass expectedType for selected directly
+            Selector.Factory factory = selected.newSelectorFactory(cfm, expectedType, defs, boundNames);
+            ColumnSpecification receiver = factory.getColumnSpecification(cfm);
+
+            if (!(receiver.type instanceof CollectionType))
+                throw new InvalidRequestException(String.format("Invalid slice selection: %s of type %s is not a collection", selected, receiver.type.asCQL3Type()));
+
+            ColumnSpecification boundSpec = specForElementOrSlice(selected, receiver, "Slice");
+
+            // If from or to are null, this means the user didn't provide on in the syntax (we had c[x..] or c[..x]).
+            // The equivalent of doing this when preparing values would be to use UNSET.
+            Term f = from == null ? Constants.UNSET_VALUE : from.prepare(cfm.keyspace, boundSpec);
+            Term t = to == null ? Constants.UNSET_VALUE : to.prepare(cfm.keyspace, boundSpec);
+            f.collectMarkerSpecification(boundNames);
+            t.collectMarkerSpecification(boundNames);
+            return ElementsSelector.newSliceFactory(toString(), factory, (CollectionType)receiver.type, f, t);
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            AbstractType<?> selectedType = selected.getExactTypeIfKnown(keyspace);
+            if (selectedType == null || !(selectedType instanceof CollectionType))
+                return null;
+
+            return selectedType;
+        }
+
+        @Override
+        public boolean selectColumns(Predicate<ColumnMetadata> predicate)
+        {
+            return selected.selectColumns(predicate);
+        }
+
+        public static class Raw extends Selectable.Raw
+        {
+            private final Selectable.Raw selected;
+            // Both from and to can be null if they haven't been provided
+            private final Term.Raw from;
+            private final Term.Raw to;
+
+            public Raw(Selectable.Raw selected, Term.Raw from, Term.Raw to)
+            {
+                this.selected = selected;
+                this.from = from;
+                this.to = to;
+            }
+
+            public WithSliceSelection prepare(TableMetadata cfm)
+            {
+                return new WithSliceSelection(selected.prepare(cfm), from, to);
+            }
         }
     }
 }

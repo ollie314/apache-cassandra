@@ -25,8 +25,8 @@ import com.google.common.collect.ImmutableRangeSet;
 import com.google.common.collect.Range;
 import com.google.common.collect.RangeSet;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
@@ -67,13 +67,18 @@ final class TokenFilter implements PartitionKeyRestrictions
         return isOnToken() ? false : restrictions.hasIN();
     }
 
+    public boolean hasContains()
+    {
+        return isOnToken() ? false : restrictions.hasContains();
+    }
+
     public boolean hasOnlyEqualityRestrictions()
     {
         return isOnToken() ? false : restrictions.hasOnlyEqualityRestrictions();
     }
 
     @Override
-    public Set<Restriction> getRestrictions(ColumnDefinition columnDef)
+    public Set<Restriction> getRestrictions(ColumnMetadata columnDef)
     {
         Set<Restriction> set = new HashSet<>();
         set.addAll(restrictions.getRestrictions(columnDef));
@@ -243,19 +248,19 @@ final class TokenFilter implements PartitionKeyRestrictions
     }
 
     @Override
-    public ColumnDefinition getFirstColumn()
+    public ColumnMetadata getFirstColumn()
     {
         return restrictions.getFirstColumn();
     }
 
     @Override
-    public ColumnDefinition getLastColumn()
+    public ColumnMetadata getLastColumn()
     {
         return restrictions.getLastColumn();
     }
 
     @Override
-    public List<ColumnDefinition> getColumnDefs()
+    public List<ColumnMetadata> getColumnDefs()
     {
         return restrictions.getColumnDefs();
     }
@@ -291,15 +296,15 @@ final class TokenFilter implements PartitionKeyRestrictions
     }
 
     @Override
-    public boolean needFiltering(CFMetaData cfm)
+    public boolean needFiltering(TableMetadata table)
     {
-        return restrictions.needFiltering(cfm);
+        return restrictions.needFiltering(table);
     }
 
     @Override
-    public boolean hasUnrestrictedPartitionKeyComponents(CFMetaData cfm)
+    public boolean hasUnrestrictedPartitionKeyComponents(TableMetadata table)
     {
-        return restrictions.hasUnrestrictedPartitionKeyComponents(cfm);
+        return restrictions.hasUnrestrictedPartitionKeyComponents(table);
     }
 
     @Override

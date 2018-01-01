@@ -18,17 +18,17 @@
 package org.apache.cassandra.db.rows;
 
 import java.util.*;
-import java.security.MessageDigest;
 import java.util.function.Consumer;
 
 import com.google.common.base.Predicate;
+import com.google.common.hash.Hasher;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.paxos.Commit;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.HashingUtils;
 import org.apache.cassandra.utils.MergeIterator;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
@@ -60,7 +60,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      * An in-natural-order collection of the columns for which data (incl. simple tombstones)
      * is present in this row.
      */
-    public Collection<ColumnDefinition> columns();
+    public Collection<ColumnMetadata> columns();
 
     /**
      * The row deletion.
@@ -106,8 +106,13 @@ public interface Row extends Unfiltered, Collection<ColumnData>
 
     /**
      * Whether the row has some live information (i.e. it's not just deletion informations).
+     * 
+     * @param nowInSec the current time to decide what is deleted and what isn't
+     * @param enforceStrictLiveness whether the row should be purged if there is no PK liveness info,
+     *                              normally retrieved from {@link CFMetaData#enforceStrictLiveness()}
+     * @return true if there is some live information
      */
-    public boolean hasLiveData(int nowInSec);
+    public boolean hasLiveData(int nowInSec, boolean enforceStrictLiveness);
 
     /**
      * Returns a cell for a simple column.
@@ -115,7 +120,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      * @param c the simple column for which to fetch the cell.
      * @return the corresponding cell or {@code null} if the row has no such cell.
      */
-    public Cell getCell(ColumnDefinition c);
+    public Cell getCell(ColumnMetadata c);
 
     /**
      * Return a cell for a given complex column and cell path.
@@ -124,7 +129,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      * @param path the cell path for which to fetch the cell.
      * @return the corresponding cell or {@code null} if the row has no such cell.
      */
-    public Cell getCell(ColumnDefinition c, CellPath path);
+    public Cell getCell(ColumnMetadata c, CellPath path);
 
     /**
      * The data for a complex column.
@@ -132,9 +137,9 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      * The returned object groups all the cells for the column, as well as it's complex deletion (if relevant).
      *
      * @param c the complex column for which to return the complex data.
-     * @return the data for {@code c} or {@code null} is the row has no data for this column.
+     * @return the data for {@code c} or {@code null} if the row has no data for this column.
      */
-    public ComplexColumnData getComplexColumnData(ColumnDefinition c);
+    public ComplexColumnData getComplexColumnData(ColumnMetadata c);
 
     /**
      * An iterable over the cells of this row.
@@ -156,7 +161,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      * @param reversed if cells should returned in reverse order.
      * @return an iterable over the cells of this row in "legacy order".
      */
-    public Iterable<Cell> cellsInLegacyOrder(CFMetaData metadata, boolean reversed);
+    public Iterable<Cell> cellsInLegacyOrder(TableMetadata metadata, boolean reversed);
 
     /**
      * Whether the row stores any (non-live) complex deletion for any complex column.
@@ -180,14 +185,14 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      *
      * @return a search iterator for the cells of this row.
      */
-    public SearchIterator<ColumnDefinition, ColumnData> searchIterator();
+    public SearchIterator<ColumnMetadata, ColumnData> searchIterator();
 
     /**
      * Returns a copy of this row that:
      *   1) only includes the data for the column included by {@code filter}.
      *   2) doesn't include any data that belongs to a dropped column (recorded in {@code metadata}).
      */
-    public Row filter(ColumnFilter filter, CFMetaData metadata);
+    public Row filter(ColumnFilter filter, TableMetadata metadata);
 
     /**
      * Returns a copy of this row that:
@@ -196,17 +201,27 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      *   3) doesn't include any data that is shadowed/deleted by {@code activeDeletion}.
      *   4) uses {@code activeDeletion} as row deletion iff {@code setActiveDeletionToRow} and {@code activeDeletion} supersedes the row deletion.
      */
-    public Row filter(ColumnFilter filter, DeletionTime activeDeletion, boolean setActiveDeletionToRow, CFMetaData metadata);
+    public Row filter(ColumnFilter filter, DeletionTime activeDeletion, boolean setActiveDeletionToRow, TableMetadata metadata);
 
     /**
      * Returns a copy of this row without any deletion info that should be purged according to {@code purger}.
      *
      * @param purger the {@code DeletionPurger} to use to decide what can be purged.
      * @param nowInSec the current time to decide what is deleted and what isn't (in the case of expired cells).
+     * @param enforceStrictLiveness whether the row should be purged if there is no PK liveness info,
+     *                              normally retrieved from {@link TableMetadata#enforceStrictLiveness()}
+     *
+     *        When enforceStrictLiveness is set, rows with empty PK liveness info
+     *        and no row deletion are purged.
+     *
+     *        Currently this is only used by views with normal base column as PK column
+     *        so updates to other base columns do not make the row live when the PK column
+     *        is not live. See CASSANDRA-11500.
+     *
      * @return this row but without any deletion info purged by {@code purger}. If the purged row is empty, returns
-     * {@code null}.
+     *         {@code null}.
      */
-    public Row purge(DeletionPurger purger, int nowInSec);
+    public Row purge(DeletionPurger purger, int nowInSec, boolean enforceStrictLiveness);
 
     /**
      * Returns a copy of this row which only include the data queried by {@code filter}, excluding anything _fetched_ for
@@ -249,7 +264,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
 
     public long unsharedHeapSizeExcludingData();
 
-    public String toString(CFMetaData metadata, boolean fullDetails);
+    public String toString(TableMetadata metadata, boolean fullDetails);
 
     /**
      * Apply a function to every column in a row
@@ -298,6 +313,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
             return time.isLive() ? LIVE : new Deletion(time, false);
         }
 
+        @Deprecated
         public static Deletion shadowable(DeletionTime time)
         {
             return new Deletion(time, true);
@@ -360,10 +376,10 @@ public interface Row extends Unfiltered, Collection<ColumnData>
             return time.deletes(cell);
         }
 
-        public void digest(MessageDigest digest)
+        public void digest(Hasher hasher)
         {
-            time.digest(digest);
-            FBUtilities.updateWithBoolean(digest, isShadowable);
+            time.digest(hasher);
+            HashingUtils.updateWithBoolean(hasher, isShadowable);
         }
 
         public int dataSize()
@@ -421,6 +437,12 @@ public interface Row extends Unfiltered, Collection<ColumnData>
     public interface Builder
     {
         /**
+         * Creates a copy of this {@code Builder}.
+         * @return a copy of this {@code Builder}
+         */
+        public Builder copy();
+
+        /**
          * Whether the builder is a sorted one or not.
          *
          * @return if the builder requires calls to be done in sorted order or not (see above).
@@ -475,7 +497,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
          * @param column the column for which to add the {@code complexDeletion}.
          * @param complexDeletion the complex deletion time to add.
          */
-        public void addComplexDeletion(ColumnDefinition column, DeletionTime complexDeletion);
+        public void addComplexDeletion(ColumnMetadata column, DeletionTime complexDeletion);
 
         /**
          * Builds and return built row.
@@ -690,7 +712,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
         {
             private final int nowInSec;
 
-            private ColumnDefinition column;
+            private ColumnMetadata column;
             private final List<ColumnData> versions;
 
             private DeletionTime activeDeletion;
@@ -715,8 +737,23 @@ public interface Row extends Unfiltered, Collection<ColumnData>
 
             public void reduce(int idx, ColumnData data)
             {
-                column = data.column();
+                if (useColumnMetadata(data.column()))
+                    column = data.column();
+
                 versions.add(data);
+            }
+
+            /**
+             * Determines it the {@code ColumnMetadata} is the one that should be used.
+             * @param dataColumn the {@code ColumnMetadata} to use.
+             * @return {@code true} if the {@code ColumnMetadata} is the one that should be used, {@code false} otherwise.
+             */
+            private boolean useColumnMetadata(ColumnMetadata dataColumn)
+            {
+                if (column == null)
+                    return true;
+
+                return AbstractTypeVersionComparator.INSTANCE.compare(column.type, dataColumn.type) < 0;
             }
 
             protected ColumnData getReduced()
@@ -768,6 +805,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
 
             protected void onKeyChange()
             {
+                column = null;
                 versions.clear();
             }
         }

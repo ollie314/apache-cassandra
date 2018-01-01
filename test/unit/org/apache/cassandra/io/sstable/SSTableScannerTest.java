@@ -24,14 +24,13 @@ import java.util.Collection;
 import java.util.List;
 
 import com.google.common.collect.Iterables;
-import com.google.common.util.concurrent.RateLimiter;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
@@ -46,6 +45,7 @@ import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
@@ -74,7 +74,7 @@ public class SSTableScannerTest
     }
 
     // we produce all DataRange variations that produce an inclusive start and exclusive end range
-    private static Iterable<DataRange> dataRanges(CFMetaData metadata, int start, int end)
+    private static Iterable<DataRange> dataRanges(TableMetadata metadata, int start, int end)
     {
         if (end < start)
             return dataRanges(metadata, start, end, false, true);
@@ -85,7 +85,7 @@ public class SSTableScannerTest
         );
     }
 
-    private static Iterable<DataRange> dataRanges(CFMetaData metadata, int start, int end, boolean inclusiveStart, boolean inclusiveEnd)
+    private static Iterable<DataRange> dataRanges(TableMetadata metadata, int start, int end, boolean inclusiveStart, boolean inclusiveEnd)
     {
         List<DataRange> ranges = new ArrayList<>();
         if (start == end + 1)
@@ -143,7 +143,7 @@ public class SSTableScannerTest
         return token(key).maxKeyBound();
     }
 
-    private static DataRange dataRange(CFMetaData metadata, PartitionPosition start, boolean startInclusive, PartitionPosition end, boolean endInclusive)
+    private static DataRange dataRange(TableMetadata metadata, PartitionPosition start, boolean startInclusive, PartitionPosition end, boolean endInclusive)
     {
         Slices.Builder sb = new Slices.Builder(metadata.comparator);
         ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(sb.build(), false);
@@ -165,7 +165,7 @@ public class SSTableScannerTest
         return ranges;
     }
 
-    private static void insertRowWithKey(CFMetaData metadata, int key)
+    private static void insertRowWithKey(TableMetadata metadata, int key)
     {
         long timestamp = System.currentTimeMillis();
 
@@ -180,9 +180,11 @@ public class SSTableScannerTest
     private static void assertScanMatches(SSTableReader sstable, int scanStart, int scanEnd, int ... boundaries)
     {
         assert boundaries.length % 2 == 0;
-        for (DataRange range : dataRanges(sstable.metadata, scanStart, scanEnd))
+        for (DataRange range : dataRanges(sstable.metadata(), scanStart, scanEnd))
         {
-            try(ISSTableScanner scanner = sstable.getScanner(ColumnFilter.all(sstable.metadata), range, false))
+            try(ISSTableScanner scanner = sstable.getScanner(ColumnFilter.all(sstable.metadata()),
+                                                             range,
+                                                             SSTableReadsListener.NOOP_LISTENER))
             {
                 for (int b = 0; b < boundaries.length; b += 2)
                     for (int i = boundaries[b]; i <= boundaries[b + 1]; i++)
@@ -212,7 +214,7 @@ public class SSTableScannerTest
         store.disableAutoCompaction();
 
         for (int i = 2; i < 10; i++)
-            insertRowWithKey(store.metadata, i);
+            insertRowWithKey(store.metadata(), i);
         store.forceBlockingFlush();
 
         assertEquals(1, store.getLiveSSTables().size());
@@ -318,7 +320,7 @@ public class SSTableScannerTest
 
         for (int i = 0; i < 3; i++)
             for (int j = 2; j < 10; j++)
-                insertRowWithKey(store.metadata, i * 100 + j);
+                insertRowWithKey(store.metadata(), i * 100 + j);
         store.forceBlockingFlush();
 
         assertEquals(1, store.getLiveSSTables().size());
@@ -438,7 +440,7 @@ public class SSTableScannerTest
         // disable compaction while flushing
         store.disableAutoCompaction();
 
-        insertRowWithKey(store.metadata, 205);
+        insertRowWithKey(store.metadata(), 205);
         store.forceBlockingFlush();
 
         assertEquals(1, store.getLiveSSTables().size());

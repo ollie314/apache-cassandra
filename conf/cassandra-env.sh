@@ -214,6 +214,18 @@ if [ "x$CASSANDRA_HEAPDUMP_DIR" != "x" ]; then
     JVM_OPTS="$JVM_OPTS -XX:HeapDumpPath=$CASSANDRA_HEAPDUMP_DIR/cassandra-`date +%s`-pid$$.hprof"
 fi
 
+# stop the jvm on OutOfMemoryError as it can result in some data corruption
+# uncomment the preferred option
+# ExitOnOutOfMemoryError and CrashOnOutOfMemoryError require a JRE greater or equals to 1.7 update 101 or 1.8 update 92
+# For OnOutOfMemoryError we cannot use the JVM_OPTS variables because bash commands split words
+# on white spaces without taking quotes into account
+# JVM_OPTS="$JVM_OPTS -XX:+ExitOnOutOfMemoryError"
+# JVM_OPTS="$JVM_OPTS -XX:+CrashOnOutOfMemoryError"
+JVM_ON_OUT_OF_MEMORY_ERROR_OPT="-XX:OnOutOfMemoryError=kill -9 %p"
+
+# print an heap histogram on OutOfMemoryError
+# JVM_OPTS="$JVM_OPTS -Dcassandra.printHeapHistogramOnOutOfMemoryError=true"
+
 # jmx: metrics and administration interface
 #
 # add this if you're having trouble connecting:
@@ -282,14 +294,30 @@ JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/
 # See http://wiki.apache.org/cassandra/Operations#Monitoring_with_MX4J
 # By default mx4j listens on 0.0.0.0:8081. Uncomment the following lines
 # to control its listen address and port.
-#MX4J_ADDRESS="-Dmx4jaddress=127.0.0.1"
-#MX4J_PORT="-Dmx4jport=8081"
+#MX4J_ADDRESS="127.0.0.1"
+#MX4J_PORT="8081"
 
 # Cassandra uses SIGAR to capture OS metrics CASSANDRA-7838
 # for SIGAR we have to set the java.library.path
 # to the location of the native libraries.
 JVM_OPTS="$JVM_OPTS -Djava.library.path=$CASSANDRA_HOME/lib/sigar-bin"
 
-JVM_OPTS="$JVM_OPTS $MX4J_ADDRESS"
-JVM_OPTS="$JVM_OPTS $MX4J_PORT"
+if [ "x$MX4J_ADDRESS" != "x" ]; then
+    if [[ "$MX4J_ADDRESS" == \-Dmx4jaddress* ]]; then
+        # Backward compatible with the older style #13578
+        JVM_OPTS="$JVM_OPTS $MX4J_ADDRESS"
+    else
+        JVM_OPTS="$JVM_OPTS -Dmx4jaddress=$MX4J_ADDRESS"
+    fi
+fi
+if [ "x$MX4J_PORT" != "x" ]; then
+    if [[ "$MX4J_PORT" == \-Dmx4jport* ]]; then
+        # Backward compatible with the older style #13578
+        JVM_OPTS="$JVM_OPTS $MX4J_PORT"
+    else
+        JVM_OPTS="$JVM_OPTS -Dmx4jport=$MX4J_PORT"
+    fi
+fi
+
 JVM_OPTS="$JVM_OPTS $JVM_EXTRA_OPTS"
+

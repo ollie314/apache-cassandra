@@ -18,7 +18,6 @@
 package org.apache.cassandra.db.commitlog;
 
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -26,7 +25,7 @@ import java.nio.channels.FileChannel;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.CLibrary;
+import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.SyncUtil;
 
 /*
@@ -54,21 +53,9 @@ public class MemoryMappedSegment extends CommitLogSegment
     {
         try
         {
-            // Extend the file size to the standard segment size.
-            // NOTE: while we're using RAF to easily adjust file size, we need to avoid using RAF
-            // for grabbing the FileChannel due to FILE_SHARE_DELETE flag bug on windows.
-            // See: https://bugs.openjdk.java.net/browse/JDK-6357433 and CASSANDRA-8308
-            try (RandomAccessFile raf = new RandomAccessFile(logFile, "rw"))
-            {
-                raf.setLength(DatabaseDescriptor.getCommitLogSegmentSize());
-            }
-            catch (IOException e)
-            {
-                throw new FSWriteError(e, logFile);
-            }
+            MappedByteBuffer mappedFile = channel.map(FileChannel.MapMode.READ_WRITE, 0, DatabaseDescriptor.getCommitLogSegmentSize());
             manager.addSize(DatabaseDescriptor.getCommitLogSegmentSize());
-
-            return channel.map(FileChannel.MapMode.READ_WRITE, 0, DatabaseDescriptor.getCommitLogSegmentSize());
+            return mappedFile;
         }
         catch (IOException e)
         {
@@ -89,8 +76,12 @@ public class MemoryMappedSegment extends CommitLogSegment
 
         // write previous sync marker to point to next sync marker
         // we don't chain the crcs here to ensure this method is idempotent if it fails
-        writeSyncMarker(buffer, startMarker, startMarker, nextMarker);
+        writeSyncMarker(id, buffer, startMarker, startMarker, nextMarker);
+    }
 
+    @Override
+    protected void flush(int startMarker, int nextMarker)
+    {
         try
         {
             SyncUtil.force((MappedByteBuffer) buffer);
@@ -99,7 +90,7 @@ public class MemoryMappedSegment extends CommitLogSegment
         {
             throw new FSWriteError(e, getPath());
         }
-        CLibrary.trySkipCache(fd, startMarker, nextMarker, logFile.getAbsolutePath());
+        NativeLibrary.trySkipCache(fd, startMarker, nextMarker, logFile.getAbsolutePath());
     }
 
     @Override

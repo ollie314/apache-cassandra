@@ -28,10 +28,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.*;
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.cql3.QueryHandler;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.functions.Function;
@@ -40,7 +41,6 @@ import org.apache.cassandra.exceptions.AuthenticationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
 import org.apache.cassandra.schema.SchemaKeyspace;
-import org.apache.cassandra.thrift.ThriftValidation;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.CassandraVersion;
@@ -55,8 +55,7 @@ public class ClientState
 
     private static final Set<IResource> READABLE_SYSTEM_RESOURCES = new HashSet<>();
     private static final Set<IResource> PROTECTED_AUTH_RESOURCES = new HashSet<>();
-    private static final Set<String> ALTERABLE_SYSTEM_KEYSPACES = new HashSet<>();
-    private static final Set<IResource> DROPPABLE_SYSTEM_TABLES = new HashSet<>();
+
     static
     {
         // We want these system cfs to be always readable to authenticated users since many tools rely on them
@@ -73,15 +72,6 @@ public class ClientState
             PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthorizer().protectedResources());
             PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getRoleManager().protectedResources());
         }
-
-        // allow users with sufficient privileges to alter KS level options on AUTH_KS and
-        // TRACING_KS, and also to drop legacy tables (users, credentials, permissions) from
-        // AUTH_KS
-        ALTERABLE_SYSTEM_KEYSPACES.add(SchemaConstants.AUTH_KEYSPACE_NAME);
-        ALTERABLE_SYSTEM_KEYSPACES.add(SchemaConstants.TRACE_KEYSPACE_NAME);
-        DROPPABLE_SYSTEM_TABLES.add(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, PasswordAuthenticator.LEGACY_CREDENTIALS_TABLE));
-        DROPPABLE_SYSTEM_TABLES.add(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, CassandraRoleManager.LEGACY_USERS_TABLE));
-        DROPPABLE_SYSTEM_TABLES.add(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, CassandraAuthorizer.USER_PERMISSIONS));
     }
 
     // Current user for the session
@@ -139,6 +129,14 @@ public class ClientState
             this.user = AuthenticatedUser.ANONYMOUS_USER;
     }
 
+    protected ClientState(ClientState source)
+    {
+        this.isInternal = source.isInternal;
+        this.remoteAddress = source.remoteAddress;
+        this.user = source.user;
+        this.keyspace = source.keyspace;
+    }
+
     /**
      * @return a ClientState object for internal C* calls (not limited by any kind of auth).
      */
@@ -148,11 +146,27 @@ public class ClientState
     }
 
     /**
-     * @return a ClientState object for external clients (thrift/native protocol users).
+     * @return a ClientState object for external clients (native protocol users).
      */
     public static ClientState forExternalCalls(SocketAddress remoteAddress)
     {
         return new ClientState((InetSocketAddress)remoteAddress);
+    }
+
+    /**
+     * Clone this ClientState object, but use the provided keyspace instead of the
+     * keyspace in this ClientState object.
+     *
+     * @return a new ClientState object if the keyspace argument is non-null. Otherwise do not clone
+     *   and return this ClientState object.
+     */
+    public ClientState cloneWithKeyspaceIfSet(String keyspace)
+    {
+        if (keyspace == null)
+            return this;
+        ClientState clientState = new ClientState(this);
+        clientState.setKeyspace(keyspace);
+        return clientState;
     }
 
     /**
@@ -255,7 +269,7 @@ public class ClientState
     {
         // Skip keyspace validation for non-authenticated users. Apparently, some client libraries
         // call set_keyspace() before calling login(), and we have to handle that.
-        if (user != null && Schema.instance.getKSMetaData(ks) == null)
+        if (user != null && Schema.instance.getKeyspaceMetadata(ks) == null)
             throw new InvalidRequestException("Keyspace '" + ks + "' does not exist");
         keyspace = ks;
     }
@@ -290,29 +304,41 @@ public class ClientState
     public void hasColumnFamilyAccess(String keyspace, String columnFamily, Permission perm)
     throws UnauthorizedException, InvalidRequestException
     {
-        ThriftValidation.validateColumnFamily(keyspace, columnFamily);
+        Schema.instance.validateTable(keyspace, columnFamily);
         hasAccess(keyspace, perm, DataResource.table(keyspace, columnFamily));
     }
 
-    public void hasColumnFamilyAccess(CFMetaData cfm, Permission perm)
+    public void hasColumnFamilyAccess(TableMetadataRef tableRef, Permission perm)
     throws UnauthorizedException, InvalidRequestException
     {
-        hasAccess(cfm.ksName, perm, cfm.resource);
+        hasColumnFamilyAccess(tableRef.get(), perm);
+    }
+
+    public void hasColumnFamilyAccess(TableMetadata table, Permission perm)
+    throws UnauthorizedException, InvalidRequestException
+    {
+        hasAccess(table.keyspace, perm, table.resource);
     }
 
     private void hasAccess(String keyspace, Permission perm, DataResource resource)
     throws UnauthorizedException, InvalidRequestException
     {
         validateKeyspace(keyspace);
+
         if (isInternal)
             return;
+
         validateLogin();
+
         preventSystemKSSchemaModification(keyspace, resource, perm);
+
         if ((perm == Permission.SELECT) && READABLE_SYSTEM_RESOURCES.contains(resource))
             return;
+
         if (PROTECTED_AUTH_RESOURCES.contains(resource))
             if ((perm == Permission.CREATE) || (perm == Permission.ALTER) || (perm == Permission.DROP))
                 throw new UnauthorizedException(String.format("%s schema is protected", resource));
+
         ensureHasPermission(perm, resource);
     }
 
@@ -360,21 +386,21 @@ public class ClientState
 
     private void preventSystemKSSchemaModification(String keyspace, DataResource resource, Permission perm) throws UnauthorizedException
     {
-        // we only care about schema modification.
-        if (!((perm == Permission.ALTER) || (perm == Permission.DROP) || (perm == Permission.CREATE)))
+        // we only care about DDL statements
+        if (perm != Permission.ALTER && perm != Permission.DROP && perm != Permission.CREATE)
             return;
 
-        // prevent system keyspace modification
-        if (SchemaConstants.isSystemKeyspace(keyspace))
+        // prevent ALL local system keyspace modification
+        if (SchemaConstants.isLocalSystemKeyspace(keyspace))
             throw new UnauthorizedException(keyspace + " keyspace is not user-modifiable.");
 
-        // allow users with sufficient privileges to alter KS level options on AUTH_KS and
-        // TRACING_KS, and also to drop legacy tables (users, credentials, permissions) from
-        // AUTH_KS
-        if (ALTERABLE_SYSTEM_KEYSPACES.contains(resource.getKeyspace().toLowerCase())
-           && ((perm == Permission.ALTER && !resource.isKeyspaceLevel())
-               || (perm == Permission.DROP && !DROPPABLE_SYSTEM_TABLES.contains(resource))))
+        if (SchemaConstants.isReplicatedSystemKeyspace(keyspace))
         {
+            // allow users with sufficient privileges to alter replication params of replicated system keyspaces
+            if (perm == Permission.ALTER && resource.isKeyspaceLevel())
+                return;
+
+            // prevent all other modifications of replicated system keyspaces
             throw new UnauthorizedException(String.format("Cannot %s %s", perm, resource));
         }
     }

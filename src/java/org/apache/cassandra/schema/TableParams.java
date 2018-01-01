@@ -24,6 +24,7 @@ import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableMap;
 
+import org.apache.cassandra.cql3.Attributes;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.utils.BloomCalculations;
 
@@ -133,6 +134,11 @@ public final class TableParams
                             .cdc(params.cdc);
     }
 
+    public Builder unbuild()
+    {
+        return builder(this);
+    }
+
     public void validate()
     {
         compaction.validate();
@@ -170,6 +176,9 @@ public final class TableParams
 
         if (defaultTimeToLive < 0)
             fail("%s must be greater than or equal to 0 (got %s)", Option.DEFAULT_TIME_TO_LIVE, defaultTimeToLive);
+
+        if (defaultTimeToLive > Attributes.MAX_TTL)
+            fail("%s must be less than or equal to %d (got %s)", Option.DEFAULT_TIME_TO_LIVE, Attributes.MAX_TTL, defaultTimeToLive);
 
         if (gcGraceSeconds < 0)
             fail("%s must be greater than or equal to 0 (got %s)", Option.GC_GRACE_SECONDS, gcGraceSeconds);

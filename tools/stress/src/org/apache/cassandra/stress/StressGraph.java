@@ -110,17 +110,14 @@ public class StressGraph
 
     private String getGraphHTML()
     {
-        InputStream graphHTMLRes = StressGraph.class.getClassLoader().getResourceAsStream("org/apache/cassandra/stress/graph/graph.html");
-        String graphHTML;
-        try
+        try (InputStream graphHTMLRes = StressGraph.class.getClassLoader().getResourceAsStream("org/apache/cassandra/stress/graph/graph.html"))
         {
-            graphHTML = new String(ByteStreams.toByteArray(graphHTMLRes));
+            return new String(ByteStreams.toByteArray(graphHTMLRes));
         }
         catch (IOException e)
         {
             throw new RuntimeException(e);
         }
-        return graphHTML;
     }
 
     /** Parse log and append to stats array */
@@ -151,7 +148,7 @@ public class StressGraph
                         currentThreadCount = tc.group(2);
                     }
                 }
-                
+
                 // Detect mode changes
                 if (line.equals(StressMetrics.HEAD))
                 {
@@ -213,7 +210,8 @@ public class StressGraph
                         json.put("revision", stressSettings.graph.revision);
                     else
                         json.put("revision", String.format("%s - %s threads", stressSettings.graph.revision, currentThreadCount));
-                    json.put("command", StringUtils.join(stressArguments, " "));
+                    String command = StringUtils.join(stressArguments, " ").replaceAll("password=.*? ", "password=******* ");
+                    json.put("command", command);
                     json.put("intervals", intervals);
                     stats.add(json);
 
@@ -234,7 +232,7 @@ public class StressGraph
 
     private JSONObject createJSONStats(JSONObject json)
     {
-        try (InputStream logStream = new FileInputStream(stressSettings.graph.temporaryLogFile))
+        try (InputStream logStream = Files.newInputStream(stressSettings.graph.temporaryLogFile.toPath()))
         {
             JSONArray stats;
             if (json == null)

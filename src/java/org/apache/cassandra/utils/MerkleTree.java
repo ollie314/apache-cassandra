@@ -22,8 +22,12 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.util.*;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.PeekingIterator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.dht.IPartitioner;
@@ -34,7 +38,6 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.net.MessagingService;
 
 /**
  * A MerkleTree implemented as a binary tree.
@@ -58,6 +61,8 @@ import org.apache.cassandra.net.MessagingService;
  */
 public class MerkleTree implements Serializable
 {
+    private static Logger logger = LoggerFactory.getLogger(MerkleTree.class);
+
     public static final MerkleTreeSerializer serializer = new MerkleTreeSerializer();
     private static final long serialVersionUID = 2L;
 
@@ -241,8 +246,20 @@ public class MerkleTree implements Serializable
 
         if (lhash != null && rhash != null && !Arrays.equals(lhash, rhash))
         {
-            if (FULLY_INCONSISTENT == differenceHelper(ltree, rtree, diff, active))
+            if(lnode instanceof  Leaf || rnode instanceof Leaf)
+            {
+                logger.debug("Digest mismatch detected among leaf nodes {}, {}", lnode, rnode);
                 diff.add(active);
+            }
+            else
+            {
+                logger.debug("Digest mismatch detected, traversing trees [{}, {}]", ltree, rtree);
+                if (FULLY_INCONSISTENT == differenceHelper(ltree, rtree, diff, active))
+                {
+                    logger.debug("Range {} fully inconsistent", active);
+                    diff.add(active);
+                }
+            }
         }
         else if (lhash == null || rhash == null)
             diff.add(active);
@@ -256,14 +273,25 @@ public class MerkleTree implements Serializable
      * Takes two trees and a range for which they have hashes, but are inconsistent.
      * @return FULLY_INCONSISTENT if active is inconsistent, PARTIALLY_INCONSISTENT if only a subrange is inconsistent.
      */
+    @VisibleForTesting
     static int differenceHelper(MerkleTree ltree, MerkleTree rtree, List<TreeRange> diff, TreeRange active)
     {
         if (active.depth == Byte.MAX_VALUE)
             return CONSISTENT;
 
         Token midpoint = ltree.partitioner().midpoint(active.left, active.right);
+        // sanity check for midpoint calculation, see CASSANDRA-13052
+        if (midpoint.equals(active.left) || midpoint.equals(active.right))
+        {
+            // If the midpoint equals either the left or the right, we have a range that's too small to split - we'll simply report the
+            // whole range as inconsistent
+            logger.debug("({}) No sane midpoint ({}) for range {} , marking whole range as inconsistent", active.depth, midpoint, active);
+            return FULLY_INCONSISTENT;
+        }
+
         TreeDifference left = new TreeDifference(active.left, midpoint, inc(active.depth));
         TreeDifference right = new TreeDifference(midpoint, active.right, inc(active.depth));
+        logger.debug("({}) Hashing sub-ranges [{}, {}] for {} divided by midpoint {}", active.depth, left, right, active, midpoint);
         byte[] lhash, rhash;
         Hashable lnode, rnode;
 
@@ -278,9 +306,16 @@ public class MerkleTree implements Serializable
         int ldiff = CONSISTENT;
         boolean lreso = lhash != null && rhash != null;
         if (lreso && !Arrays.equals(lhash, rhash))
-            ldiff = differenceHelper(ltree, rtree, diff, left);
+        {
+            logger.debug("({}) Inconsistent digest on left sub-range {}: [{}, {}]", active.depth, left, lnode, rnode);
+            if (lnode instanceof Leaf) ldiff = FULLY_INCONSISTENT;
+            else ldiff = differenceHelper(ltree, rtree, diff, left);
+        }
         else if (!lreso)
+        {
+            logger.debug("({}) Left sub-range fully inconsistent {}", active.depth, right);
             ldiff = FULLY_INCONSISTENT;
+        }
 
         // see if we should recurse right
         lnode = ltree.find(right);
@@ -293,25 +328,36 @@ public class MerkleTree implements Serializable
         int rdiff = CONSISTENT;
         boolean rreso = lhash != null && rhash != null;
         if (rreso && !Arrays.equals(lhash, rhash))
-            rdiff = differenceHelper(ltree, rtree, diff, right);
+        {
+            logger.debug("({}) Inconsistent digest on right sub-range {}: [{}, {}]", active.depth, right, lnode, rnode);
+            if (rnode instanceof Leaf) rdiff = FULLY_INCONSISTENT;
+            else rdiff = differenceHelper(ltree, rtree, diff, right);
+        }
         else if (!rreso)
+        {
+            logger.debug("({}) Right sub-range fully inconsistent {}", active.depth, right);
             rdiff = FULLY_INCONSISTENT;
+        }
 
         if (ldiff == FULLY_INCONSISTENT && rdiff == FULLY_INCONSISTENT)
         {
             // both children are fully inconsistent
+            logger.debug("({}) Fully inconsistent range [{}, {}]", active.depth, left, right);
             return FULLY_INCONSISTENT;
         }
         else if (ldiff == FULLY_INCONSISTENT)
         {
+            logger.debug("({}) Adding left sub-range to diff as fully inconsistent {}", active.depth, left);
             diff.add(left);
             return PARTIALLY_INCONSISTENT;
         }
         else if (rdiff == FULLY_INCONSISTENT)
         {
+            logger.debug("({}) Adding right sub-range to diff as fully inconsistent {}", active.depth, right);
             diff.add(right);
             return PARTIALLY_INCONSISTENT;
         }
+        logger.debug("({}) Range {} partially inconstent", active.depth, active);
         return PARTIALLY_INCONSISTENT;
     }
 
@@ -845,16 +891,6 @@ public class MerkleTree implements Serializable
         {
             public void serialize(Inner inner, DataOutputPlus out, int version) throws IOException
             {
-                if (version < MessagingService.VERSION_30)
-                {
-                    if (inner.hash == null)
-                        out.writeInt(-1);
-                    else
-                    {
-                        out.writeInt(inner.hash.length);
-                        out.write(inner.hash);
-                    }
-                }
                 Token.serializer.serialize(inner.token, out, version);
                 Hashable.serializer.serialize(inner.lchild, out, version);
                 Hashable.serializer.serialize(inner.rchild, out, version);
@@ -862,13 +898,6 @@ public class MerkleTree implements Serializable
 
             public Inner deserialize(DataInput in, IPartitioner p, int version) throws IOException
             {
-                if (version < MessagingService.VERSION_30)
-                {
-                    int hashLen = in.readInt();
-                    byte[] hash = hashLen >= 0 ? new byte[hashLen] : null;
-                    if (hash != null)
-                        in.readFully(hash);
-                }
                 Token token = Token.serializer.deserialize(in, p, version);
                 Hashable lchild = Hashable.serializer.deserialize(in, p, version);
                 Hashable rchild = Hashable.serializer.deserialize(in, p, version);
@@ -877,18 +906,9 @@ public class MerkleTree implements Serializable
 
             public long serializedSize(Inner inner, int version)
             {
-                long size = 0;
-                if (version < MessagingService.VERSION_30)
-                {
-                    size += inner.hash == null
-                                       ? TypeSizes.sizeof(-1)
-                                       : TypeSizes.sizeof(inner.hash().length) + inner.hash().length;
-                }
-
-                size += Token.serializer.serializedSize(inner.token, version)
-                + Hashable.serializer.serializedSize(inner.lchild, version)
-                + Hashable.serializer.serializedSize(inner.rchild, version);
-                return size;
+                return Token.serializer.serializedSize(inner.token, version)
+                     + Hashable.serializer.serializedSize(inner.lchild, version)
+                     + Hashable.serializer.serializedSize(inner.rchild, version);
             }
         }
     }
@@ -938,24 +958,18 @@ public class MerkleTree implements Serializable
             {
                 if (leaf.hash == null)
                 {
-                    if (version < MessagingService.VERSION_30)
-                        out.writeInt(-1);
-                    else
-                        out.writeByte(-1);
+                    out.writeByte(-1);
                 }
                 else
                 {
-                    if (version < MessagingService.VERSION_30)
-                        out.writeInt(leaf.hash.length);
-                    else
-                        out.writeByte(leaf.hash.length);
+                    out.writeByte(leaf.hash.length);
                     out.write(leaf.hash);
                 }
             }
 
             public Leaf deserialize(DataInput in, IPartitioner p, int version) throws IOException
             {
-                int hashLen = version < MessagingService.VERSION_30 ? in.readInt() : in.readByte();
+                int hashLen = in.readByte();
                 byte[] hash = hashLen < 0 ? null : new byte[hashLen];
                 if (hash != null)
                     in.readFully(hash);
@@ -964,11 +978,9 @@ public class MerkleTree implements Serializable
 
             public long serializedSize(Leaf leaf, int version)
             {
-                long size = version < MessagingService.VERSION_30 ? TypeSizes.sizeof(1) : 1;
+                long size = 1;
                 if (leaf.hash != null)
-                {
                     size += leaf.hash().length;
-                }
                 return size;
             }
         }

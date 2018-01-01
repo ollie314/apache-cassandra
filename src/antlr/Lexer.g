@@ -262,6 +262,10 @@ QUOTED_NAME
     : '\"' (c=~('\"') { b.appendCodePoint(c); } | '\"' '\"' { b.appendCodePoint('\"'); })+ '\"'
     ;
 
+EMPTY_QUOTED_NAME
+    : '\"' '\"'
+    ;
+
 fragment DIGIT
     : '0'..'9'
     ;
@@ -300,13 +304,18 @@ QMARK
     : '?'
     ;
 
+RANGE
+    : '..'
+    ;
+
 /*
  * Normally a lexer only emits one token at a time, but ours is tricked out
  * to support multiple (see @lexer::members near the top of the grammar).
  */
 FLOAT
-    : INTEGER EXPONENT
-    | INTEGER '.' DIGIT* EXPONENT?
+    : (INTEGER '.' RANGE) => INTEGER '.'
+    | (INTEGER RANGE) => INTEGER {$type = INTEGER;}
+    | INTEGER ('.' DIGIT*)? EXPONENT?
     ;
 
 /*

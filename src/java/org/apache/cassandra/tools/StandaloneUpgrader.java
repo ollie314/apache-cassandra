@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -20,12 +20,8 @@ package org.apache.cassandra.tools;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
-import org.apache.cassandra.io.sstable.format.SSTableFormat;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.commons.cli.*;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
@@ -34,6 +30,9 @@ import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.Upgrader;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.OutputHandler;
 
@@ -56,7 +55,7 @@ public class StandaloneUpgrader
             // load keyspace descriptions.
             Schema.instance.loadFromDisk(false);
 
-            if (Schema.instance.getCFMetaData(options.keyspace, options.cf) == null)
+            if (Schema.instance.getTableMetadataRef(options.keyspace, options.cf) == null)
                 throw new IllegalArgumentException(String.format("Unknown keyspace/table %s.%s",
                                                                  options.keyspace,
                                                                  options.cf));
@@ -84,7 +83,10 @@ public class StandaloneUpgrader
                 {
                     SSTableReader sstable = SSTableReader.openNoValidation(entry.getKey(), components, cfs);
                     if (sstable.descriptor.version.equals(SSTableFormat.Type.current().info.getLatestVersion()))
+                    {
+                        sstable.selfRef().release();
                         continue;
+                    }
                     readers.add(sstable);
                 }
                 catch (Exception e)
@@ -93,8 +95,6 @@ public class StandaloneUpgrader
                     System.err.println(String.format("Error Loading %s: %s", entry.getKey(), e.getMessage()));
                     if (options.debug)
                         e.printStackTrace(System.err);
-
-                    continue;
                 }
             }
 

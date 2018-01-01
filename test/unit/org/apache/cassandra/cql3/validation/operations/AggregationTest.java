@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -40,8 +41,8 @@ import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.spi.TurboFilterList;
 import ch.qos.logback.classic.turbo.ReconfigureOnChangeFilter;
 import ch.qos.logback.classic.turbo.TurboFilter;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
@@ -317,26 +318,6 @@ public class AggregationTest extends CQLTester
 
         assertTrue(row.getLong("writetime(b)") >= today);
         assertTrue(row.getLong("system.min(writetime(b))") == yesterday);
-    }
-
-    @Test
-    public void testFunctionsWithCompactStorage() throws Throwable
-    {
-        createTable("CREATE TABLE %s (a int , b int, c double, primary key(a, b) ) WITH COMPACT STORAGE");
-
-        execute("INSERT INTO %s (a, b, c) VALUES (1, 1, 11.5)");
-        execute("INSERT INTO %s (a, b, c) VALUES (1, 2, 9.5)");
-        execute("INSERT INTO %s (a, b, c) VALUES (1, 3, 9.0)");
-
-        assertRows(execute("SELECT max(b), min(b), sum(b), avg(b) , max(c), sum(c), avg(c) FROM %s"),
-                   row(3, 1, 6, 2, 11.5, 30.0, 10.0));
-
-        assertRows(execute("SELECT COUNT(*) FROM %s"), row(3L));
-        assertRows(execute("SELECT COUNT(1) FROM %s"), row(3L));
-        assertRows(execute("SELECT COUNT(*) FROM %s WHERE a = 1 AND b > 1"), row(2L));
-        assertRows(execute("SELECT COUNT(1) FROM %s WHERE a = 1 AND b > 1"), row(2L));
-        assertRows(execute("SELECT max(b), min(b), sum(b), avg(b) , max(c), sum(c), avg(c) FROM %s WHERE a = 1 AND b > 1"),
-                   row(3, 2, 5, 2, 9.5, 18.5, 9.25));
     }
 
     @Test
@@ -923,6 +904,51 @@ public class AggregationTest extends CQLTester
     }
 
     @Test
+    public void testJavaAggregateEmpty() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int primary key, b int)");
+
+        String fState = createFunction(KEYSPACE,
+                                       "int, int",
+                                       "CREATE FUNCTION %s(a int, b int) " +
+                                       "CALLED ON NULL INPUT " +
+                                       "RETURNS int " +
+                                       "LANGUAGE java " +
+                                       "AS 'return Integer.valueOf((a!=null?a.intValue():0) + b.intValue());'");
+
+        String a = createAggregate(KEYSPACE,
+                                   "int, int",
+                                   "CREATE AGGREGATE %s(int) " +
+                                   "SFUNC " + shortFunctionName(fState) + " " +
+                                   "STYPE int");
+
+        assertRows(execute("SELECT " + a + "(b) FROM %s"), row(new Object[]{null}));
+    }
+
+    @Test
+    public void testJavaAggregateStateEmpty() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int primary key, b uuid)");
+
+        String fState = createFunction(KEYSPACE,
+                                       "int, int",
+                                       "CREATE FUNCTION %s(state map<uuid, int>, type uuid) " +
+                                       "RETURNS NULL ON NULL INPUT " +
+                                       "RETURNS map<uuid, int> " +
+                                       "LANGUAGE java " +
+                                       "AS 'return state;'");
+
+        String a = createAggregate(KEYSPACE,
+                                   "int, int",
+                                   "CREATE AGGREGATE %s(uuid) " +
+                                   "SFUNC " + shortFunctionName(fState) + " " +
+                                   "STYPE map<uuid, int> " +
+                                   "INITCOND {}");
+
+        assertRows(execute("SELECT " + a + "(b) FROM %s"), row(Collections.emptyMap()));
+    }
+
+    @Test
     public void testJavaAggregateComplex() throws Throwable
     {
         createTable("CREATE TABLE %s (a int primary key, b int)");
@@ -1073,7 +1099,7 @@ public class AggregationTest extends CQLTester
                                        "SFUNC " + shortFunctionName(fState) + " " +
                                        "STYPE int");
 
-            ResultMessage.Prepared prepared = QueryProcessor.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls(), false);
+            ResultMessage.Prepared prepared = QueryProcessor.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls());
             assertNotNull(QueryProcessor.instance.getPrepared(prepared.statementId));
 
             execute("DROP AGGREGATE " + a + "(int)");
@@ -1085,7 +1111,7 @@ public class AggregationTest extends CQLTester
                     "SFUNC " + shortFunctionName(fState) + " " +
                     "STYPE int");
 
-            prepared = QueryProcessor.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls(), false);
+            prepared = QueryProcessor.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls());
             assertNotNull(QueryProcessor.instance.getPrepared(prepared.statementId));
 
             execute("DROP KEYSPACE " + otherKS + ";");
@@ -1282,7 +1308,7 @@ public class AggregationTest extends CQLTester
                                    "SFUNC " + shortFunctionName(fState) + " " +
                                    "STYPE int ");
 
-        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(keyspace());
+        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(keyspace());
         UDAggregate f = (UDAggregate) ksm.functions.get(parseFunctionName(a)).iterator().next();
 
         UDAggregate broken = UDAggregate.createBroken(f.name(),
@@ -1291,7 +1317,7 @@ public class AggregationTest extends CQLTester
                                                       null,
                                                       new InvalidRequestException("foo bar is broken"));
 
-        Schema.instance.setKeyspaceMetadata(ksm.withSwapped(ksm.functions.without(f.name(), f.argTypes()).with(broken)));
+        Schema.instance.load(ksm.withSwapped(ksm.functions.without(f.name(), f.argTypes()).with(broken)));
 
         assertInvalidThrowMessage("foo bar is broken", InvalidRequestException.class,
                                   "SELECT " + a + "(val) FROM %s");

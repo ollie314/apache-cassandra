@@ -66,13 +66,13 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         }
         else
             logger.debug("Enabling tombstone compactions for TWCS");
-
     }
 
     @Override
     @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
     public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
     {
+        List<SSTableReader> previousCandidate = null;
         while (true)
         {
             List<SSTableReader> latestBucket = getNextBackgroundSSTables(gcBefore);
@@ -80,9 +80,20 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
             if (latestBucket.isEmpty())
                 return null;
 
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+            if (latestBucket.equals(previousCandidate))
+            {
+                logger.warn("Could not acquire references for compacting SSTables {} which is not a problem per se," +
+                            "unless it happens frequently, in which case it must be reported. Will retry later.",
+                            latestBucket);
+                return null;
+            }
+
             LifecycleTransaction modifier = cfs.getTracker().tryModify(latestBucket, OperationType.COMPACTION);
             if (modifier != null)
-                return new CompactionTask(cfs, modifier, gcBefore);
+                return new TimeWindowCompactionTask(cfs, modifier, gcBefore, options.ignoreOverlaps);
+            previousCandidate = latestBucket;
         }
     }
 
@@ -104,7 +115,8 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         if (System.currentTimeMillis() - lastExpiredCheck > options.expiredSSTableCheckFrequency)
         {
             logger.debug("TWCS expired check sufficiently far in the past, checking for fully expired SSTables");
-            expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, cfs.getOverlappingLiveSSTables(uncompacting), gcBefore);
+            expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, options.ignoreOverlaps ? Collections.emptySet() : cfs.getOverlappingLiveSSTables(uncompacting),
+                                                                   gcBefore, options.ignoreOverlaps);
             lastExpiredCheck = System.currentTimeMillis();
         }
         else
@@ -175,6 +187,12 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
     public void removeSSTable(SSTableReader sstable)
     {
         sstables.remove(sstable);
+    }
+
+    @Override
+    protected Set<SSTableReader> getSSTables()
+    {
+        return ImmutableSet.copyOf(sstables);
     }
 
     /**
@@ -330,7 +348,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         LifecycleTransaction txn = cfs.getTracker().tryModify(filteredSSTables, OperationType.COMPACTION);
         if (txn == null)
             return null;
-        return Collections.singleton(new CompactionTask(cfs, txn, gcBefore));
+        return Collections.singleton(new TimeWindowCompactionTask(cfs, txn, gcBefore, options.ignoreOverlaps));
     }
 
     @Override
@@ -346,7 +364,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
             return null;
         }
 
-        return new CompactionTask(cfs, modifier, gcBefore).setUserDefined(true);
+        return new TimeWindowCompactionTask(cfs, modifier, gcBefore, options.ignoreOverlaps).setUserDefined(true);
     }
 
     public int getEstimatedRemainingTasks()

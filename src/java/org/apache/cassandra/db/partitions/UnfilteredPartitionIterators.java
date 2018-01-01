@@ -19,10 +19,10 @@ package org.apache.cassandra.db.partitions;
 
 import java.io.IOError;
 import java.io.IOException;
-import java.security.MessageDigest;
 import java.util.*;
 
-import org.apache.cassandra.config.CFMetaData;
+import com.google.common.hash.Hasher;
+
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
@@ -31,7 +31,7 @@ import org.apache.cassandra.db.transform.MorePartitions;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.MergeIterator;
 
 /**
@@ -96,13 +96,6 @@ public abstract class UnfilteredPartitionIterators
         return MorePartitions.extend(iterators.get(0), new Extend());
     }
 
-
-    public static PartitionIterator mergeAndFilter(List<UnfilteredPartitionIterator> iterators, int nowInSec, MergeListener listener)
-    {
-        // TODO: we could have a somewhat faster version if we were to merge the UnfilteredRowIterators directly as RowIterators
-        return filter(merge(iterators, nowInSec, listener), nowInSec);
-    }
-
     public static PartitionIterator filter(final UnfilteredPartitionIterator iterator, final int nowInSec)
     {
         return FilteredPartitions.filter(iterator, nowInSec);
@@ -113,8 +106,7 @@ public abstract class UnfilteredPartitionIterators
         assert listener != null;
         assert !iterators.isEmpty();
 
-        final boolean isForThrift = iterators.get(0).isForThrift();
-        final CFMetaData metadata = iterators.get(0).metadata();
+        final TableMetadata metadata = iterators.get(0).metadata();
 
         final MergeIterator<UnfilteredRowIterator, UnfilteredRowIterator> merged = MergeIterator.get(iterators, partitionComparator, new MergeIterator.Reducer<UnfilteredRowIterator, UnfilteredRowIterator>()
         {
@@ -155,12 +147,7 @@ public abstract class UnfilteredPartitionIterators
 
         return new AbstractUnfilteredPartitionIterator()
         {
-            public boolean isForThrift()
-            {
-                return isForThrift;
-            }
-
-            public CFMetaData metadata()
+            public TableMetadata metadata()
             {
                 return metadata;
             }
@@ -179,6 +166,7 @@ public abstract class UnfilteredPartitionIterators
             public void close()
             {
                 merged.close();
+                listener.close();
             }
         };
     }
@@ -190,8 +178,7 @@ public abstract class UnfilteredPartitionIterators
         if (iterators.size() == 1)
             return iterators.get(0);
 
-        final boolean isForThrift = iterators.get(0).isForThrift();
-        final CFMetaData metadata = iterators.get(0).metadata();
+        final TableMetadata metadata = iterators.get(0).metadata();
 
         final MergeIterator<UnfilteredRowIterator, UnfilteredRowIterator> merged = MergeIterator.get(iterators, partitionComparator, new MergeIterator.Reducer<UnfilteredRowIterator, UnfilteredRowIterator>()
         {
@@ -221,12 +208,7 @@ public abstract class UnfilteredPartitionIterators
 
         return new AbstractUnfilteredPartitionIterator()
         {
-            public boolean isForThrift()
-            {
-                return isForThrift;
-            }
-
-            public CFMetaData metadata()
+            public TableMetadata metadata()
             {
                 return metadata;
             }
@@ -252,13 +234,11 @@ public abstract class UnfilteredPartitionIterators
     /**
      * Digests the the provided iterator.
      *
-     * @param command the command that has yield {@code iterator}. This can be null if {@code version >= MessagingService.VERSION_30}
-     * as this is only used when producing digest to be sent to legacy nodes.
      * @param iterator the iterator to digest.
-     * @param digest the {@code MessageDigest} to use for the digest.
+     * @param hasher the {@link Hasher} to use for the digest.
      * @param version the messaging protocol to use when producing the digest.
      */
-    public static void digest(ReadCommand command, UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
+    public static void digest(UnfilteredPartitionIterator iterator, Hasher hasher, int version)
     {
         try (UnfilteredPartitionIterator iter = iterator)
         {
@@ -266,7 +246,7 @@ public abstract class UnfilteredPartitionIterators
             {
                 try (UnfilteredRowIterator partition = iter.next())
                 {
-                    UnfilteredRowIterators.digest(command, partition, digest, version);
+                    UnfilteredRowIterators.digest(partition, hasher, version);
                 }
             }
         }
@@ -303,9 +283,9 @@ public abstract class UnfilteredPartitionIterators
     {
         public void serialize(UnfilteredPartitionIterator iter, ColumnFilter selection, DataOutputPlus out, int version) throws IOException
         {
-            assert version >= MessagingService.VERSION_30; // We handle backward compatibility directy in ReadResponse.LegacyRangeSliceReplySerializer
-
-            out.writeBoolean(iter.isForThrift());
+            // Previously, a boolean indicating if this was for a thrift query.
+            // Unused since 4.0 but kept on wire for compatibility.
+            out.writeBoolean(false);
             while (iter.hasNext())
             {
                 out.writeBoolean(true);
@@ -317,10 +297,10 @@ public abstract class UnfilteredPartitionIterators
             out.writeBoolean(false);
         }
 
-        public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final CFMetaData metadata, final ColumnFilter selection, final SerializationHelper.Flag flag) throws IOException
+        public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final TableMetadata metadata, final ColumnFilter selection, final SerializationHelper.Flag flag) throws IOException
         {
-            assert version >= MessagingService.VERSION_30; // We handle backward compatibility directy in ReadResponse.LegacyRangeSliceReplySerializer
-            final boolean isForThrift = in.readBoolean();
+            // Skip now unused isForThrift boolean
+            in.readBoolean();
 
             return new AbstractUnfilteredPartitionIterator()
             {
@@ -328,12 +308,7 @@ public abstract class UnfilteredPartitionIterators
                 private boolean hasNext;
                 private boolean nextReturned = true;
 
-                public boolean isForThrift()
-                {
-                    return isForThrift;
-                }
-
-                public CFMetaData metadata()
+                public TableMetadata metadata()
                 {
                     return metadata;
                 }
@@ -343,10 +318,21 @@ public abstract class UnfilteredPartitionIterators
                     if (!nextReturned)
                         return hasNext;
 
-                    // We can't answer this until the previously returned iterator has been fully consumed,
-                    // so complain if that's not the case.
-                    if (next != null && next.hasNext())
-                        throw new IllegalStateException("Cannot call hasNext() until the previous iterator has been fully consumed");
+                    /*
+                     * We must consume the previous iterator before we start deserializing the next partition, so
+                     * that we start from the right position in the byte stream.
+                     *
+                     * It's possible however that it hasn't been fully consumed by upstream consumers - for example,
+                     * if a per partition limit caused merge iterator to stop early (see CASSANDRA-13911).
+                     *
+                     * In that case we must drain the unconsumed iterator fully ourselves, here.
+                     *
+                     * NOTE: transformations of the upstream BaseRows won't be applied for these consumed elements,
+                     * so, for exmaple, they won't be counted.
+                     */
+                    if (null != next)
+                        while (next.hasNext())
+                            next.next();
 
                     try
                     {

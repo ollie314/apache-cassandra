@@ -53,7 +53,7 @@ public interface ReadQuery
 
         public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
         {
-            return EmptyIterators.unfilteredPartition(executionController.metaData(), false);
+            return EmptyIterators.unfilteredPartition(executionController.metadata());
         }
 
         public DataLimits limits()
@@ -75,6 +75,12 @@ public interface ReadQuery
         }
 
         public boolean selectsClustering(DecoratedKey key, Clustering clustering)
+        {
+            return false;
+        }
+
+        @Override
+        public boolean selectsFullPartition()
         {
             return false;
         }
@@ -114,7 +120,7 @@ public interface ReadQuery
      * Execute the query locally. This is similar to {@link ReadQuery#executeInternal(ReadExecutionController)}
      * but it returns an unfiltered partition iterator that can be merged later on.
      *
-     * @param controller the {@code ReadExecutionController} protecting the read.
+     * @param executionController the {@code ReadExecutionController} protecting the read.
      * @return the result of the read query.
      */
     public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController);
@@ -148,4 +154,10 @@ public interface ReadQuery
      * checkRowFilter is true
      */
     public boolean selectsClustering(DecoratedKey key, Clustering clustering);
+
+    /**
+     * Checks if this {@code ReadQuery} selects full partitions, that is it has no filtering on clustering or regular columns.
+     * @return {@code true} if this {@code ReadQuery} selects full partitions, {@code false} otherwise.
+     */
+    public boolean selectsFullPartition();
 }

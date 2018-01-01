@@ -77,23 +77,6 @@ public class SelectSingleColumnRelationTest extends CQLTester
         execute("insert into %s (a, b, c, d) values (?, ?, ?, ?)", "first", 3, 7, 3);
         execute("insert into %s (a, b, c, d) values (?, ?, ?, ?)", "second", 4, 8, 4);
 
-        testSelectQueriesWithClusteringColumnRelations();
-    }
-
-    @Test
-    public void testClusteringColumnRelationsWithCompactStorage() throws Throwable
-    {
-        createTable("CREATE TABLE %s (a text, b int, c int, d int, primary key(a, b, c)) WITH COMPACT STORAGE;");
-        execute("insert into %s (a, b, c, d) values (?, ?, ?, ?)", "first", 1, 5, 1);
-        execute("insert into %s (a, b, c, d) values (?, ?, ?, ?)", "first", 2, 6, 2);
-        execute("insert into %s (a, b, c, d) values (?, ?, ?, ?)", "first", 3, 7, 3);
-        execute("insert into %s (a, b, c, d) values (?, ?, ?, ?)", "second", 4, 8, 4);
-
-        testSelectQueriesWithClusteringColumnRelations();
-    }
-
-    private void testSelectQueriesWithClusteringColumnRelations() throws Throwable
-    {
         assertRows(execute("select * from %s where a in (?, ?)", "first", "second"),
                    row("first", 1, 5, 1),
                    row("first", 2, 6, 2),
@@ -424,36 +407,30 @@ public class SelectSingleColumnRelationTest extends CQLTester
     @Test
     public void testEmptyIN() throws Throwable
     {
-        for (String compactOption : new String[] { "", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (k1 int, k2 int, v int, PRIMARY KEY (k1, k2))" + compactOption);
+        createTable("CREATE TABLE %s (k1 int, k2 int, v int, PRIMARY KEY (k1, k2))");
 
-            for (int i = 0; i <= 2; i++)
-                for (int j = 0; j <= 2; j++)
-                    execute("INSERT INTO %s (k1, k2, v) VALUES (?, ?, ?)", i, j, i + j);
+        for (int i = 0; i <= 2; i++)
+            for (int j = 0; j <= 2; j++)
+                execute("INSERT INTO %s (k1, k2, v) VALUES (?, ?, ?)", i, j, i + j);
 
-            assertEmpty(execute("SELECT v FROM %s WHERE k1 IN ()"));
-            assertEmpty(execute("SELECT v FROM %s WHERE k1 = 0 AND k2 IN ()"));
-        }
+        assertEmpty(execute("SELECT v FROM %s WHERE k1 IN ()"));
+        assertEmpty(execute("SELECT v FROM %s WHERE k1 = 0 AND k2 IN ()"));
     }
 
     @Test
     public void testINWithDuplicateValue() throws Throwable
     {
-        for (String compactOption : new String[] { "", " WITH COMPACT STORAGE" })
-        {
-            createTable("CREATE TABLE %s (k1 int, k2 int, v int, PRIMARY KEY (k1, k2))" + compactOption);
-            execute("INSERT INTO %s (k1,  k2, v) VALUES (?, ?, ?)", 1, 1, 1);
+        createTable("CREATE TABLE %s (k1 int, k2 int, v int, PRIMARY KEY (k1, k2))");
+        execute("INSERT INTO %s (k1,  k2, v) VALUES (?, ?, ?)", 1, 1, 1);
 
-            assertRows(execute("SELECT * FROM %s WHERE k1 IN (?, ?)", 1, 1),
-                       row(1, 1, 1));
+        assertRows(execute("SELECT * FROM %s WHERE k1 IN (?, ?)", 1, 1),
+                   row(1, 1, 1));
 
-            assertRows(execute("SELECT * FROM %s WHERE k1 IN (?, ?) AND k2 IN (?, ?)", 1, 1, 1, 1),
-                       row(1, 1, 1));
+        assertRows(execute("SELECT * FROM %s WHERE k1 IN (?, ?) AND k2 IN (?, ?)", 1, 1, 1, 1),
+                   row(1, 1, 1));
 
-            assertRows(execute("SELECT * FROM %s WHERE k1 = ? AND k2 IN (?, ?)", 1, 1, 1),
-                       row(1, 1, 1));
-        }
+        assertRows(execute("SELECT * FROM %s WHERE k1 = ? AND k2 IN (?, ?)", 1, 1, 1),
+                   row(1, 1, 1));
     }
 
     @Test
@@ -637,5 +614,29 @@ public class SelectSingleColumnRelationTest extends CQLTester
         assertInvalidMessage("Undefined column name d", "SELECT c AS d FROM %s WHERE d CONTAINS 0");
         assertInvalidMessage("Undefined column name d", "SELECT c AS d FROM %s WHERE d CONTAINS KEY 0");
         assertInvalidMessage("Undefined column name d", "SELECT d FROM %s WHERE a = 0");
+    }
+
+    @Test
+    public void testInvalidNonFrozenUDTRelation() throws Throwable
+    {
+        String type = createType("CREATE TYPE %s (a int)");
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b " + type + ")");
+        Object udt = userType("a", 1);
+
+        // All operators
+        String msg = "Non-frozen UDT column 'b' (" + type + ") cannot be restricted by any relation";
+        assertInvalidMessage(msg, "SELECT * FROM %s WHERE b = ?", udt);
+        assertInvalidMessage(msg, "SELECT * FROM %s WHERE b > ?", udt);
+        assertInvalidMessage(msg, "SELECT * FROM %s WHERE b < ?", udt);
+        assertInvalidMessage(msg, "SELECT * FROM %s WHERE b >= ?", udt);
+        assertInvalidMessage(msg, "SELECT * FROM %s WHERE b <= ?", udt);
+        assertInvalidMessage(msg, "SELECT * FROM %s WHERE b IN (?)", udt);
+        assertInvalidMessage(msg, "SELECT * FROM %s WHERE b LIKE ?", udt);
+        assertInvalidMessage("Unsupported \"!=\" relation: b != {a: 0}",
+                             "SELECT * FROM %s WHERE b != {a: 0}", udt);
+        assertInvalidMessage("Unsupported restriction: b IS NOT NULL",
+                             "SELECT * FROM %s WHERE b IS NOT NULL", udt);
+        assertInvalidMessage("Cannot use CONTAINS on non-collection column b",
+                             "SELECT * FROM %s WHERE b CONTAINS ?", udt);
     }
 }

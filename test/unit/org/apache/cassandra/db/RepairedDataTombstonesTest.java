@@ -182,9 +182,11 @@ public class RepairedDataTombstonesTest extends CQLTester
             while (iterator.hasNext())
             {
                 partitionsFound++;
-                UnfilteredRowIterator rowIter = iterator.next();
-                int val = ByteBufferUtil.toInt(rowIter.partitionKey().getKey());
-                assertTrue("val=" + val, val >= 10 && val < 20);
+                try (UnfilteredRowIterator rowIter = iterator.next())
+                {
+                    int val = ByteBufferUtil.toInt(rowIter.partitionKey().getKey());
+                    assertTrue("val=" + val, val >= 10 && val < 20);
+                }
             }
         }
         assertEquals(10, partitionsFound);
@@ -306,7 +308,7 @@ public class RepairedDataTombstonesTest extends CQLTester
 
     public static void repair(ColumnFamilyStore cfs, SSTableReader sstable) throws IOException
     {
-        sstable.descriptor.getMetadataSerializer().mutateRepairedAt(sstable.descriptor, 1);
+        sstable.descriptor.getMetadataSerializer().mutateRepaired(sstable.descriptor, 1, null);
         sstable.reloadSSTableMetadata();
         cfs.getTracker().notifySSTableRepairedStatusChanged(Collections.singleton(sstable));
     }

@@ -22,8 +22,8 @@ import java.util.regex.Pattern;
 
 import org.apache.commons.lang3.StringUtils;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.statements.IndexTarget;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -36,17 +36,17 @@ public class TargetParser
     private static final Pattern TWO_QUOTES = Pattern.compile("\"\"");
     private static final String QUOTE = "\"";
 
-    public static Pair<ColumnDefinition, IndexTarget.Type> parse(CFMetaData cfm, IndexMetadata indexDef)
+    public static Pair<ColumnMetadata, IndexTarget.Type> parse(TableMetadata metadata, IndexMetadata indexDef)
     {
         String target = indexDef.options.get("target");
         assert target != null : String.format("No target definition found for index %s", indexDef.name);
-        Pair<ColumnDefinition, IndexTarget.Type> result = parse(cfm, target);
+        Pair<ColumnMetadata, IndexTarget.Type> result = parse(metadata, target);
         if (result == null)
             throw new ConfigurationException(String.format("Unable to parse targets for index %s (%s)", indexDef.name, target));
         return result;
     }
 
-    public static Pair<ColumnDefinition, IndexTarget.Type> parse(CFMetaData cfm, String target)
+    public static Pair<ColumnMetadata, IndexTarget.Type> parse(TableMetadata metadata, String target)
     {
         // if the regex matches then the target is in the form "keys(foo)", "entries(bar)" etc
         // if not, then it must be a simple column name and implictly its type is VALUES
@@ -77,13 +77,16 @@ public class TargetParser
         }
 
         // if it's not a CQL table, we can't assume that the column name is utf8, so
-        // in that case we have to do a linear scan of the cfm's columns to get the matching one
-        if (cfm.isCQLTable())
-            return Pair.create(cfm.getColumnDefinition(new ColumnIdentifier(columnName, true)), targetType);
-        else
-            for (ColumnDefinition column : cfm.allColumns())
-                if (column.name.toString().equals(columnName))
-                    return Pair.create(column, targetType);
+        // in that case we have to do a linear scan of the cfm's columns to get the matching one.
+        // After dropping compact storage (see CASSANDRA-10857), we can't distinguish between the
+        // former compact/thrift table, so we have to fall back to linear scan in both cases.
+        ColumnMetadata cd = metadata.getColumn(new ColumnIdentifier(columnName, true));
+        if (cd != null)
+            return Pair.create(cd, targetType);
+
+        for (ColumnMetadata column : metadata.columns())
+            if (column.name.toString().equals(columnName))
+                return Pair.create(column, targetType);
 
         return null;
     }

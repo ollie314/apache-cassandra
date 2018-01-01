@@ -110,3 +110,14 @@ Perl
 ^^^^
 
 - `Cassandra::Client and DBD::Cassandra <https://github.com/tvdw/perl-dbd-cassandra>`__
+
+Elixir
+^^^^^^
+
+- `Xandra <https://github.com/lexhide/xandra>`__
+- `CQEx <https://github.com/matehat/cqex>`__
+
+Dart
+^^^^
+
+- `dart_cassandra_cql <https://github.com/achilleasa/dart_cassandra_cql>`__

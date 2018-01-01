@@ -19,7 +19,7 @@ package org.apache.cassandra.cql3.restrictions;
 
 import java.util.Set;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 
 /**
  * Sets of restrictions
@@ -32,7 +32,7 @@ public interface Restrictions extends Restriction
      * @param columnDef the column definition
      * @return the restrictions applied to the specified column
      */
-    Set<Restriction> getRestrictions(ColumnDefinition columnDef);
+    Set<Restriction> getRestrictions(ColumnMetadata columnDef);
 
     /**
      * Checks if this <code>Restrictions</code> is empty or not.
@@ -54,6 +54,11 @@ public interface Restrictions extends Restriction
      */
     public boolean hasIN();
 
+    /**
+     * Checks if any of the underlying restrictions is a CONTAINS / CONTAINS KEY restriction.
+     * @return <code>true</code> if any of the underlying restrictions is CONTAINS, <code>false</code> otherwise
+     */
+    public boolean hasContains();
     /**
      * Checks if any of the underlying restrictions is a slice.
      * @return <code>true</code> if any of the underlying restrictions is a slice, <code>false</code> otherwise

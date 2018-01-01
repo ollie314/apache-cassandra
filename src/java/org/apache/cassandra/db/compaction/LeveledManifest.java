@@ -23,6 +23,7 @@ import java.util.*;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
@@ -169,8 +170,28 @@ public class LeveledManifest
             {
                 logger.error("Could not change sstable level - adding it at level 0 anyway, we will find it at restart.", e);
             }
-            generations[0].add(reader);
+            if (!contains(reader))
+            {
+                generations[0].add(reader);
+            }
+            else
+            {
+                // An SSTable being added multiple times to this manifest indicates a programming error, but we don't
+                // throw an AssertionError because this shouldn't break the compaction strategy. Instead we log it
+                // together with a RuntimeException so the stack is print for troubleshooting if this ever happens.
+                logger.warn("SSTable {} is already present on leveled manifest and should not be re-added.", reader, new RuntimeException());
+            }
         }
+    }
+
+    private boolean contains(SSTableReader reader)
+    {
+        for (int i = 0; i < generations.length; i++)
+        {
+            if (generations[i].contains(reader))
+                return true;
+        }
+        return false;
     }
 
     public synchronized void replace(Collection<SSTableReader> removed, Collection<SSTableReader> added)
@@ -344,6 +365,11 @@ public class LeveledManifest
         // This isn't a magic wand -- if you are consistently writing too fast for LCS to keep
         // up, you're still screwed.  But if instead you have intermittent bursts of activity,
         // it can help a lot.
+
+        // Let's check that L0 is far enough behind to warrant STCS.
+        // If it is, it will be used before proceeding any of higher level
+        CompactionCandidate l0Compaction = getSTCSInL0CompactionCandidate();
+
         for (int i = generations.length - 1; i > 0; i--)
         {
             List<SSTableReader> sstables = getLevel(i);
@@ -358,7 +384,6 @@ public class LeveledManifest
             if (score > 1.001)
             {
                 // before proceeding with a higher level, let's see if L0 is far enough behind to warrant STCS
-                CompactionCandidate l0Compaction = getSTCSInL0CompactionCandidate();
                 if (l0Compaction != null)
                     return l0Compaction;
 
@@ -388,7 +413,7 @@ public class LeveledManifest
             // Since we don't have any other compactions to do, see if there is a STCS compaction to perform in L0; if
             // there is a long running compaction, we want to make sure that we continue to keep the number of SSTables
             // small in L0.
-            return getSTCSInL0CompactionCandidate();
+            return l0Compaction;
         }
         return new CompactionCandidate(candidates, getNextLevel(candidates), maxSSTableSizeInBytes);
     }
@@ -416,7 +441,8 @@ public class LeveledManifest
                                                                                     options.bucketHigh,
                                                                                     options.bucketLow,
                                                                                     options.minSSTableSize);
-        return SizeTieredCompactionStrategy.mostInterestingBucket(buckets, 4, 32);
+        return SizeTieredCompactionStrategy.mostInterestingBucket(buckets,
+                cfs.getMinimumCompactionThreshold(), cfs.getMaximumCompactionThreshold());
     }
 
     /**
@@ -524,6 +550,16 @@ public class LeveledManifest
         assert level >= 0 : reader + " not present in manifest: "+level;
         generations[level].remove(reader);
         return level;
+    }
+
+    public synchronized Set<SSTableReader> getSSTables()
+    {
+        ImmutableSet.Builder<SSTableReader> builder = ImmutableSet.builder();
+        for (List<SSTableReader> sstables : generations)
+        {
+            builder.addAll(sstables);
+        }
+        return builder.build();
     }
 
     private static Set<SSTableReader> overlapping(Collection<SSTableReader> candidates, Iterable<SSTableReader> others)
@@ -780,6 +816,13 @@ public class LeveledManifest
             // If there is 1 byte over TBL - (MBL * 1.001), there is still a task left, so we need to round up.
             estimated[i] = (long)Math.ceil((double)Math.max(0L, SSTableReader.getTotalBytes(sstables) - (long)(maxBytesForLevel(i, maxSSTableSizeInBytes) * 1.001)) / (double)maxSSTableSizeInBytes);
             tasks += estimated[i];
+        }
+
+        if (!DatabaseDescriptor.getDisableSTCSInL0() && getLevel(0).size() > MAX_COMPACTING_L0)
+        {
+            int l0compactions = getLevel(0).size() / MAX_COMPACTING_L0;
+            tasks += l0compactions;
+            estimated[0] += l0compactions;
         }
 
         logger.trace("Estimating {} compactions to do for {}.{}",

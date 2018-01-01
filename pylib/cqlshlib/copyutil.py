@@ -84,6 +84,11 @@ def printmsg(msg, eol='\n', encoding='utf8'):
     sys.stdout.flush()
 
 
+# Keep arguments in sync with printmsg
+def swallowmsg(msg, eol='', encoding=''):
+    None
+
+
 class OneWayPipe(object):
     """
     A one way pipe protected by two process level locks, one for reading and one for writing.
@@ -242,7 +247,7 @@ class CopyTask(object):
 
         # do not display messages when exporting to STDOUT unless --debug is set
         self.printmsg = printmsg if self.fname is not None or direction == 'from' or DEBUG \
-            else lambda _, eol='\n': None
+            else swallowmsg
         self.options = self.parse_options(opts, direction)
 
         self.num_processes = self.options.copy['numprocesses']
@@ -1084,11 +1089,11 @@ class ImportErrorHandler(object):
             shell.printerr("Failed to import %d rows: %s - %s,  given up without retries"
                            % (len(err.rows), err.name, err.msg))
         else:
-            self.insert_errors += len(err.rows)
             if not err.final:
                 shell.printerr("Failed to import %d rows: %s - %s,  will retry later, attempt %d of %d"
                                % (len(err.rows), err.name, err.msg, err.attempts, self.max_attempts))
             else:
+                self.insert_errors += len(err.rows)
                 self.add_failed_rows(err.rows)
                 shell.printerr("Failed to import %d rows: %s - %s,  given up after %d attempts"
                                % (len(err.rows), err.name, err.msg, err.attempts))
@@ -1817,9 +1822,10 @@ class ImportConversion(object):
         # these functions are used for non-prepared statements to protect values with quotes if required
         self.protectors = [self._get_protector(t) for t in self.coltypes]
 
-    def _get_protector(self, t):
+    @staticmethod
+    def _get_protector(t):
         if t in ('ascii', 'text', 'timestamp', 'date', 'time', 'inet'):
-            return lambda v: unicode(protect_value(v), self.encoding)
+            return lambda v: protect_value(v)
         else:
             return lambda v: v
 
@@ -1897,11 +1903,30 @@ class ImportConversion(object):
 
         def split(val, sep=','):
             """
-            Split into a list of values whenever we encounter a separator but
+            Split "val" into a list of values whenever the separator "sep" is found, but
             ignore separators inside parentheses or single quotes, except for the two
-            outermost parentheses, which will be ignored. We expect val to be at least
-            2 characters long (the two outer parentheses).
+            outermost parentheses, which will be ignored. This method is called when parsing composite
+            types, "val" should be at least 2 characters long, the first char should be an
+            open parenthesis and the last char should be a matching closing parenthesis. We could also
+            check exactly which parenthesis type depending on the caller, but I don't want to enforce
+            too many checks that don't necessarily provide any additional benefits, and risk breaking
+            data that could previously be imported, even if strictly speaking it is incorrect CQL.
+            For example, right now we accept sets that start with '[' and ']', I don't want to break this
+            by enforcing '{' and '}' in a minor release.
             """
+            def is_open_paren(cc):
+                return cc == '{' or cc == '[' or cc == '('
+
+            def is_close_paren(cc):
+                return cc == '}' or cc == ']' or cc == ')'
+
+            def paren_match(c1, c2):
+                return (c1 == '{' and c2 == '}') or (c1 == '[' and c2 == ']') or (c1 == '(' and c2 == ')')
+
+            if len(val) < 2 or not paren_match(val[0], val[-1]):
+                raise ParseError('Invalid composite string, it should start and end with matching parentheses: {}'
+                                 .format(val))
+
             ret = []
             last = 1
             level = 0
@@ -1910,9 +1935,9 @@ class ImportConversion(object):
                 if c == '\'':
                     quote = not quote
                 elif not quote:
-                    if c == '{' or c == '[' or c == '(':
+                    if is_open_paren(c):
                         level += 1
-                    elif c == '}' or c == ']' or c == ')':
+                    elif is_close_paren(c):
                         level -= 1
                     elif c == sep and level == 1:
                         ret.append(val[last:i])
@@ -1973,7 +1998,7 @@ class ImportConversion(object):
             return tuple(convert_mandatory(t, v) for t, v in zip(ct.subtypes, split(val)))
 
         def convert_list(val, ct=cql_type):
-            return list(convert_mandatory(ct.subtypes[0], v) for v in split(val))
+            return tuple(convert_mandatory(ct.subtypes[0], v) for v in split(val))
 
         def convert_set(val, ct=cql_type):
             return frozenset(convert_mandatory(ct.subtypes[0], v) for v in split(val))
@@ -1997,10 +2022,15 @@ class ImportConversion(object):
             an attribute, so we are using named tuples. It must also be hashable,
             so we cannot use dictionaries. Maybe there is a way to instantiate ct
             directly but I could not work it out.
+            Also note that it is possible that the subfield names in the csv are in the
+            wrong order, so we must sort them according to ct.fieldnames, see CASSANDRA-12959.
             """
             vals = [v for v in [split('{%s}' % vv, sep=':') for vv in split(val)]]
-            ret_type = namedtuple(ct.typename, [unprotect(v[0]) for v in vals])
-            return ret_type(*tuple(convert(t, v[1]) for t, v in zip(ct.subtypes, vals)))
+            dict_vals = dict((unprotect(v[0]), v[1]) for v in vals)
+            sorted_converted_vals = [(n, convert(t, dict_vals[n]) if n in dict_vals else self.get_null_val())
+                                     for n, t in zip(ct.fieldnames, ct.subtypes)]
+            ret_type = namedtuple(ct.typename, [v[0] for v in sorted_converted_vals])
+            return ret_type(*tuple(v[1] for v in sorted_converted_vals))
 
         def convert_single_subtype(val, ct=cql_type):
             return converters.get(ct.subtypes[0].typename, convert_unknown)(val, ct=ct.subtypes[0])
@@ -2073,6 +2103,13 @@ class ImportConversion(object):
             try:
                 return c(v) if v != self.nullval else self.get_null_val()
             except Exception, e:
+                # if we could not convert an empty string, then self.nullval has been set to a marker
+                # because the user needs to import empty strings, except that the converters for some types
+                # will fail to convert an empty string, in this case the null value should be inserted
+                # see CASSANDRA-12794
+                if v == '':
+                    return self.get_null_val()
+
                 if self.debug:
                     traceback.print_exc()
                 raise ParseError("Failed to parse %s : %s" % (val, e.message))
@@ -2232,7 +2269,7 @@ class ImportProcess(ChildProcess):
         ChildProcess.__init__(self, params=params, target=self.run)
 
         self.skip_columns = params['skip_columns']
-        self.valid_columns = params['valid_columns']
+        self.valid_columns = [c.encode(self.encoding) for c in params['valid_columns']]
         self.skip_column_indexes = [i for i, c in enumerate(self.columns) if c in self.skip_columns]
 
         options = params['options']

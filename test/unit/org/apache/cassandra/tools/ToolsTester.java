@@ -51,9 +51,6 @@ public abstract class ToolsTester
     private static List<ThreadInfo> initialThreads;
 
     static final String[] EXPECTED_THREADS_WITH_SCHEMA = {
-    "NativePoolCleaner",
-    "COMMIT-LOG-ALLOCATOR",
-    "COMMIT-LOG-WRITER",
     "PerDiskMemtableFlushWriter_0:[1-9]",
     "MemtablePostFlush:[1-9]",
     "MemtableFlushWriter:[1-9]",
@@ -117,12 +114,12 @@ public abstract class ToolsTester
 
     public void assertSchemaNotLoaded()
     {
-        assertClassNotLoaded("org.apache.cassandra.config.Schema");
+        assertClassNotLoaded("org.apache.cassandra.schema.Schema");
     }
 
     public void assertSchemaLoaded()
     {
-        assertClassLoaded("org.apache.cassandra.config.Schema");
+        assertClassLoaded("org.apache.cassandra.schema.Schema");
     }
 
     public void assertKeyspaceNotLoaded()

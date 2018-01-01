@@ -21,7 +21,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.stream.Collectors;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.*;
@@ -96,7 +96,6 @@ public abstract class UserTypes
      * the user type entries.
      *
      * @param items items associated to the user type entries
-     * @param mapper the mapper used to user type the items to the {@code String} representation of the map entries
      * @return a {@code String} representation of the user type
      */
     public static <T> String userTypeToString(Map<FieldIdentifier, T> items)
@@ -168,7 +167,24 @@ public abstract class UserTypes
 
         private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            validateUserTypeAssignableTo(receiver, entries);
+            if (!receiver.type.isUDT())
+                throw new InvalidRequestException(String.format("Invalid user type literal for %s of type %s", receiver.name, receiver.type.asCQL3Type()));
+
+            UserType ut = (UserType)receiver.type;
+            for (int i = 0; i < ut.size(); i++)
+            {
+                FieldIdentifier field = ut.fieldName(i);
+                Term.Raw value = entries.get(field);
+                if (value == null)
+                    continue;
+
+                ColumnSpecification fieldSpec = fieldSpecOf(receiver, i);
+                if (!value.testAssignment(keyspace, fieldSpec).isAssignable())
+                {
+                    throw new InvalidRequestException(String.format("Invalid user type literal for %s: field %s is not of type %s",
+                            receiver.name, field, fieldSpec.type.asCQL3Type()));
+                }
+            }
         }
 
         public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
@@ -200,13 +216,7 @@ public abstract class UserTypes
 
         public static Value fromSerialized(ByteBuffer bytes, UserType type)
         {
-            ByteBuffer[] values = type.split(bytes);
-            if (values.length > type.size())
-            {
-                throw new InvalidRequestException(String.format(
-                        "UDT value contained too many fields (expected %s, got %s)", type.size(), values.length));
-            }
-
+            type.validate(bytes);
             return new Value(type, type.split(bytes));
         }
 
@@ -316,7 +326,7 @@ public abstract class UserTypes
 
     public static class Setter extends Operation
     {
-        public Setter(ColumnDefinition column, Term t)
+        public Setter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
@@ -362,7 +372,7 @@ public abstract class UserTypes
     {
         private final FieldIdentifier field;
 
-        public SetterByField(ColumnDefinition column, FieldIdentifier field, Term t)
+        public SetterByField(ColumnMetadata column, FieldIdentifier field, Term t)
         {
             super(column, t);
             this.field = field;
@@ -389,7 +399,7 @@ public abstract class UserTypes
     {
         private final FieldIdentifier field;
 
-        public DeleterByField(ColumnDefinition column, FieldIdentifier field)
+        public DeleterByField(ColumnMetadata column, FieldIdentifier field)
         {
             super(column, null);
             this.field = field;

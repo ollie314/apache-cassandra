@@ -41,7 +41,6 @@ import org.apache.cassandra.exceptions.UnavailableException;
 import org.apache.cassandra.metrics.ReadRepairMetrics;
 import org.apache.cassandra.net.IAsyncCallbackWithFailure;
 import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.tracing.TraceState;
@@ -54,7 +53,7 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
     protected static final Logger logger = LoggerFactory.getLogger( ReadCallback.class );
 
     public final ResponseResolver resolver;
-    private final SimpleCondition condition = new SimpleCondition();
+    final SimpleCondition condition = new SimpleCondition();
     private final long queryStartNanoTime;
     final int blockfor;
     final List<InetAddress> endpoints;
@@ -77,9 +76,9 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
     {
         this(resolver,
              consistencyLevel,
-             consistencyLevel.blockFor(Keyspace.open(command.metadata().ksName)),
+             consistencyLevel.blockFor(Keyspace.open(command.metadata().keyspace)),
              command,
-             Keyspace.open(command.metadata().ksName),
+             Keyspace.open(command.metadata().keyspace),
              filteredEndpoints,
              queryStartNanoTime);
     }
@@ -227,10 +226,10 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
         {
             // If the resolver is a DigestResolver, we need to do a full data read if there is a mismatch.
             // Otherwise, resolve will send the repairs directly if needs be (and in that case we should never
-            // get a digest mismatch)
+            // get a digest mismatch).
             try
             {
-                resolver.resolve();
+                resolver.compareResponses();
             }
             catch (DigestMismatchException e)
             {
@@ -247,10 +246,7 @@ public class ReadCallback implements IAsyncCallbackWithFailure<ReadResponse>
                 AsyncRepairCallback repairHandler = new AsyncRepairCallback(repairResolver, endpoints.size());
 
                 for (InetAddress endpoint : endpoints)
-                {
-                    MessageOut<ReadCommand> message = command.createMessage(MessagingService.instance().getVersion(endpoint));
-                    MessagingService.instance().sendRR(message, endpoint, repairHandler);
-                }
+                    MessagingService.instance().sendRR(command.createMessage(), endpoint, repairHandler);
             }
         }
     }

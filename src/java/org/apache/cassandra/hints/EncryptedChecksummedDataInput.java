@@ -23,15 +23,15 @@ import javax.crypto.Cipher;
 
 import com.google.common.annotations.VisibleForTesting;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.security.EncryptionUtils;
-import org.apache.cassandra.hints.CompressedChecksummedDataInput.Position;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.util.ChannelProxy;
 
 public class EncryptedChecksummedDataInput extends ChecksummedDataInput
 {
-    private static final ThreadLocal<ByteBuffer> reusableBuffers = new ThreadLocal<ByteBuffer>()
+    private static final FastThreadLocal<ByteBuffer> reusableBuffers = new FastThreadLocal<ByteBuffer>()
     {
         protected ByteBuffer initialValue()
         {

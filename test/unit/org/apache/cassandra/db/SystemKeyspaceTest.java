@@ -17,25 +17,20 @@
  */
 package org.apache.cassandra.db;
 
-import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
 
-import org.apache.commons.io.FileUtils;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.CassandraVersion;
@@ -45,8 +40,6 @@ import static org.junit.Assert.assertTrue;
 
 public class SystemKeyspaceTest
 {
-    public static final String MIGRATION_SSTABLES_ROOT = "migration-sstable-root";
-
     @BeforeClass
     public static void prepSnapshotTracker()
     {
@@ -155,81 +148,6 @@ public class SystemKeyspaceTest
         Keyspace.clearSnapshot(null, SchemaConstants.SYSTEM_KEYSPACE_NAME);
     }
 
-    @Test
-    public void testMigrateEmptyDataDirs() throws IOException
-    {
-        File dataDir = Paths.get(DatabaseDescriptor.getAllDataFileLocations()[0]).toFile();
-        if (new File(dataDir, "Emptykeyspace1").exists())
-            FileUtils.deleteDirectory(new File(dataDir, "Emptykeyspace1"));
-        assertTrue(new File(dataDir, "Emptykeyspace1").mkdirs());
-        assertEquals(0, numLegacyFiles());
-        SystemKeyspace.migrateDataDirs();
-        assertEquals(0, numLegacyFiles());
-
-        assertTrue(new File(dataDir, "Emptykeyspace1/table1").mkdirs());
-        assertEquals(0, numLegacyFiles());
-        SystemKeyspace.migrateDataDirs();
-        assertEquals(0, numLegacyFiles());
-
-        assertTrue(new File(dataDir, "Emptykeyspace1/wrong_file").createNewFile());
-        assertEquals(0, numLegacyFiles());
-        SystemKeyspace.migrateDataDirs();
-        assertEquals(0, numLegacyFiles());
-
-    }
-
-    @Test
-    public void testMigrateDataDirs_2_1() throws IOException
-    {
-        testMigrateDataDirs("2.1", 5); // see test data for num legacy files
-    }
-
-    @Test
-    public void testMigrateDataDirs_2_2() throws IOException
-    {
-        testMigrateDataDirs("2.2", 7); // see test data for num legacy files
-    }
-
-    private void testMigrateDataDirs(String version, int numLegacyFiles) throws IOException
-    {
-        Path migrationSSTableRoot = Paths.get(System.getProperty(MIGRATION_SSTABLES_ROOT), version);
-        Path dataDir = Paths.get(DatabaseDescriptor.getAllDataFileLocations()[0]);
-
-        FileUtils.copyDirectory(migrationSSTableRoot.toFile(), dataDir.toFile());
-
-        assertEquals(numLegacyFiles, numLegacyFiles());
-
-        SystemKeyspace.migrateDataDirs();
-
-        assertEquals(0, numLegacyFiles());
-    }
-
-    private static int numLegacyFiles()
-    {
-        int ret = 0;
-        Iterable<String> dirs = Arrays.asList(DatabaseDescriptor.getAllDataFileLocations());
-        for (String dataDir : dirs)
-        {
-            File dir = new File(dataDir);
-            for (File ksdir : dir.listFiles((d, n) -> new File(d, n).isDirectory()))
-            {
-                for (File cfdir : ksdir.listFiles((d, n) -> new File(d, n).isDirectory()))
-                {
-                    if (Descriptor.isLegacyFile(cfdir))
-                    {
-                        ret++;
-                    }
-                    else
-                    {
-                        File[] legacyFiles = cfdir.listFiles((d, n) -> Descriptor.isLegacyFile(new File(d, n)));
-                        ret += legacyFiles.length;
-                    }
-                }
-            }
-        }
-        return ret;
-    }
-
     private String getOlderVersionString()
     {
         String version = FBUtilities.getReleaseVersionString();
@@ -244,7 +162,7 @@ public class SystemKeyspaceTest
         for (ColumnFamilyStore cfs : Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStores())
         {
             if (!cfs.getSnapshotDetails().isEmpty())
-                snapshottedTableNames.add(cfs.getColumnFamilyName());
+                snapshottedTableNames.add(cfs.getTableName());
         }
         return snapshottedTableNames;
     }

@@ -18,20 +18,20 @@
 package org.apache.cassandra.cql3.statements;
 
 import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.config.ViewDefinition;
 import org.apache.cassandra.cql3.CFName;
 import org.apache.cassandra.db.view.View;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.schema.MigrationManager;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.schema.TableParams;
+import org.apache.cassandra.schema.ViewMetadata;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.Event;
-
-import static org.apache.cassandra.thrift.ThriftValidation.validateColumnFamily;
 
 public class AlterViewStatement extends SchemaAlteringStatement
 {
@@ -45,9 +45,9 @@ public class AlterViewStatement extends SchemaAlteringStatement
 
     public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException
     {
-        CFMetaData baseTable = View.findBaseTable(keyspace(), columnFamily());
+        TableMetadataRef baseTable = View.findBaseTable(keyspace(), columnFamily());
         if (baseTable != null)
-            state.hasColumnFamilyAccess(keyspace(), baseTable.cfName, Permission.ALTER);
+            state.hasColumnFamilyAccess(keyspace(), baseTable.name, Permission.ALTER);
     }
 
     public void validate(ClientState state)
@@ -55,29 +55,37 @@ public class AlterViewStatement extends SchemaAlteringStatement
         // validated in announceMigration()
     }
 
-    public Event.SchemaChange announceMigration(boolean isLocalOnly) throws RequestValidationException
+    public Event.SchemaChange announceMigration(QueryState queryState, boolean isLocalOnly) throws RequestValidationException
     {
-        CFMetaData meta = validateColumnFamily(keyspace(), columnFamily());
+        TableMetadata meta = Schema.instance.validateTable(keyspace(), columnFamily());
         if (!meta.isView())
             throw new InvalidRequestException("Cannot use ALTER MATERIALIZED VIEW on Table");
 
-        ViewDefinition viewCopy = Schema.instance.getView(keyspace(), columnFamily()).copy();
+        ViewMetadata current = Schema.instance.getView(keyspace(), columnFamily());
 
         if (attrs == null)
             throw new InvalidRequestException("ALTER MATERIALIZED VIEW WITH invoked, but no parameters found");
 
         attrs.validate();
 
-        TableParams params = attrs.asAlteredTableParams(viewCopy.metadata.params);
+        TableParams params = attrs.asAlteredTableParams(current.metadata.params);
         if (params.gcGraceSeconds == 0)
         {
             throw new InvalidRequestException("Cannot alter gc_grace_seconds of a materialized view to 0, since this " +
                                               "value is used to TTL undelivered updates. Setting gc_grace_seconds too " +
                                               "low might cause undelivered updates to expire before being replayed.");
         }
-        viewCopy.metadata.params(params);
 
-        MigrationManager.announceViewUpdate(viewCopy, isLocalOnly);
+        if (params.defaultTimeToLive > 0)
+        {
+            throw new InvalidRequestException("Cannot set or alter default_time_to_live for a materialized view. " +
+                                              "Data in a materialized view always expire at the same time than " +
+                                              "the corresponding data in the parent table.");
+        }
+
+        ViewMetadata updated = current.copy(current.metadata.unbuild().params(params).build());
+
+        MigrationManager.announceViewUpdate(updated, isLocalOnly);
         return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
     }
 

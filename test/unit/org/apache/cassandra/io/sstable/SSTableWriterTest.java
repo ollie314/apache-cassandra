@@ -30,6 +30,7 @@ import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -52,7 +53,7 @@ public class SSTableWriterTest extends SSTableWriterTestBase
         {
             for (int i = 0; i < 10000; i++)
             {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
+                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata(), random(i, 10)).withTimestamp(1);
                 for (int j = 0; j < 100; j++)
                     builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
                 writer.append(builder.build().unfilteredIterator());
@@ -63,7 +64,7 @@ public class SSTableWriterTest extends SSTableWriterTestBase
             assertFileCounts(dir.list());
             for (int i = 10000; i < 20000; i++)
             {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
+                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata(), random(i, 10)).withTimestamp(1);
                 for (int j = 0; j < 100; j++)
                     builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
                 writer.append(builder.build().unfilteredIterator());
@@ -107,7 +108,7 @@ public class SSTableWriterTest extends SSTableWriterTestBase
         {
             for (int i = 0; i < 10000; i++)
             {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
+                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata(), random(i, 10)).withTimestamp(1);
                 for (int j = 0; j < 100; j++)
                     builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
                 writer.append(builder.build().unfilteredIterator());
@@ -116,7 +117,7 @@ public class SSTableWriterTest extends SSTableWriterTestBase
             assertFileCounts(dir.list());
             for (int i = 10000; i < 20000; i++)
             {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
+                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata(), random(i, 10)).withTimestamp(1);
                 for (int j = 0; j < 100; j++)
                     builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
                 writer.append(builder.build().unfilteredIterator());
@@ -158,7 +159,7 @@ public class SSTableWriterTest extends SSTableWriterTestBase
         {
             for (int i = 0; i < 10000; i++)
             {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
+                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata(), random(i, 10)).withTimestamp(1);
                 for (int j = 0; j < 100; j++)
                     builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
                 writer1.append(builder.build().unfilteredIterator());
@@ -167,7 +168,7 @@ public class SSTableWriterTest extends SSTableWriterTestBase
             assertFileCounts(dir.list());
             for (int i = 10000; i < 20000; i++)
             {
-                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata, random(i, 10)).withTimestamp(1);
+                UpdateBuilder builder = UpdateBuilder.create(cfs.metadata(), random(i, 10)).withTimestamp(1);
                 for (int j = 0; j < 100; j++)
                     builder.newRow("" + j).add("val", ByteBuffer.allocate(1000));
                 writer2.append(builder.build().unfilteredIterator());
@@ -212,7 +213,7 @@ public class SSTableWriterTest extends SSTableWriterTestBase
 
         try (SSTableWriter writer1 = getWriter(cfs, dir, txn))
         {
-            UpdateBuilder largeValue = UpdateBuilder.create(cfs.metadata, "large_value").withTimestamp(1);
+            UpdateBuilder largeValue = UpdateBuilder.create(cfs.metadata(), "large_value").withTimestamp(1);
             largeValue.newRow("clustering").add("val", ByteBuffer.allocate(2 * 1024 * 1024));
             writer1.append(largeValue.build().unfilteredIterator());
 
@@ -223,7 +224,11 @@ public class SSTableWriterTest extends SSTableWriterTestBase
             try
             {
                 DecoratedKey dk = Util.dk("large_value");
-                UnfilteredRowIterator rowIter = sstable.iterator(dk, Slices.ALL, ColumnFilter.all(cfs.metadata), false, false);
+                UnfilteredRowIterator rowIter = sstable.iterator(dk,
+                                                                 Slices.ALL,
+                                                                 ColumnFilter.all(cfs.metadata()),
+                                                                 false,
+                                                                 SSTableReadsListener.NOOP_LISTENER);
                 while (rowIter.hasNext())
                 {
                     rowIter.next();

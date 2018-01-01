@@ -88,7 +88,7 @@ public abstract class Message
         STARTUP        (1,  Direction.REQUEST,  StartupMessage.codec),
         READY          (2,  Direction.RESPONSE, ReadyMessage.codec),
         AUTHENTICATE   (3,  Direction.RESPONSE, AuthenticateMessage.codec),
-        CREDENTIALS    (4,  Direction.REQUEST,  CredentialsMessage.codec),
+        CREDENTIALS    (4,  Direction.REQUEST,  UnsupportedMessageCodec.instance),
         OPTIONS        (5,  Direction.REQUEST,  OptionsMessage.codec),
         SUPPORTED      (6,  Direction.RESPONSE, SupportedMessage.codec),
         QUERY          (7,  Direction.REQUEST,  QueryMessage.codec),
@@ -550,15 +550,21 @@ public abstract class Message
             flusher.queued.add(item);
             flusher.start();
         }
+    }
+
+    @ChannelHandler.Sharable
+    public static final class ExceptionHandler extends ChannelInboundHandlerAdapter
+    {
 
         @Override
         public void exceptionCaught(final ChannelHandlerContext ctx, Throwable cause)
-        throws Exception
         {
+            // Provide error message to client in case channel is still open
+            UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), false);
+            ErrorMessage errorMessage = ErrorMessage.fromException(cause, handler);
             if (ctx.channel().isOpen())
             {
-                UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), false);
-                ChannelFuture future = ctx.writeAndFlush(ErrorMessage.fromException(cause, handler));
+                ChannelFuture future = ctx.writeAndFlush(errorMessage);
                 // On protocol exception, close the channel as soon as the message have been sent
                 if (cause instanceof ProtocolException)
                 {
@@ -604,7 +610,9 @@ public abstract class Message
                 message = "Unexpected exception during request; channel = <unprintable>";
             }
 
-            if (!alwaysLogAtError && exception instanceof IOException)
+            // netty wraps SSL errors in a CodecExcpetion
+            boolean isIOException = exception instanceof IOException || (exception.getCause() instanceof IOException);
+            if (!alwaysLogAtError && isIOException)
             {
                 if (ioExceptionsAtDebugLevel.contains(exception.getMessage()))
                 {

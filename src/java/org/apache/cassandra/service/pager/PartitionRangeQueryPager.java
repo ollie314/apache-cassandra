@@ -17,22 +17,15 @@
  */
 package org.apache.cassandra.service.pager;
 
-import java.util.Optional;
-
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.exceptions.RequestExecutionException;
-import org.apache.cassandra.index.Index;
-import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.transport.ProtocolVersion;
 
 /**
  * Pages a PartitionRangeReadCommand.
- *
- * Note: this only work for CQL3 queries for now (because thrift queries expect
- * a different limit on the rows than on the columns, which complicates it).
  */
 public class PartitionRangeQueryPager extends AbstractQueryPager
 {
@@ -45,7 +38,7 @@ public class PartitionRangeQueryPager extends AbstractQueryPager
 
         if (state != null)
         {
-            lastReturnedKey = command.metadata().decorateKey(state.partitionKey);
+            lastReturnedKey = command.metadata().partitioner.decorateKey(state.partitionKey);
             lastReturnedRow = state.rowMark;
             restoreState(lastReturnedKey, state.remaining, state.remainingInPartition);
         }
@@ -109,9 +102,7 @@ public class PartitionRangeQueryPager extends AbstractQueryPager
             }
         }
 
-        Index index = command.getIndex(Keyspace.openAndGetStore(command.metadata()));
-        Optional<IndexMetadata> indexMetadata = index != null ? Optional.of(index.getIndexMetadata()) : Optional.empty();
-        return new PartitionRangeReadCommand(command.metadata(), command.nowInSec(), command.columnFilter(), command.rowFilter(), limits, pageRange, indexMetadata);
+        return ((PartitionRangeReadCommand) command).withUpdatedLimitsAndDataRange(limits, pageRange);
     }
 
     protected void recordLast(DecoratedKey key, Row last)

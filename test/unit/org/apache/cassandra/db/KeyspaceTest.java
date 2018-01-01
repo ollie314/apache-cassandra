@@ -24,6 +24,7 @@ import java.util.*;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
@@ -41,14 +42,34 @@ import static org.junit.Assert.*;
 
 public class KeyspaceTest extends CQLTester
 {
+    // Test needs synchronous table drop to avoid flushes causing flaky failures of testLimitSSTables
+
+    @Override
+    protected String createTable(String query)
+    {
+        return super.createTable(KEYSPACE_PER_TEST, query);
+    }
+
+    @Override
+    protected UntypedResultSet execute(String query, Object... values) throws Throwable
+    {
+        return executeFormattedQuery(formatQuery(KEYSPACE_PER_TEST, query), values);
+    }
+
+    @Override
+    public ColumnFamilyStore getCurrentColumnFamilyStore()
+    {
+        return super.getCurrentColumnFamilyStore(KEYSPACE_PER_TEST);
+    }
+
     @Test
     public void testGetRowNoColumns() throws Throwable
     {
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
 
         execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", 0, 0);
 
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         for (int round = 0; round < 2; round++)
         {
@@ -69,31 +90,31 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testGetRowSingleColumn() throws Throwable
     {
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
 
         for (int i = 0; i < 2; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
 
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         for (int round = 0; round < 2; round++)
         {
             // slice with limit 1
             Row row = Util.getOnlyRow(Util.cmd(cfs, "0").columns("c").withLimit(1).build());
-            assertEquals(ByteBufferUtil.bytes(0), row.getCell(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false))).value());
+            assertEquals(ByteBufferUtil.bytes(0), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).value());
 
             // fetch each row by name
             for (int i = 0; i < 2; i++)
             {
                 row = Util.getOnlyRow(Util.cmd(cfs, "0").columns("c").includeRow(i).build());
-                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false))).value());
+                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).value());
             }
 
             // fetch each row by slice
             for (int i = 0; i < 2; i++)
             {
                 row = Util.getOnlyRow(Util.cmd(cfs, "0").columns("c").fromIncl(i).toIncl(i).build());
-                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false))).value());
+                assertEquals(ByteBufferUtil.bytes(i), row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false))).value());
             }
 
             if (round == 0)
@@ -104,11 +125,11 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testGetSliceBloomFilterFalsePositive() throws Throwable
     {
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
 
         execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "1", 1, 1);
 
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         // check empty reads on the partitions before and after the existing one
         for (String key : new String[]{"0", "2"})
@@ -145,7 +166,7 @@ public class KeyspaceTest extends CQLTester
                     for (int i = sliceEnd; i >= sliceStart; i--)
                     {
                         Row row = rowIterator.next();
-                        Cell cell = row.getCell(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false)));
+                        Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
                         assertEquals(ByteBufferUtil.bytes(columnValuePrefix + i), cell.value());
                     }
                 }
@@ -154,7 +175,7 @@ public class KeyspaceTest extends CQLTester
                     for (int i = sliceStart; i <= sliceEnd; i++)
                     {
                         Row row = rowIterator.next();
-                        Cell cell = row.getCell(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false)));
+                        Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
                         assertEquals(ByteBufferUtil.bytes(columnValuePrefix + i), cell.value());
                     }
                 }
@@ -166,14 +187,13 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testGetSliceWithCutoff() throws Throwable
     {
-        // tests slicing against data from one row in a memtable and then flushed to an sstable
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c text, PRIMARY KEY (a, b))");
+        createTable("CREATE TABLE %s (a text, b int, c text, PRIMARY KEY (a, b))");
         String prefix = "omg!thisisthevalue!";
 
         for (int i = 0; i < 300; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, prefix + i);
 
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         for (int round = 0; round < 2; round++)
         {
@@ -194,8 +214,8 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testReversedWithFlushing() throws Throwable
     {
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b)) WITH CLUSTERING ORDER BY (b DESC)");
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b)) WITH CLUSTERING ORDER BY (b DESC)");
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         for (int i = 0; i < 10; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
@@ -206,7 +226,7 @@ public class KeyspaceTest extends CQLTester
         {
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
 
-            PartitionColumns columns = PartitionColumns.of(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false)));
+            RegularAndStaticColumns columns = RegularAndStaticColumns.of(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
             ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(Slices.ALL, false);
             SinglePartitionReadCommand command = singlePartitionSlice(cfs, "0", filter, null);
             try (ReadExecutionController executionController = command.executionController();
@@ -215,7 +235,7 @@ public class KeyspaceTest extends CQLTester
                 try (RowIterator rowIterator = iterator.next())
                 {
                     Row row = rowIterator.next();
-                    Cell cell = row.getCell(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false)));
+                    Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
                     assertEquals(ByteBufferUtil.bytes(i), cell.value());
                 }
             }
@@ -230,7 +250,7 @@ public class KeyspaceTest extends CQLTester
             if (columnValues.length == 0)
             {
                 if (iterator.hasNext())
-                    fail("Didn't expect any results, but got rows starting with: " + iterator.next().next().toString(cfs.metadata));
+                    fail("Didn't expect any results, but got rows starting with: " + iterator.next().next().toString(cfs.metadata()));
                 return;
             }
 
@@ -239,7 +259,7 @@ public class KeyspaceTest extends CQLTester
                 for (int expected : columnValues)
                 {
                     Row row = rowIterator.next();
-                    Cell cell = row.getCell(cfs.metadata.getColumnDefinition(new ColumnIdentifier("c", false)));
+                    Cell cell = row.getCell(cfs.metadata().getColumn(new ColumnIdentifier("c", false)));
                     assertEquals(
                             String.format("Expected %s, but got %s", ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(expected)), ByteBufferUtil.bytesToHex(cell.value())),
                             ByteBufferUtil.bytes(expected), cell.value());
@@ -267,15 +287,14 @@ public class KeyspaceTest extends CQLTester
                          ? DataLimits.NONE
                          : DataLimits.cqlLimits(rowLimit);
         return SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, limit, Util.dk(key), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, limit, Util.dk(key), filter);
     }
 
     @Test
     public void testGetSliceFromBasic() throws Throwable
     {
-        // tests slicing against data from one row in a memtable and then flushed to an sstable
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         for (int i = 1; i < 10; i++)
         {
@@ -322,9 +341,8 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testGetSliceWithExpiration() throws Throwable
     {
-        // tests slicing against data from one row with expiring column in a memtable and then flushed to an sstable
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", 0, 0);
         execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?) USING TTL 60", "0", 1, 1);
@@ -346,9 +364,8 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testGetSliceFromAdvanced() throws Throwable
     {
-        // tests slicing against data from one row spread across two sstables
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         for (int i = 1; i < 7; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
@@ -372,9 +389,8 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testGetSliceFromLarge() throws Throwable
     {
-        // tests slicing against 1000 rows in an sstable
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
 
         for (int i = 1000; i < 2000; i++)
             execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", "0", i, i);
@@ -389,7 +405,7 @@ public class KeyspaceTest extends CQLTester
 
         // verify that we do indeed have multiple index entries
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
-        RowIndexEntry indexEntry = sstable.getPosition(Util.dk("0"), SSTableReader.Operator.EQ);
+        RowIndexEntry<?> indexEntry = sstable.getPosition(Util.dk("0"), SSTableReader.Operator.EQ);
         assert indexEntry.columnsIndexCount() > 2;
 
         validateSliceLarge(cfs);
@@ -398,8 +414,8 @@ public class KeyspaceTest extends CQLTester
     @Test
     public void testLimitSSTables() throws Throwable
     {
-        String tableName = createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        createTable("CREATE TABLE %s (a text, b int, c int, PRIMARY KEY (a, b))");
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
         cfs.disableAutoCompaction();
 
         for (int j = 0; j < 10; j++)
@@ -451,8 +467,8 @@ public class KeyspaceTest extends CQLTester
         // k   |a0:90|a1:91|..|a9:99
         // ---------------------
         // then we slice out col1 = a5 and col2 > 85 -> which should let us just check 2 sstables and get 2 columns
-        String tableName = createTable("CREATE TABLE %s (a text, b text, c int, d int, PRIMARY KEY (a, b, c))");
-        final ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        createTable("CREATE TABLE %s (a text, b text, c int, d int, PRIMARY KEY (a, b, c))");
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
         cfs.disableAutoCompaction();
 
         for (int j = 0; j < 10; j++)
@@ -474,17 +490,17 @@ public class KeyspaceTest extends CQLTester
     {
         ClusteringIndexSliceFilter filter = slices(cfs, 1000, null, false);
         SinglePartitionReadCommand command = SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1000, 1001, 1002);
 
         filter = slices(cfs, 1195, null, false);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1195, 1196, 1197);
 
         filter = slices(cfs, null, 1996, true);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, DataLimits.cqlLimits(1000), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(1000), Util.dk("0"), filter);
         int[] expectedValues = new int[997];
         for (int i = 0, v = 1996; v >= 1000; i++, v--)
             expectedValues[i] = v;
@@ -492,22 +508,22 @@ public class KeyspaceTest extends CQLTester
 
         filter = slices(cfs, 1990, null, false);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1990, 1991, 1992);
 
         filter = slices(cfs, null, null, true);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1999, 1998, 1997);
 
         filter = slices(cfs, null, 9000, true);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command, 1999, 1998, 1997);
 
         filter = slices(cfs, 9000, null, false);
         command = SinglePartitionReadCommand.create(
-                cfs.metadata, FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
+                cfs.metadata(), FBUtilities.nowInSeconds(), ColumnFilter.all(cfs.metadata()), RowFilter.NONE, DataLimits.cqlLimits(3), Util.dk("0"), filter);
         assertRowsInResult(cfs, command);
     }
 }

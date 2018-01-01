@@ -20,11 +20,11 @@ package org.apache.cassandra.cql3.statements;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.Multimap;
+import com.google.common.collect.*;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.conditions.ColumnCondition;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.*;
 import org.apache.cassandra.db.rows.Row;
@@ -40,10 +40,10 @@ import org.apache.cassandra.utils.Pair;
  */
 public class CQL3CasRequest implements CASRequest
 {
-    public final CFMetaData cfm;
+    public final TableMetadata metadata;
     public final DecoratedKey key;
     public final boolean isBatch;
-    private final PartitionColumns conditionColumns;
+    private final RegularAndStaticColumns conditionColumns;
     private final boolean updatesRegularRows;
     private final boolean updatesStaticRow;
     private boolean hasExists; // whether we have an exist or if not exist condition
@@ -57,17 +57,18 @@ public class CQL3CasRequest implements CASRequest
     private final TreeMap<Clustering, RowCondition> conditions;
 
     private final List<RowUpdate> updates = new ArrayList<>();
+    private final List<RangeDeletion> rangeDeletions = new ArrayList<>();
 
-    public CQL3CasRequest(CFMetaData cfm,
+    public CQL3CasRequest(TableMetadata metadata,
                           DecoratedKey key,
                           boolean isBatch,
-                          PartitionColumns conditionColumns,
+                          RegularAndStaticColumns conditionColumns,
                           boolean updatesRegularRows,
                           boolean updatesStaticRow)
     {
-        this.cfm = cfm;
+        this.metadata = metadata;
         this.key = key;
-        this.conditions = new TreeMap<>(cfm.comparator);
+        this.conditions = new TreeMap<>(metadata.comparator);
         this.isBatch = isBatch;
         this.conditionColumns = conditionColumns;
         this.updatesRegularRows = updatesRegularRows;
@@ -77,6 +78,11 @@ public class CQL3CasRequest implements CASRequest
     public void addRowUpdate(Clustering clustering, ModificationStatement stmt, QueryOptions options, long timestamp)
     {
         updates.add(new RowUpdate(clustering, stmt, options, timestamp));
+    }
+
+    public void addRangeDeletion(Slice slice, ModificationStatement stmt, QueryOptions options, long timestamp)
+    {
+        rangeDeletions.add(new RangeDeletion(slice, stmt, options, timestamp));
     }
 
     public void addNotExist(Clustering clustering) throws InvalidRequestException
@@ -156,7 +162,7 @@ public class CQL3CasRequest implements CASRequest
         }
     }
 
-    private PartitionColumns columnsToRead()
+    private RegularAndStaticColumns columnsToRead()
     {
         // If all our conditions are columns conditions (IF x = ?), then it's enough to query
         // the columns from the conditions. If we have a IF EXISTS or IF NOT EXISTS however,
@@ -167,10 +173,10 @@ public class CQL3CasRequest implements CASRequest
         // case.
         if (hasExists)
         {
-            PartitionColumns allColumns = cfm.partitionColumns();
+            RegularAndStaticColumns allColumns = metadata.regularAndStaticColumns();
             Columns statics = updatesStaticRow ? allColumns.statics : Columns.NONE;
             Columns regulars = updatesRegularRows ? allColumns.regulars : Columns.NONE;
-            return new PartitionColumns(statics, regulars);
+            return new RegularAndStaticColumns(statics, regulars);
         }
         return conditionColumns;
     }
@@ -179,19 +185,22 @@ public class CQL3CasRequest implements CASRequest
     {
         assert staticConditions != null || !conditions.isEmpty();
 
+        // Fetch all columns, but query only the selected ones
+        ColumnFilter columnFilter = ColumnFilter.selection(metadata, columnsToRead());
+
         // With only a static condition, we still want to make the distinction between a non-existing partition and one
         // that exists (has some live data) but has not static content. So we query the first live row of the partition.
         if (conditions.isEmpty())
-            return SinglePartitionReadCommand.create(cfm,
+            return SinglePartitionReadCommand.create(metadata,
                                                      nowInSec,
-                                                     ColumnFilter.selection(columnsToRead()),
+                                                     columnFilter,
                                                      RowFilter.NONE,
                                                      DataLimits.cqlLimits(1),
                                                      key,
                                                      new ClusteringIndexSliceFilter(Slices.ALL, false));
 
         ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(conditions.navigableKeySet(), false);
-        return SinglePartitionReadCommand.create(cfm, nowInSec, key, ColumnFilter.selection(columnsToRead()), filter);
+        return SinglePartitionReadCommand.create(metadata, nowInSec, key, columnFilter, filter);
     }
 
     /**
@@ -216,9 +225,9 @@ public class CQL3CasRequest implements CASRequest
         return true;
     }
 
-    private PartitionColumns updatedColumns()
+    private RegularAndStaticColumns updatedColumns()
     {
-        PartitionColumns.Builder builder = PartitionColumns.builder();
+        RegularAndStaticColumns.Builder builder = RegularAndStaticColumns.builder();
         for (RowUpdate upd : updates)
             builder.addAll(upd.stmt.updatedColumns());
         return builder.build();
@@ -226,11 +235,13 @@ public class CQL3CasRequest implements CASRequest
 
     public PartitionUpdate makeUpdates(FilteredPartition current) throws InvalidRequestException
     {
-        PartitionUpdate update = new PartitionUpdate(cfm, key, updatedColumns(), conditions.size());
+        PartitionUpdate update = new PartitionUpdate(metadata, key, updatedColumns(), conditions.size());
         for (RowUpdate upd : updates)
             upd.applyUpdates(current, update);
+        for (RangeDeletion upd : rangeDeletions)
+            upd.applyUpdates(current, update);
 
-        Keyspace.openAndGetStore(cfm).indexManager.validate(update);
+        Keyspace.openAndGetStore(metadata).indexManager.validate(update);
         return update;
     }
 
@@ -258,8 +269,32 @@ public class CQL3CasRequest implements CASRequest
         public void applyUpdates(FilteredPartition current, PartitionUpdate updates) throws InvalidRequestException
         {
             Map<DecoratedKey, Partition> map = stmt.requiresRead() ? Collections.<DecoratedKey, Partition>singletonMap(key, current) : null;
-            UpdateParameters params = new UpdateParameters(cfm, updates.columns(), options, timestamp, stmt.getTimeToLive(options), map);
+            UpdateParameters params = new UpdateParameters(metadata, updates.columns(), options, timestamp, stmt.getTimeToLive(options), map);
             stmt.addUpdateForKey(updates, clustering, params);
+        }
+    }
+
+    private class RangeDeletion
+    {
+        private final Slice slice;
+        private final ModificationStatement stmt;
+        private final QueryOptions options;
+        private final long timestamp;
+
+        private RangeDeletion(Slice slice, ModificationStatement stmt, QueryOptions options, long timestamp)
+        {
+            this.slice = slice;
+            this.stmt = stmt;
+            this.options = options;
+            this.timestamp = timestamp;
+        }
+
+        public void applyUpdates(FilteredPartition current, PartitionUpdate updates) throws InvalidRequestException
+        {
+            // No slice statements currently require a read, but this maintains consistency with RowUpdate, and future proofs us
+            Map<DecoratedKey, Partition> map = stmt.requiresRead() ? Collections.<DecoratedKey, Partition>singletonMap(key, current) : null;
+            UpdateParameters params = new UpdateParameters(metadata, updates.columns(), options, timestamp, stmt.getTimeToLive(options), map);
+            stmt.addUpdateForKey(updates, slice, params);
         }
     }
 

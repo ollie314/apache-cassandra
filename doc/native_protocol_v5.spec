@@ -202,51 +202,69 @@ Table of Contents
   To describe the layout of the frame body for the messages in Section 4, we
   define the following:
 
-    [int]          A 4 bytes integer
-    [long]         A 8 bytes integer
-    [byte]         A 1 byte unsigned integer
-    [short]        A 2 bytes unsigned integer
-    [string]       A [short] n, followed by n bytes representing an UTF-8
-                   string.
-    [long string]  An [int] n, followed by n bytes representing an UTF-8 string.
-    [uuid]         A 16 bytes long uuid.
-    [string list]  A [short] n, followed by n [string].
-    [bytes]        A [int] n, followed by n bytes if n >= 0. If n < 0,
-                   no byte should follow and the value represented is `null`.
-    [value]        A [int] n, followed by n bytes if n >= 0.
-                   If n == -1 no byte should follow and the value represented is `null`.
-                   If n == -2 no byte should follow and the value represented is
-                   `not set` not resulting in any change to the existing value.
-                   n < -2 is an invalid value and results in an error.
-    [short bytes]  A [short] n, followed by n bytes if n >= 0.
+    [int]             A 4 bytes integer
+    [long]            A 8 bytes integer
+    [byte]            A 1 byte unsigned integer
+    [short]           A 2 bytes unsigned integer
+    [string]          A [short] n, followed by n bytes representing an UTF-8
+                      string.
+    [long string]     An [int] n, followed by n bytes representing an UTF-8 string.
+    [uuid]            A 16 bytes long uuid.
+    [string list]     A [short] n, followed by n [string].
+    [bytes]           A [int] n, followed by n bytes if n >= 0. If n < 0,
+                      no byte should follow and the value represented is `null`.
+    [value]           A [int] n, followed by n bytes if n >= 0.
+                      If n == -1 no byte should follow and the value represented is `null`.
+                      If n == -2 no byte should follow and the value represented is
+                      `not set` not resulting in any change to the existing value.
+                      n < -2 is an invalid value and results in an error.
+    [short bytes]     A [short] n, followed by n bytes if n >= 0.
 
-    [option]       A pair of <id><value> where <id> is a [short] representing
-                   the option id and <value> depends on that option (and can be
-                   of size 0). The supported id (and the corresponding <value>)
-                   will be described when this is used.
-    [option list]  A [short] n, followed by n [option].
-    [inet]         An address (ip and port) to a node. It consists of one
-                   [byte] n, that represents the address size, followed by n
-                   [byte] representing the IP address (in practice n can only be
-                   either 4 (IPv4) or 16 (IPv6)), following by one [int]
-                   representing the port.
-    [inetaddr]     An IP address (without a port) to a node. It consists of one
-                   [byte] n, that represents the address size, followed by n
-                   [byte] representing the IP address.
-    [consistency]  A consistency level specification. This is a [short]
-                   representing a consistency level with the following
-                   correspondance:
-                     0x0000    ANY
-                     0x0001    ONE
-                     0x0002    TWO
-                     0x0003    THREE
-                     0x0004    QUORUM
-                     0x0005    ALL
-                     0x0006    LOCAL_QUORUM
-                     0x0007    EACH_QUORUM
-                     0x0008    SERIAL
-                     0x0009    LOCAL_SERIAL
-                     0x000A    LOCAL_ONE
+    [unsigned vint]   An unsigned variable length integer. A vint is encoded with the most significant byte (MSB) first.
+                      The most significant byte will contains the information about how many extra bytes need to be read
+                      as well as the most significant bits of the integer.
+                      The number of extra bytes to read is encoded as 1 bits on the left side.
+                      For example, if we need to read 2 more bytes the first byte will start with 110
+                      (e.g. 256 000 will be encoded on 3 bytes as [110]00011 11101000 00000000)
+                      If the encoded integer is 8 bytes long the vint will be encoded on 9 bytes and the first
+                      byte will be: 11111111
+
+   [vint]             A signed variable length integer. This is encoded using zig-zag encoding and then sent
+                      like an [unsigned vint]. Zig-zag encoding converts numbers as follows:
+                      0 = 0, -1 = 1, 1 = 2, -2 = 3, 2 = 4, -3 = 5, 3 = 6 and so forth.
+                      The purpose is to send small negative values as small unsigned values, so that we save bytes on the wire.
+                      To encode a value n use "(n >> 31) ^ (n << 1)" for 32 bit values, and "(n >> 63) ^ (n << 1)"
+                      for 64 bit values where "^" is the xor operation, "<<" is the left shift operation and ">>" is
+                      the arithemtic right shift operation (highest-order bit is replicated).
+                      Decode with "(n >> 1) ^ -(n & 1)".
+
+    [option]          A pair of <id><value> where <id> is a [short] representing
+                      the option id and <value> depends on that option (and can be
+                      of size 0). The supported id (and the corresponding <value>)
+                      will be described when this is used.
+    [option list]     A [short] n, followed by n [option].
+    [inet]            An address (ip and port) to a node. It consists of one
+                      [byte] n, that represents the address size, followed by n
+                      [byte] representing the IP address (in practice n can only be
+                      either 4 (IPv4) or 16 (IPv6)), following by one [int]
+                      representing the port.
+    [inetaddr]        An IP address (without a port) to a node. It consists of one
+                      [byte] n, that represents the address size, followed by n
+                      [byte] representing the IP address.
+    [consistency]     A consistency level specification. This is a [short]
+                      representing a consistency level with the following
+                      correspondance:
+                        0x0000    ANY
+                        0x0001    ONE
+                        0x0002    TWO
+                        0x0003    THREE
+                        0x0004    QUORUM
+                        0x0005    ALL
+                        0x0006    LOCAL_QUORUM
+                        0x0007    EACH_QUORUM
+                        0x0008    SERIAL
+                        0x0009    LOCAL_SERIAL
+                        0x000A    LOCAL_ONE
 
     [string map]      A [short] n, followed by n pair <k><v> where <k> and <v>
                       are [string].
@@ -314,7 +332,7 @@ Table of Contents
     <query><query_parameters>
   where <query> is a [long string] representing the query and
   <query_parameters> must be
-    <consistency><flags>[<n>[name_1]<value_1>...[name_n]<value_n>][<result_page_size>][<paging_state>][<serial_consistency>][<timestamp>]
+    <consistency><flags>[<n>[name_1]<value_1>...[name_n]<value_n>][<result_page_size>][<paging_state>][<serial_consistency>][<timestamp>][<keyspace>]
   where:
     - <consistency> is the [consistency] level for the operation.
     - <flags> is a [int] whose bits define the options for this query and
@@ -357,6 +375,9 @@ Table of Contents
               since the names for the expected values was returned during preparation,
               a client can always provide values in the right order without any names
               and using this flag, while supported, is almost surely inefficient.
+        0x80: With keyspace. If set, <keyspace> must be present. <keyspace> is a
+              [string] indicating the keyspace that the query should be executed in.
+              It supercedes the keyspace that the connection is bound to, if any.
 
   Note that the consistency is ignored by some queries (USE, CREATE, ALTER,
   TRUNCATE, ...).
@@ -367,8 +388,17 @@ Table of Contents
 
 4.1.5. PREPARE
 
-  Prepare a query for later execution (through EXECUTE). The body consists of
-  the CQL query to prepare as a [long string].
+  Prepare a query for later execution (through EXECUTE). The body of the message must be:
+    <query><flags>[<keyspace>]
+  where:
+    - <query> is a [long string] representing the CQL query.
+    - <flags> is a [int] whose bits define the options for this statement and in particular
+      influence what the remainder of the message contains.
+      A flag is set if the bit corresponding to its `mask` is set. Supported
+      flags are, given their mask:
+        0x01: With keyspace. If set, <keyspace> must be present. <keyspace> is a
+              [string] indicating the keyspace that the query should be executed in.
+              It supercedes the keyspace that the connection is bound to, if any.
 
   The server will respond with a RESULT message with a `prepared` kind (0x0004,
   see Section 4.2.5).
@@ -377,12 +407,15 @@ Table of Contents
 4.1.6. EXECUTE
 
   Executes a prepared query. The body of the message must be:
-    <id><query_parameters>
-  where <id> is the prepared query ID. It's the [short bytes] returned as a
-  response to a PREPARE message. As for <query_parameters>, it has the exact
-  same definition as in QUERY (see Section 4.1.4).
-
-  The response from the server will be a RESULT message.
+  <id><result_metadata_id><query_parameters>
+  where
+  - <id> is the prepared query ID. It's the [short bytes] returned as a
+      response to a PREPARE message. As for <query_parameters>, it has the exact
+      same definition as in QUERY (see Section 4.1.4).
+    - <result_metadata_id> is the ID of the resultset metadata that was sent
+      along with response to PREPARE message. If a RESULT/Rows message reports
+      changed resultset metadata with the Metadata_changed flag, the reported new
+      resultset metadata must be used in subsequent executions.
 
 
 4.1.7. BATCH
@@ -390,7 +423,7 @@ Table of Contents
   Allows executing a list of queries (prepared or not) as a batch (note that
   only DML statements are accepted in a batch). The body of the message must
   be:
-    <type><n><query_1>...<query_n><consistency><flags>[<serial_consistency>][<timestamp>]
+    <type><n><query_1>...<query_n><consistency><flags>[<serial_consistency>][<timestamp>][<keyspace>]
   where:
     - <type> is a [byte] indicating the type of batch to use:
         - If <type> == 0, the batch will be "logged". This is equivalent to a
@@ -422,6 +455,9 @@ Table of Contents
               to implement. This will be fixed in a future version of the native
               protocol. See https://issues.apache.org/jira/browse/CASSANDRA-10246 for
               more details].
+        0x80: With keyspace. If set, <keyspace> must be present. <keyspace> is a
+              [string] indicating the keyspace that the query should be executed in.
+              It supercedes the keyspace that the connection is bound to, if any.
     - <n> is a [short] indicating the number of following queries.
     - <query_1>...<query_n> are the queries to execute. A <query_i> must be of the
       form:
@@ -550,7 +586,7 @@ Table of Contents
     <metadata><rows_count><rows_content>
   where:
     - <metadata> is composed of:
-        <flags><columns_count>[<paging_state>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
+        <flags><columns_count>[<paging_state>][<new_metadata_id>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
       where:
         - <flags> is an [int]. The bits of <flags> provides information on the
           formatting of the remaining information. A flag is set if the bit
@@ -571,9 +607,16 @@ Table of Contents
                       no other information (so no <global_table_spec> nor <col_spec_i>).
                       This will only ever be the case if this was requested
                       during the query (see QUERY and RESULT messages).
+            0x0008    Metadata_changed: if set, the No_metadata flag has to be unset
+                      and <new_metadata_id> has to be supplied. This flag is to be
+                      used to avoid a roundtrip in case of metadata changes for queries
+                      that requested metadata to be skipped.
         - <columns_count> is an [int] representing the number of columns selected
           by the query that produced this result. It defines the number of <col_spec_i>
           elements in and the number of elements for each row in <rows_content>.
+        - <new_metadata_id> is [short bytes] representing the new, changed resultset
+           metadata. The new metadata ID must also be used in subsequent executions of
+           the corresponding prepared statement, if any.
         - <global_table_spec> is present if the Global_tables_spec is set in
           <flags>. It is composed of two [string] representing the
           (unique) keyspace name and table name the columns belong to.
@@ -613,6 +656,7 @@ Table of Contents
             0x0012    Time
             0x0013    Smallint
             0x0014    Tinyint
+            0x0015    Duration
             0x0020    List: the value is an [option], representing the type
                             of the elements of the list.
             0x0021    Map: the value is two [option], representing the types of the
@@ -654,9 +698,10 @@ Table of Contents
 4.2.5.4. Prepared
 
   The result to a PREPARE message. The body of a Prepared result is:
-    <id><metadata><result_metadata>
+    <id><result_metadata_id><metadata><result_metadata>
   where:
     - <id> is [short bytes] representing the prepared query ID.
+    - <result_metadata_id> is [short bytes] representing the resultset metadata ID.
     - <metadata> is composed of:
         <flags><columns_count><pk_count>[<pk_index_1>...<pk_index_n>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
       where:
@@ -881,77 +926,88 @@ Table of Contents
 
   An 8 byte floating point number in the IEEE 754 binary64 format.
 
-6.8 float
+6.8 duration
+
+  A duration is composed of 3 signed variable length integers ([vint]s).
+  The first [vint] represents a number of months, the second [vint] represents
+  a number of days, and the last [vint] represents a number of nanoseconds.
+  The number of months and days must be valid 32 bits integers whereas the
+  number of nanoseconds must be a valid 64 bits integer.
+  A duration can either be positive or negative. If a duration is positive
+  all the integers must be positive or zero. If a duration is
+  negative all the numbers must be negative or zero.
+
+6.9 float
 
   A 4 byte floating point number in the IEEE 754 binary32 format.
 
-6.9 inet
+6.10 inet
 
   A 4 byte or 16 byte sequence denoting an IPv4 or IPv6 address, respectively.
 
-6.10 int
+6.11 int
 
   A 4 byte two's complement integer.
 
-6.11 list
+6.12 list
 
   A [int] n indicating the number of elements in the list, followed by n
   elements.  Each element is [bytes] representing the serialized value.
 
-6.12 map
+6.13 map
 
   A [int] n indicating the number of key/value pairs in the map, followed by
   n entries.  Each entry is composed of two [bytes] representing the key
   and value.
 
-6.13 set
+6.14 set
 
   A [int] n indicating the number of elements in the set, followed by n
   elements.  Each element is [bytes] representing the serialized value.
 
-6.14 smallint
+6.15 smallint
 
   A 2 byte two's complement integer.
 
-6.15 text
+6.16 text
 
   A sequence of bytes conforming to the UTF-8 specifications.
 
-6.16 time
+6.17 time
 
   An 8 byte two's complement long representing nanoseconds since midnight.
   Valid values are in the range 0 to 86399999999999
 
-6.17 timestamp
+6.18 timestamp
 
   An 8 byte two's complement integer representing a millisecond-precision
   offset from the unix epoch (00:00:00, January 1st, 1970).  Negative values
   represent a negative offset from the epoch.
 
-6.18 timeuuid
+6.19 timeuuid
 
   A 16 byte sequence representing a version 1 UUID as defined by RFC 4122.
 
-6.19 tinyint
+6.20 tinyint
 
   A 1 byte two's complement integer.
 
-6.20 tuple
+6.21 tuple
 
   A sequence of [bytes] values representing the items in a tuple.  The encoding
   of each element depends on the data type for that position in the tuple.
   Null values may be represented by using length -1 for the [bytes]
   representation of an element.
 
-6.21 uuid
+6.22 uuid
 
   A 16 byte sequence representing any valid UUID as defined by RFC 4122.
 
-6.22 varchar
+6.23 varchar
 
   An alias of the "text" type.
 
-6.23 varint
+6.24 varint
 
   A variable-length two's complement encoding of a signed integer.
 
@@ -1182,3 +1238,6 @@ Table of Contents
     a failure reason code which indicates why the request failed on that node.
   * Enlarged flag's bitmaps for QUERY, EXECUTE and BATCH messages from [byte] to [int]
     (Sections 4.1.4, 4.1.6 and 4.1.7).
+  * Add the duration data type
+  * Added keyspace field in QUERY, PREPARE, and BATCH messages (Sections 4.1.4, 4.1.5, and 4.1.7).
+  * Added [int] flags field in PREPARE message (Section 4.1.5).

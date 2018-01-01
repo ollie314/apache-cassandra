@@ -28,7 +28,6 @@ import com.google.common.collect.ImmutableList;
 
 import static junit.framework.Assert.*;
 
-import java.lang.Thread.State;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -64,7 +63,7 @@ public class HintsBufferPoolTest
         });
         blocked.start();
 
-        Util.spinAssertEquals(State.WAITING, () -> blocked.getState(), 1);
+        Util.spinAssertEquals(true, () -> blockedOnBackpressure, 60);
 
         while (blocked.isAlive())
             if (!returnedBuffers.isEmpty())

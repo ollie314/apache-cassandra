@@ -21,7 +21,6 @@ import java.nio.ByteBuffer;
 
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.compress.ICompressor;
-import org.apache.cassandra.utils.SyncUtil;
 
 /**
  * Compressed commit log segment. Provides an in-memory buffer for the mutation threads. On sync compresses the written
@@ -30,7 +29,7 @@ import org.apache.cassandra.utils.SyncUtil;
  * The format of the compressed commit log is as follows:
  * - standard commit log header (as written by {@link CommitLogDescriptor#writeHeader(ByteBuffer, CommitLogDescriptor)})
  * - a series of 'sync segments' that are written every time the commit log is sync()'ed
- * -- a sync section header, see {@link CommitLogSegment#writeSyncMarker(ByteBuffer, int, int, int)}
+ * -- a sync section header, see {@link CommitLogSegment#writeSyncMarker(long, ByteBuffer, int, int, int)}
  * -- total plain text length for this section
  * -- a block of compressed data
  */
@@ -77,12 +76,11 @@ public class CompressedSegment extends FileDirectSegment
 
             // Only one thread can be here at a given time.
             // Protected by synchronization on CommitLogSegment.sync().
-            writeSyncMarker(compressedBuffer, 0, (int) channel.position(), (int) channel.position() + compressedBuffer.remaining());
+            writeSyncMarker(id, compressedBuffer, 0, (int) channel.position(), (int) channel.position() + compressedBuffer.remaining());
             manager.addSize(compressedBuffer.limit());
             channel.write(compressedBuffer);
             assert channel.position() - lastWrittenPos == compressedBuffer.limit();
             lastWrittenPos = channel.position();
-            SyncUtil.force(channel, true);
         }
         catch (Exception e)
         {

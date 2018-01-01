@@ -23,13 +23,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.UserTypes;
 import org.apache.cassandra.cql3.functions.Function;
-import org.apache.cassandra.cql3.selection.Selection.ResultSetBuilder;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.ColumnFilter.Builder;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.marshal.UserType;
@@ -76,7 +77,7 @@ final class UserTypeSelector extends Selector
 
                 if (tmpMapping.getMappings().get(resultsColumn).isEmpty())
                     // add a null mapping for cases where the collection is empty
-                    mapping.addMapping(resultsColumn, (ColumnDefinition)null);
+                    mapping.addMapping(resultsColumn, (ColumnMetadata)null);
                 else
                     // collate the mapped columns from the child factories & add those
                     mapping.addMapping(resultsColumn, tmpMapping.getMappings().values());
@@ -130,7 +131,31 @@ final class UserTypeSelector extends Selector
                 }
                 return false;
             }
+
+            @Override
+            boolean areAllFetchedColumnsKnown()
+            {
+                for (Factory factory : factories.values())
+                {
+                    if (!factory.areAllFetchedColumnsKnown())
+                        return false;
+                }
+                return true;
+            }
+
+            @Override
+            void addFetchedColumns(Builder builder)
+            {
+                for (Factory factory : factories.values())
+                    factory.addFetchedColumns(builder);
+            }
         };
+    }
+
+    public void addFetchedColumns(ColumnFilter.Builder builder)
+    {
+        for (Selector field : fields.values())
+            field.addFetchedColumns(builder);
     }
 
     public void addInput(ProtocolVersion protocolVersion, ResultSetBuilder rs) throws InvalidRequestException
